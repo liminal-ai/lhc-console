@@ -61,16 +61,17 @@ app.get("/api/threads", async (req) => {
     }
   });
   if (q.cwd) threads = threads.filter((t) => t.cwd === q.cwd);
+  let enriched = threads.map((t) => ({ ...t, stats: cachedQuickStats(t) }));
   if (q.q) {
     const needle = q.q.toLowerCase();
-    threads = threads.filter(
+    enriched = enriched.filter(
       (t) =>
         t.threadId.includes(needle) ||
         (t.title ?? "").toLowerCase().includes(needle) ||
-        (t.cwd ?? "").toLowerCase().includes(needle),
+        (t.cwd ?? "").toLowerCase().includes(needle) ||
+        (t.stats?.summary ?? "").toLowerCase().includes(needle),
     );
   }
-  const enriched = threads.map((t) => ({ ...t, stats: cachedQuickStats(t) }));
   enriched.sort((a, b) => {
     const am = a.stats?.lastEventAt ?? a.fileMtime ?? a.createdAt;
     const bm = b.stats?.lastEventAt ?? b.fileMtime ?? b.createdAt;

@@ -11,11 +11,11 @@ and does not depend on the `lhc` SDK. Its operations live in
 
 ## Layout
 
-| Path | What |
-| --- | --- |
-| `packages/core` | Host discovery, registry reads, thread-file reads (`node:sqlite`, read-only) |
-| `apps/server` | Fastify REST API (`/api/hosts`, `/api/threads`, thread detail/turns/messages/view) |
-| `apps/web` | Vite front end — thread finder, turn/message navigation |
+| Path            | What                                                                               |
+| --------------- | ---------------------------------------------------------------------------------- |
+| `packages/core` | Host discovery, registry reads, thread-file reads (`node:sqlite`, read-only)       |
+| `apps/server`   | Fastify REST API (`/api/hosts`, `/api/threads`, thread detail/turns/messages/view) |
+| `apps/web`      | Vite front end — thread finder, turn/message navigation                            |
 
 ## Development
 

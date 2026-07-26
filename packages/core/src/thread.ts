@@ -24,9 +24,12 @@ export interface ThreadQuickStats {
 /** Max characters of `summary` carried in the aggregated list. */
 const SUMMARY_CAP = 240;
 
-function tidySummary(text: string): string {
+/** Max characters of the overview's readable summary paragraph. */
+const SUMMARY_CAP_LONG = 2400;
+
+function tidySummary(text: string, cap = SUMMARY_CAP): string {
   const flat = text.replace(/\s+/g, " ").trim();
-  return flat.length > SUMMARY_CAP ? `${flat.slice(0, SUMMARY_CAP - 1).trimEnd()}…` : flat;
+  return flat.length > cap ? `${flat.slice(0, cap - 1).trimEnd()}…` : flat;
 }
 
 export function threadQuickStats(filePath: string): ThreadQuickStats {
@@ -89,7 +92,7 @@ export function threadQuickStats(filePath: string): ThreadQuickStats {
  * ready `chunk_summary_brief` (highest chunk_order), falling back to the
  * decoded text of the first user prompt. Null when the thread has neither.
  */
-function threadSummaryText(db: DatabaseSync): string | null {
+function threadSummaryText(db: DatabaseSync, cap = SUMMARY_CAP): string | null {
   const brief = db
     .prepare(
       `select d.content from derivation d
@@ -101,7 +104,7 @@ function threadSummaryText(db: DatabaseSync): string | null {
        order by c.chunk_order desc limit 1`,
     )
     .get() as unknown as { content: string } | undefined;
-  if (brief?.content) return tidySummary(brief.content);
+  if (brief?.content) return tidySummary(brief.content, cap);
 
   const prompt = db
     .prepare(
@@ -112,7 +115,7 @@ function threadSummaryText(db: DatabaseSync): string | null {
     )
     .get() as unknown as { content: string } | undefined;
   if (!prompt) return null;
-  const text = tidySummary(decodeBlockContent("text", prompt.content).text);
+  const text = tidySummary(decodeBlockContent("text", prompt.content).text, cap);
   return text.length > 0 ? text : null;
 }
 
@@ -131,6 +134,8 @@ export interface ThreadOverview {
   chunkCount: number;
   view: ThreadViewInfo | null;
   visibilityBoundary: number | null;
+  /** Readable summary paragraph (same source as `stats.summary`, less truncated). */
+  summary: string | null;
 }
 
 export interface ThreadViewInfo {
@@ -215,6 +220,7 @@ export function threadOverview(filePath: string): ThreadOverview {
       chunkCount: chunk.c,
       view,
       visibilityBoundary: boundary ? boundary.position : null,
+      summary: threadSummaryText(db, SUMMARY_CAP_LONG),
     };
   });
 }
@@ -232,13 +238,26 @@ export interface TurnListing {
   promptExcerpt: string | null;
 }
 
+/** Column names present on a table, for schema-tolerant queries. */
+function tableColumns(db: DatabaseSync, table: string): Set<string> {
+  const rows = db.prepare(`pragma table_info(${table})`).all() as unknown as { name: string }[];
+  return new Set(rows.map((r) => r.name));
+}
+
 export function listTurns(filePath: string): TurnListing[] {
   return withDb(filePath, (db) => {
+    // Older thread files predate turns.outcome/started_at/ended_at; select what
+    // exists and recover timestamps from the event log below.
+    const cols = tableColumns(db, "turns");
+    const pick = (name: string): string => (cols.has(name) ? `t.${name}` : `null ${name}`);
+
     const turns = db
       .prepare(
-        `select t.turn_id, t.turn_order, t.status, t.outcome, t.started_at, t.ended_at,
+        `select t.turn_id, t.turn_order, t.status, t.closed_at_event_order,
+                ${pick("outcome")}, ${pick("started_at")}, ${pick("ended_at")},
                 count(m.message_id) message_count,
-                coalesce(sum(m.token_estimate), 0) token_estimate
+                coalesce(sum(m.token_estimate), 0) token_estimate,
+                min(m.source_event_order) first_event_order
          from turns t
          left join message m on m.turn_id = t.turn_id and m.deleted_at is null
          where t.deleted_at is null
@@ -249,12 +268,21 @@ export function listTurns(filePath: string): TurnListing[] {
       turn_id: string;
       turn_order: number;
       status: string;
+      closed_at_event_order: number | null;
       outcome: string | null;
       started_at: string | null;
       ended_at: string | null;
       message_count: number;
       token_estimate: number;
+      first_event_order: number | null;
     }[];
+
+    const eventStmt = db.prepare("select recorded_at from event where event_order = ?");
+    const stampAt = (order: number | null): string | null => {
+      if (order == null) return null;
+      const row = eventStmt.get(order) as unknown as { recorded_at: string } | undefined;
+      return row?.recorded_at ?? null;
+    };
 
     const promptStmt = db.prepare(
       `select mb.content from message m
@@ -270,8 +298,8 @@ export function listTurns(filePath: string): TurnListing[] {
         turnOrder: t.turn_order,
         status: t.status,
         outcome: t.outcome,
-        startedAt: t.started_at,
-        endedAt: t.ended_at,
+        startedAt: t.started_at ?? stampAt(t.first_event_order),
+        endedAt: t.ended_at ?? (t.status === "closed" ? stampAt(t.closed_at_event_order) : null),
         messageCount: t.message_count,
         tokenEstimate: t.token_estimate,
         promptExcerpt: prompt

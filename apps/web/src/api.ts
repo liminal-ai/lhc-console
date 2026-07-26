@@ -82,6 +82,8 @@ export interface OverviewResponse {
     chunkCount: number;
     view: ViewInfo | null;
     visibilityBoundary: number | null;
+    /** Readable summary paragraph; longer form of `stats.summary`. */
+    summary: string | null;
   };
 }
 

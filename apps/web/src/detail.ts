@@ -1,0 +1,443 @@
+import { api, type MessageRow, type OverviewResponse, type TurnRow } from "./api.ts";
+import { el, fmtAgo, fmtBytes, fmtCount, fmtStamp, fmtTokens } from "./format.ts";
+
+export type Tab = "overview" | "histogram" | "turns" | "view";
+
+const TABS: { id: Tab; label: string }[] = [
+  { id: "overview", label: "overview" },
+  { id: "histogram", label: "histogram" },
+  { id: "turns", label: "turns" },
+  { id: "view", label: "thread view" },
+];
+
+export function isTab(s: string | undefined): s is Tab {
+  return TABS.some((t) => t.id === s);
+}
+
+/** Everything fetched for one thread, kept across tab switches. */
+interface ThreadState {
+  hostId: string;
+  threadId: string;
+  ov: OverviewResponse;
+  turns: TurnRow[];
+  /** Message payloads by turn id, loaded lazily and never refetched. */
+  messages: Map<string, MessageRow[]>;
+  selectedTurnOrder: number | null;
+}
+
+/** Small LRU so revisiting a thread is instant without unbounded retention. */
+const CACHE_MAX = 4;
+const cache = new Map<string, ThreadState>();
+
+function cacheKey(hostId: string, threadId: string): string {
+  return `${hostId}/${threadId}`;
+}
+
+async function loadThread(hostId: string, threadId: string): Promise<ThreadState> {
+  const key = cacheKey(hostId, threadId);
+  const hit = cache.get(key);
+  if (hit) return hit;
+  const [ov, turns] = await Promise.all([
+    api.overview(hostId, threadId),
+    api.turns(hostId, threadId),
+  ]);
+  const st: ThreadState = {
+    hostId,
+    threadId,
+    ov,
+    turns,
+    messages: new Map(),
+    selectedTurnOrder: null,
+  };
+  cache.set(key, st);
+  while (cache.size > CACHE_MAX) cache.delete(cache.keys().next().value!);
+  return st;
+}
+
+function threadPath(st: ThreadState, tab: Tab, turnOrder?: number | null): string {
+  const base = `/thread/${st.hostId}/${st.threadId}/${tab}`;
+  return tab === "turns" && turnOrder != null ? `${base}/${turnOrder}` : base;
+}
+
+// --- keyboard ---------------------------------------------------------------
+
+let detachKeys: (() => void) | null = null;
+
+/** Drop any tab-scoped key bindings; the router calls this before each render. */
+export function teardownDetail(): void {
+  detachKeys?.();
+  detachKeys = null;
+}
+
+function isTypingTarget(t: EventTarget | null): boolean {
+  if (!(t instanceof HTMLElement)) return false;
+  return (
+    t.isContentEditable ||
+    t.tagName === "INPUT" ||
+    t.tagName === "TEXTAREA" ||
+    t.tagName === "SELECT"
+  );
+}
+
+// --- render -----------------------------------------------------------------
+
+let renderSeq = 0;
+
+export async function renderThread(
+  app: HTMLElement,
+  hostId: string,
+  threadId: string,
+  tab: Tab,
+  turnOrder: number | null,
+): Promise<void> {
+  const seq = ++renderSeq;
+  const st = await loadThread(hostId, threadId);
+  if (seq !== renderSeq) return;
+  if (turnOrder != null && st.turns.some((t) => t.turnOrder === turnOrder)) {
+    st.selectedTurnOrder = turnOrder;
+  }
+
+  const root = el("div", "page");
+  const back = el("a", "back", "← all threads") as HTMLAnchorElement;
+  back.href = "#/";
+  root.append(back);
+  root.append(threadHeader(st));
+
+  const bar = el("div", "tabbar");
+  for (const t of TABS) {
+    const btn = el("button", `tab${t.id === tab ? " active" : ""}`, t.label) as HTMLButtonElement;
+    btn.type = "button";
+    btn.onclick = () => {
+      if (t.id === tab) return;
+      location.hash = threadPath(st, t.id, st.selectedTurnOrder);
+    };
+    bar.append(btn);
+  }
+  root.append(bar);
+
+  switch (tab) {
+    case "overview":
+      root.append(overviewPanel(st));
+      break;
+    case "turns":
+      root.append(turnsPanel(st));
+      break;
+    case "histogram":
+      root.append(stubPanel("histogram"));
+      break;
+    case "view":
+      root.append(stubPanel("thread view"));
+      break;
+  }
+
+  app.replaceChildren(root);
+}
+
+function threadHeader(st: ThreadState): HTMLElement {
+  const { thread, overview } = st.ov;
+  const s = overview.stats;
+  const head = el("div", "detail-head");
+
+  const top = el("div", "head-top");
+  top.append(el("h1", undefined, thread.title ?? overview.threadId));
+  const meta = el("div", "head-meta");
+  meta.append(el("span", `badge host-${thread.hostId}`, thread.hostId));
+  meta.append(el("span", "dim", overview.threadId));
+  if (thread.cwd) {
+    const cwd = el("span", "cwd", thread.cwd);
+    cwd.title = thread.cwd;
+    meta.append(cwd);
+  }
+  top.append(meta);
+  head.append(top);
+
+  const stamps = el("div", "head-stamps dim");
+  stamps.textContent = `created ${fmtStamp(overview.createdAt)}  ·  last activity ${fmtStamp(s.lastEventAt)} (${fmtAgo(s.lastEventAt)})`;
+  head.append(stamps);
+
+  const nums = el("div", "head-nums");
+  const bits: [string, string][] = [
+    ["turns", fmtCount(s.turnCount)],
+    ["messages", fmtCount(s.messageCount)],
+    ["tokens", fmtTokens(s.totalTokenEstimate)],
+    ["context", fmtTokens(s.contextTokens)],
+    ["size", fmtBytes(thread.fileSizeBytes)],
+  ];
+  for (const [k, v] of bits) {
+    const item = el("span", "head-num");
+    item.append(el("span", "dim", k));
+    item.append(el("span", "num", v));
+    nums.append(item);
+  }
+  head.append(nums);
+  return head;
+}
+
+function stubPanel(label: string): HTMLElement {
+  const panel = el("div", "panel stub");
+  panel.append(el("div", "hint", `${label} — coming in a later slice`));
+  return panel;
+}
+
+// --- overview tab -----------------------------------------------------------
+
+function kv(label: string, value: string, cls?: string): HTMLElement {
+  const row = el("div", "kv");
+  row.append(el("span", "kv-k", label));
+  row.append(el("span", ["kv-v", cls].filter(Boolean).join(" "), value));
+  return row;
+}
+
+function group(title: string, cls?: string): HTMLElement {
+  const g = el("div", ["ov-group", cls].filter(Boolean).join(" "));
+  g.append(el("div", "ov-title", title));
+  return g;
+}
+
+const KIND_LABELS: [string, string][] = [
+  ["user_prompt", "user prompts"],
+  ["assistant_text", "assistant text"],
+  ["assistant_thinking", "thinking"],
+  ["tool_call", "tool calls"],
+  ["tool_result", "tool results"],
+  ["model_change", "model changes"],
+  ["thinking_level_change", "thinking level"],
+  ["runtime_note", "notes"],
+];
+
+function overviewPanel(st: ThreadState): HTMLElement {
+  const { thread, overview } = st.ov;
+  const s = overview.stats;
+  const grid = el("div", "ov-grid");
+
+  const identity = group("identity");
+  identity.append(kv("thread id", overview.threadId));
+  const path = kv("file path", thread.filePath, "path");
+  path.title = thread.filePath;
+  identity.append(path);
+  identity.append(kv("estimator", overview.tokenEstimator));
+  identity.append(kv("created", fmtStamp(overview.createdAt)));
+  identity.append(kv("last event", `${fmtStamp(s.lastEventAt)} (${fmtAgo(s.lastEventAt)})`));
+  grid.append(identity);
+
+  const volume = group("volume");
+  volume.append(kv("events", fmtCount(s.eventCount)));
+  volume.append(kv("messages", fmtCount(s.messageCount)));
+  const kinds = el("div", "kv-sub");
+  const seen = new Set<string>();
+  for (const [kind, label] of KIND_LABELS) {
+    const n = overview.messageKinds[kind];
+    if (n == null) continue;
+    seen.add(kind);
+    kinds.append(kv(label, fmtCount(n)));
+  }
+  for (const [kind, n] of Object.entries(overview.messageKinds)) {
+    if (!seen.has(kind)) kinds.append(kv(kind, fmtCount(n)));
+  }
+  if (kinds.childElementCount > 0) volume.append(kinds);
+  const open = s.turnCount - s.closedTurnCount;
+  volume.append(
+    kv("turns", `${fmtCount(s.turnCount)} (${s.closedTurnCount} closed, ${open} open)`),
+  );
+  volume.append(kv("chunks", fmtCount(overview.chunkCount)));
+  volume.append(kv("total tokens", fmtTokens(s.totalTokenEstimate)));
+  volume.append(kv("context tokens", fmtTokens(s.contextTokens)));
+  volume.append(kv("file size", fmtBytes(thread.fileSizeBytes)));
+  grid.append(volume);
+
+  const view = group("thread view");
+  if (overview.view) {
+    const v = overview.view;
+    view.append(kv("profile", v.profileName ?? "unnamed"));
+    view.append(kv("created", `${fmtStamp(v.createdAt)} (${fmtAgo(v.createdAt)})`));
+    view.append(kv("compact point", `event ${fmtCount(v.compactPoint)}`));
+    view.append(kv("covered from", `event ${fmtCount(v.coveredFrom)}`));
+    const bands = el("div", "kv-sub");
+    for (const b of v.bands) bands.append(kv(`${b.band} band`, `${fmtTokens(b.tokenCount)} tok`));
+    if (v.bands.length === 0) bands.append(kv("bands", "none stored", "dim"));
+    view.append(bands);
+  } else {
+    view.append(el("div", "kv-note dim", "never compacted — whole thread is live"));
+  }
+  grid.append(view);
+
+  const health = group("health");
+  const states = overview.derivationStates;
+  const allReady = Object.entries(states).every(([k, n]) => k === "ready" || n === 0);
+  for (const state of ["ready", "pending", "failed", "blocked"]) {
+    const n = states[state];
+    if (n == null) continue;
+    const cls = state === "failed" || state === "blocked" ? "bad" : state === "ready" ? "dim" : "";
+    health.append(kv(`derivations ${state}`, fmtCount(n), cls));
+  }
+  if (Object.keys(states).length === 0) {
+    health.append(kv("derivations", "none", "dim"));
+  } else if (allReady) {
+    health.append(el("div", "kv-note dim", "all derivations ready"));
+  }
+  health.append(kv("queued work", fmtCount(s.pendingWork), s.pendingWork > 0 ? "" : "dim"));
+  health.append(
+    kv(
+      "visibility boundary",
+      overview.visibilityBoundary == null ? "—" : `event ${fmtCount(overview.visibilityBoundary)}`,
+    ),
+  );
+  grid.append(health);
+
+  const summaryText = overview.summary ?? s.summary;
+  if (summaryText) {
+    const sum = group("summary", "ov-wide");
+    sum.append(el("p", "ov-summary", summaryText));
+    grid.append(sum);
+  }
+
+  return grid;
+}
+
+// --- turns tab --------------------------------------------------------------
+
+function turnsPanel(st: ThreadState): HTMLElement {
+  const cols = el("div", "detail-cols");
+  const turnCol = el("div", "turn-col");
+  const msgCol = el("div", "msg-col");
+  const mini = el("div", "msg-mini dim", "no turn selected");
+  const msgBody = el("div", "msg-body");
+  msgCol.append(mini, msgBody);
+  cols.append(turnCol, msgCol);
+
+  if (st.turns.length === 0) {
+    turnCol.append(el("div", "hint", "no turns"));
+    msgBody.append(el("div", "hint", "nothing to show"));
+    return cols;
+  }
+
+  const cards = new Map<number, HTMLElement>();
+  for (const t of st.turns) {
+    const card = turnCard(t);
+    card.onclick = () => select(t.turnOrder, false);
+    cards.set(t.turnOrder, card);
+    turnCol.append(card);
+  }
+
+  let loadSeq = 0;
+
+  function select(order: number, scroll: boolean): void {
+    const turn = st.turns.find((t) => t.turnOrder === order);
+    if (!turn) return;
+    st.selectedTurnOrder = order;
+    for (const [o, c] of cards) c.classList.toggle("selected", o === order);
+    const card = cards.get(order);
+    if (card && scroll) card.scrollIntoView({ block: "nearest" });
+
+    mini.className = "msg-mini";
+    mini.textContent = `turn #${turn.turnOrder} · ${turn.messageCount} msgs · ${fmtTokens(turn.tokenEstimate)} tokens`;
+    history.replaceState(null, "", `#${threadPath(st, "turns", order)}`);
+
+    const cached = st.messages.get(turn.turnId);
+    if (cached) {
+      msgBody.replaceChildren(...cached.map(messageCard));
+      msgBody.scrollTop = 0;
+      return;
+    }
+    const seq = ++loadSeq;
+    msgBody.replaceChildren(el("div", "hint", "loading…"));
+    api
+      .messages(st.hostId, st.threadId, turn.turnId)
+      .then((msgs) => {
+        st.messages.set(turn.turnId, msgs);
+        if (seq !== loadSeq) return;
+        msgBody.replaceChildren(
+          ...(msgs.length ? msgs.map(messageCard) : [el("div", "hint", "no messages")]),
+        );
+        msgBody.scrollTop = 0;
+      })
+      .catch((e: unknown) => {
+        if (seq === loadSeq) msgBody.replaceChildren(el("div", "error", String(e)));
+      });
+  }
+
+  function move(delta: number): void {
+    const idx = st.turns.findIndex((t) => t.turnOrder === st.selectedTurnOrder);
+    if (idx < 0) {
+      select(st.turns[delta > 0 ? 0 : st.turns.length - 1].turnOrder, true);
+      return;
+    }
+    const next = Math.min(st.turns.length - 1, Math.max(0, idx + delta));
+    if (next !== idx) select(st.turns[next].turnOrder, true);
+  }
+
+  const onKey = (e: KeyboardEvent): void => {
+    if (e.metaKey || e.ctrlKey || e.altKey || isTypingTarget(e.target)) return;
+    const delta =
+      e.key === "ArrowDown" || e.key === "j" ? 1 : e.key === "ArrowUp" || e.key === "k" ? -1 : 0;
+    if (delta === 0) return;
+    e.preventDefault();
+    move(delta);
+  };
+  teardownDetail();
+  window.addEventListener("keydown", onKey);
+  detachKeys = () => window.removeEventListener("keydown", onKey);
+
+  const initial = st.turns.some((t) => t.turnOrder === st.selectedTurnOrder)
+    ? st.selectedTurnOrder!
+    : st.turns[0].turnOrder;
+  select(initial, false);
+  // Scroll happens after the list is in the document.
+  queueMicrotask(() => cards.get(initial)?.scrollIntoView({ block: "nearest" }));
+  return cols;
+}
+
+function turnCard(t: TurnRow): HTMLElement {
+  const card = el("div", `turn-card${t.status === "open" ? " open" : ""}`);
+  const top = el("div", "turn-top");
+  top.append(el("span", `turn-dot ${t.status}`));
+  top.append(el("span", "turn-order", `#${t.turnOrder}`));
+  if (t.status === "open") top.append(el("span", "badge warn", "open"));
+  top.append(el("span", "turn-spacer"));
+  top.append(el("span", "num dim", `${t.messageCount} msgs`));
+  top.append(el("span", "num", fmtTokens(t.tokenEstimate)));
+  const when = el("span", "dim", fmtAgo(t.startedAt));
+  when.title = t.startedAt ? new Date(t.startedAt).toLocaleString() : "unknown";
+  top.append(when);
+  card.append(top);
+  const excerpt = t.promptExcerpt?.trim();
+  card.append(
+    excerpt ? el("div", "excerpt", excerpt) : el("div", "excerpt no-prompt", "(no prompt)"),
+  );
+  return card;
+}
+
+const KIND_ICON: Record<string, string> = {
+  user_prompt: "🧑",
+  assistant_text: "🤖",
+  assistant_thinking: "💭",
+  tool_call: "🔧",
+  tool_result: "📄",
+  model_change: "🔀",
+  thinking_level_change: "🎚",
+  runtime_note: "📌",
+};
+
+function messageCard(m: MessageRow): HTMLElement {
+  const card = el("div", `msg msg-${m.kind}`);
+  const head = el("div", "msg-head");
+  const toolName = m.blocks.find((b) => b.toolName)?.toolName;
+  head.append(
+    el(
+      "span",
+      undefined,
+      `${KIND_ICON[m.kind] ?? "•"} ${m.kind}${toolName ? ` · ${toolName}` : ""}`,
+    ),
+  );
+  head.append(el("span", "dim", `#${m.sourceEventOrder}`));
+  head.append(el("span", "num dim", fmtTokens(m.tokenEstimate)));
+  card.append(head);
+  for (const b of m.blocks) {
+    const pre = el("pre", "msg-content");
+    const truncated = b.contentLength > b.content.length;
+    pre.textContent =
+      b.content + (truncated ? `\n… (${b.contentLength - b.content.length} more chars)` : "");
+    card.append(pre);
+  }
+  return card;
+}

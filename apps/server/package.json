@@ -1,0 +1,21 @@
+{
+  "name": "@lhc-console/server",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch src/index.ts",
+    "start": "node src/index.ts",
+    "check": "vp check"
+  },
+  "dependencies": {
+    "@lhc-console/core": "workspace:*",
+    "fastify": "^5.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "typescript": "catalog:",
+    "vite": "catalog:",
+    "vite-plus": "catalog:"
+  }
+}

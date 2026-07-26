@@ -9,6 +9,8 @@ export {
   threadOverview,
   threadQuickStats,
   threadSummary,
+  turnKinds,
+  TURN_KIND_BUCKETS,
   viewBands,
 } from "./thread.ts";
 export type {
@@ -17,5 +19,7 @@ export type {
   ThreadOverview,
   ThreadQuickStats,
   ThreadViewInfo,
+  TurnKindBucket,
+  TurnKindRow,
   TurnListing,
 } from "./thread.ts";

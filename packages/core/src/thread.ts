@@ -310,6 +310,143 @@ export function listTurns(filePath: string): TurnListing[] {
   });
 }
 
+/** Message-kind buckets the histogram stacks; `other` absorbs the rare kinds. */
+export const TURN_KIND_BUCKETS = [
+  "user_prompt",
+  "assistant_text",
+  "assistant_thinking",
+  "tool_call",
+  "tool_result",
+  "other",
+] as const;
+
+export type TurnKindBucket = (typeof TURN_KIND_BUCKETS)[number];
+
+function bucketOf(kind: string): TurnKindBucket {
+  return (TURN_KIND_BUCKETS as readonly string[]).includes(kind)
+    ? (kind as TurnKindBucket)
+    : "other";
+}
+
+export interface TurnKindRow {
+  turnId: string;
+  turnOrder: number;
+  status: string;
+  startedAt: string | null;
+  messageCount: number;
+  /** Event-order span of the turn's messages; null when the turn has none. */
+  firstEventOrder: number | null;
+  lastEventOrder: number | null;
+  /** Token estimate per bucket; every bucket present, zeroes included. */
+  tokens: Record<TurnKindBucket, number>;
+  totalTokens: number;
+}
+
+function emptyBuckets(): Record<TurnKindBucket, number> {
+  return {
+    user_prompt: 0,
+    assistant_text: 0,
+    assistant_thinking: 0,
+    tool_call: 0,
+    tool_result: 0,
+    other: 0,
+  };
+}
+
+/**
+ * Per-turn token totals split by message-kind bucket — the histogram's data.
+ * One grouped pass over `turns ⋈ message` (kept cheap on 400+ turn threads),
+ * plus point lookups into `event` only where a turn timestamp has to be
+ * recovered (older thread files have no `turns.started_at`).
+ */
+export function turnKinds(filePath: string): TurnKindRow[] {
+  return withDb(filePath, (db) => {
+    const cols = tableColumns(db, "turns");
+    const pick = (name: string): string => (cols.has(name) ? `t.${name}` : `null ${name}`);
+
+    const rows = db
+      .prepare(
+        `select t.turn_id, t.turn_order, t.status, ${pick("started_at")},
+                ${pick("opened_at_event_order")},
+                m.kind,
+                count(m.message_id) message_count,
+                coalesce(sum(m.token_estimate), 0) token_estimate,
+                min(m.source_event_order) first_event_order,
+                max(m.source_event_order) last_event_order
+         from turns t
+         left join message m on m.turn_id = t.turn_id and m.deleted_at is null
+         where t.deleted_at is null
+         group by t.turn_id, m.kind
+         order by t.turn_order`,
+      )
+      .all() as unknown as {
+      turn_id: string;
+      turn_order: number;
+      status: string;
+      started_at: string | null;
+      opened_at_event_order: number | null;
+      kind: string | null;
+      message_count: number;
+      token_estimate: number;
+      first_event_order: number | null;
+      last_event_order: number | null;
+    }[];
+
+    const byTurn = new Map<string, TurnKindRow>();
+    const order: TurnKindRow[] = [];
+    const stampOrder = new Map<string, number | null>();
+
+    for (const r of rows) {
+      let turn = byTurn.get(r.turn_id);
+      if (!turn) {
+        turn = {
+          turnId: r.turn_id,
+          turnOrder: r.turn_order,
+          status: r.status,
+          startedAt: r.started_at,
+          messageCount: 0,
+          firstEventOrder: null,
+          lastEventOrder: null,
+          tokens: emptyBuckets(),
+          totalTokens: 0,
+        };
+        byTurn.set(r.turn_id, turn);
+        order.push(turn);
+        stampOrder.set(r.turn_id, r.opened_at_event_order);
+      }
+      // A turn with no messages joins to a single all-null row.
+      if (r.kind == null) continue;
+      turn.tokens[bucketOf(r.kind)] += r.token_estimate;
+      turn.totalTokens += r.token_estimate;
+      turn.messageCount += r.message_count;
+      if (r.first_event_order != null) {
+        turn.firstEventOrder =
+          turn.firstEventOrder == null
+            ? r.first_event_order
+            : Math.min(turn.firstEventOrder, r.first_event_order);
+      }
+      if (r.last_event_order != null) {
+        turn.lastEventOrder =
+          turn.lastEventOrder == null
+            ? r.last_event_order
+            : Math.max(turn.lastEventOrder, r.last_event_order);
+      }
+    }
+
+    const eventStmt = db.prepare("select recorded_at from event where event_order = ?");
+    for (const turn of order) {
+      if (turn.startedAt != null) continue;
+      const at = turn.firstEventOrder ?? stampOrder.get(turn.turnId) ?? null;
+      if (at == null) continue;
+      const row = eventStmt.get(at) as unknown as { recorded_at: string } | undefined;
+      turn.startedAt = row?.recorded_at ?? null;
+    }
+
+    order.sort((a, b) => a.turnOrder - b.turnOrder);
+    return order;
+  });
+}
+
 /**
  * Block content is stored as a JSON envelope keyed by block type
  * (`{"text": …}`, `{"toolCallId", "toolName", "arguments"}`,

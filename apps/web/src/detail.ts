@@ -1,5 +1,12 @@
-import { api, type MessageRow, type OverviewResponse, type TurnRow } from "./api.ts";
+import {
+  api,
+  type MessageRow,
+  type OverviewResponse,
+  type TurnKindRow,
+  type TurnRow,
+} from "./api.ts";
 import { el, fmtAgo, fmtBytes, fmtCount, fmtStamp, fmtTokens } from "./format.ts";
+import { histogramPanel } from "./histogram.ts";
 
 export type Tab = "overview" | "histogram" | "turns" | "view";
 
@@ -22,6 +29,8 @@ interface ThreadState {
   turns: TurnRow[];
   /** Message payloads by turn id, loaded lazily and never refetched. */
   messages: Map<string, MessageRow[]>;
+  /** Histogram data, loaded on first visit to that tab and kept after. */
+  kinds: TurnKindRow[] | null;
   selectedTurnOrder: number | null;
 }
 
@@ -47,6 +56,7 @@ async function loadThread(hostId: string, threadId: string): Promise<ThreadState
     ov,
     turns,
     messages: new Map(),
+    kinds: null,
     selectedTurnOrder: null,
   };
   cache.set(key, st);
@@ -62,11 +72,14 @@ function threadPath(st: ThreadState, tab: Tab, turnOrder?: number | null): strin
 // --- keyboard ---------------------------------------------------------------
 
 let detachKeys: (() => void) | null = null;
+let detachChart: (() => void) | null = null;
 
-/** Drop any tab-scoped key bindings; the router calls this before each render. */
+/** Drop any tab-scoped bindings; the router calls this before each render. */
 export function teardownDetail(): void {
   detachKeys?.();
   detachKeys = null;
+  detachChart?.();
+  detachChart = null;
 }
 
 function isTypingTarget(t: EventTarget | null): boolean {
@@ -123,7 +136,7 @@ export async function renderThread(
       root.append(turnsPanel(st));
       break;
     case "histogram":
-      root.append(stubPanel("histogram"));
+      root.append(histogramTab(st));
       break;
     case "view":
       root.append(stubPanel("thread view"));
@@ -177,6 +190,44 @@ function stubPanel(label: string): HTMLElement {
   const panel = el("div", "panel stub");
   panel.append(el("div", "hint", `${label} — coming in a later slice`));
   return panel;
+}
+
+// --- histogram tab ----------------------------------------------------------
+
+function histogramTab(st: ThreadState): HTMLElement {
+  const host = el("div", "hist-host");
+
+  const mount = (rows: TurnKindRow[]): void => {
+    const chart = histogramPanel({
+      rows,
+      compactPoint: st.ov.overview.view?.compactPoint ?? null,
+      onSelect: (turnOrder) => {
+        st.selectedTurnOrder = turnOrder;
+        location.hash = threadPath(st, "turns", turnOrder);
+      },
+    });
+    detachChart?.();
+    detachChart = chart.dispose;
+    host.replaceChildren(chart.node);
+  };
+
+  if (st.kinds) {
+    mount(st.kinds);
+    return host;
+  }
+
+  host.append(el("div", "hint", "loading…"));
+  api
+    .turnKinds(st.hostId, st.threadId)
+    .then((rows) => {
+      st.kinds = rows;
+      // The tab may have been navigated away from while the fetch was in flight.
+      if (host.isConnected) mount(rows);
+    })
+    .catch((e: unknown) => {
+      if (host.isConnected) host.replaceChildren(el("div", "error", String(e)));
+    });
+  return host;
 }
 
 // --- overview tab -----------------------------------------------------------

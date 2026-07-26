@@ -10,6 +10,8 @@
   --ok: #4fc38a;
   --warn: #e0b055;
   --bad: #e0685f;
+  --think: #9d7fd6;
+  --tool-result: #5da8a0;
   font-family: "SF Mono", ui-monospace, "Cascadia Code", Menlo, monospace;
   font-size: 13px;
 }
@@ -521,7 +523,7 @@ button.tab.active {
 }
 
 .msg-assistant_thinking {
-  border-left-color: #9d7fd6;
+  border-left-color: var(--think);
 }
 
 .msg-tool_call {
@@ -529,7 +531,7 @@ button.tab.active {
 }
 
 .msg-tool_result {
-  border-left-color: #5da8a0;
+  border-left-color: var(--tool-result);
 }
 
 .msg-runtime_note {
@@ -551,4 +553,162 @@ button.tab.active {
   line-height: 1.45;
   max-height: 400px;
   overflow-y: auto;
+}
+
+/* histogram tab */
+.hist-host {
+  min-width: 0;
+}
+
+.hist-panel {
+  position: relative;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px 12px;
+  min-width: 0;
+}
+
+.hist-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  color: var(--dim);
+  font-size: 11px;
+  margin-bottom: 8px;
+}
+
+.hist-key {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.hist-chip {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  flex: none;
+}
+
+.hist-scroll {
+  overflow-x: auto;
+  overflow-y: hidden;
+  max-width: 100%;
+}
+
+.hist-svg {
+  display: block;
+  cursor: pointer;
+  outline: none;
+}
+
+.hist-svg:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.hist-grid {
+  stroke: var(--border);
+  stroke-width: 1;
+}
+
+.hist-baseline {
+  stroke: var(--border);
+  stroke-width: 1;
+}
+
+.hist-axis {
+  fill: var(--dim);
+  font-size: 10px;
+  font-family: inherit;
+  font-variant-numeric: tabular-nums;
+}
+
+.hist-compact {
+  stroke: var(--dim);
+  stroke-width: 1;
+  opacity: 0.5;
+}
+
+.hist-compact-tag {
+  fill: var(--dim);
+  font-size: 9px;
+  font-family: inherit;
+  letter-spacing: 0.06em;
+}
+
+.hist-highlight {
+  fill: rgb(255 255 255 / 6%);
+}
+
+.hist-open-cap {
+  fill: var(--warn);
+}
+
+.hist-caption {
+  margin-top: 8px;
+  font-size: 11px;
+}
+
+.hist-tip {
+  position: absolute;
+  z-index: 2;
+  pointer-events: none;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 9px 7px;
+  font-size: 11px;
+  min-width: 168px;
+  box-shadow: 0 6px 18px rgb(0 0 0 / 35%);
+}
+
+.hist-tip[hidden] {
+  display: none;
+}
+
+.hist-tip-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.hist-tip-turn {
+  color: var(--accent);
+}
+
+.hist-tip-rows {
+  display: grid;
+  grid-template-columns: 10px 1fr auto;
+  gap: 2px 7px;
+  align-items: center;
+}
+
+.hist-tip-row {
+  display: contents;
+}
+
+.hist-tip-label {
+  color: var(--dim);
+  white-space: nowrap;
+}
+
+.hist-tip-row .num {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.hist-tip-row.total .hist-tip-label {
+  color: var(--text);
+}
+
+.hist-key-line {
+  height: 2px;
+  border-radius: 1px;
+}
+
+.hist-key-line.blank {
+  background: none;
 }

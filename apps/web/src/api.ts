@@ -42,6 +42,26 @@ export interface TurnRow {
   promptExcerpt: string | null;
 }
 
+export type TurnKindBucket =
+  | "user_prompt"
+  | "assistant_text"
+  | "assistant_thinking"
+  | "tool_call"
+  | "tool_result"
+  | "other";
+
+export interface TurnKindRow {
+  turnId: string;
+  turnOrder: number;
+  status: string;
+  startedAt: string | null;
+  messageCount: number;
+  firstEventOrder: number | null;
+  lastEventOrder: number | null;
+  tokens: Record<TurnKindBucket, number>;
+  totalTokens: number;
+}
+
 export interface MessageBlock {
   blockIndex: number;
   blockType: string;
@@ -106,6 +126,8 @@ export const api = {
     get<OverviewResponse>(`/api/threads/${hostId}/${threadId}`),
   turns: (hostId: string, threadId: string) =>
     get<TurnRow[]>(`/api/threads/${hostId}/${threadId}/turns`),
+  turnKinds: (hostId: string, threadId: string) =>
+    get<TurnKindRow[]>(`/api/threads/${hostId}/${threadId}/turn-kinds`),
   messages: (hostId: string, threadId: string, turnId?: string) => {
     const suffix = turnId ? `?turn=${encodeURIComponent(turnId)}` : "";
     return get<MessageRow[]>(`/api/threads/${hostId}/${threadId}/messages${suffix}`);

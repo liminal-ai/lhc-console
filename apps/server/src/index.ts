@@ -8,6 +8,7 @@ import {
   resolveThread,
   threadOverview,
   threadQuickStats,
+  turnKinds,
   viewBands,
   type ThreadSummary,
   type ThreadQuickStats,
@@ -98,6 +99,16 @@ app.get("/api/threads/:hostId/:threadId/turns", async (req, reply) => {
   const thread = requireThread(hostId, threadId);
   if (!thread) return reply.code(404).send({ error: "thread not found" });
   return listTurns(thread.filePath);
+});
+
+app.get("/api/threads/:hostId/:threadId/turn-kinds", async (req, reply) => {
+  const { hostId, threadId } = req.params as {
+    hostId: string;
+    threadId: string;
+  };
+  const thread = requireThread(hostId, threadId);
+  if (!thread) return reply.code(404).send({ error: "thread not found" });
+  return turnKinds(thread.filePath);
 });
 
 app.get("/api/threads/:hostId/:threadId/messages", async (req, reply) => {

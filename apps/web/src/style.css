@@ -60,12 +60,18 @@ input[type="search"] {
 
 input[type="search"] {
   flex: 1;
+  min-width: 200px;
+}
+
+select.dir-select {
+  max-width: 220px;
 }
 
 /* thread list */
 table.threads {
   width: 100%;
   border-collapse: collapse;
+  table-layout: fixed;
 }
 
 table.threads th {
@@ -77,10 +83,42 @@ table.threads th {
   white-space: nowrap;
 }
 
+table.threads th.num {
+  text-align: right;
+}
+
+table.threads th.sortable {
+  cursor: pointer;
+  user-select: none;
+}
+
+table.threads th.sortable:hover .th-label {
+  color: var(--text);
+}
+
+table.threads th.sorted .th-label {
+  color: var(--text);
+}
+
+.sort-mark {
+  display: inline-block;
+  width: 1em;
+  margin-left: 4px;
+  color: var(--accent);
+  font-size: 10px;
+}
+
+table.threads th.num .sort-mark {
+  margin: 0 0 0 4px;
+}
+
 table.threads td {
-  padding: 8px 10px;
+  padding: 7px 10px;
   border-bottom: 1px solid var(--border);
   vertical-align: top;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 tr.thread-row {
@@ -91,8 +129,33 @@ tr.thread-row:hover {
   background: var(--panel);
 }
 
-td.title {
-  max-width: 320px;
+.col-host {
+  width: 106px;
+}
+
+.col-title {
+  width: 22%;
+}
+
+.col-dir {
+  width: 17%;
+}
+
+th.num {
+  width: 74px;
+}
+
+.col-when {
+  width: 128px;
+}
+
+th.col-when + th.col-when {
+  width: 92px;
+}
+
+.title-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .thread-id {
@@ -100,12 +163,26 @@ td.title {
   font-size: 11px;
 }
 
-td.cwd {
+.dir-parent {
+  color: #626a78;
+}
+
+.dir-base {
+  color: var(--text);
+}
+
+.summary-text {
   color: var(--dim);
-  max-width: 260px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+}
+
+.summary-text.bad {
+  color: var(--bad);
+}
+
+.list-count {
+  color: var(--dim);
+  padding: 10px 10px 0;
+  font-size: 11px;
 }
 
 td.num,

@@ -4,10 +4,12 @@ export interface QuickStats {
   turnCount: number;
   closedTurnCount: number;
   totalTokenEstimate: number;
+  contextTokens: number;
   lastEventAt: string | null;
   lastCompactAt: string | null;
   pendingWork: number;
   failedDerivations: number;
+  summary: string | null;
 }
 
 export interface ThreadRow {

@@ -1,3 +1,4 @@
+import type { DatabaseSync } from "node:sqlite";
 import { withDb } from "./db.ts";
 
 /** Cheap per-thread stats for the aggregated list view. */
@@ -7,10 +8,25 @@ export interface ThreadQuickStats {
   turnCount: number;
   closedTurnCount: number;
   totalTokenEstimate: number;
+  /**
+   * What a resume would serve: stored band token counts plus the live tail
+   * after the compact point. With no view, every non-deleted message counts.
+   */
+  contextTokens: number;
   lastEventAt: string | null;
   lastCompactAt: string | null;
   pendingWork: number;
   failedDerivations: number;
+  /** Short description: latest ready chunk_summary_brief, else first prompt. */
+  summary: string | null;
+}
+
+/** Max characters of `summary` carried in the aggregated list. */
+const SUMMARY_CAP = 240;
+
+function tidySummary(text: string): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length > SUMMARY_CAP ? `${flat.slice(0, SUMMARY_CAP - 1).trimEnd()}…` : flat;
 }
 
 export function threadQuickStats(filePath: string): ThreadQuickStats {
@@ -32,18 +48,77 @@ export function threadQuickStats(filePath: string): ThreadQuickStats {
       "select count(*) c from derivation where state in ('failed','blocked')",
     );
 
+    const totalTokens = messages.tokens ?? 0;
+
+    const viewRow = db
+      .prepare("select view_id, compact_point from thread_view where singleton = 1")
+      .get() as unknown as { view_id: string; compact_point: number } | undefined;
+
+    let contextTokens = totalTokens;
+    if (viewRow) {
+      const bands = db
+        .prepare("select coalesce(sum(token_count), 0) t from thread_view_band where view_id = ?")
+        .get(viewRow.view_id) as unknown as { t: number };
+      const tail = db
+        .prepare(
+          `select coalesce(sum(token_estimate), 0) t from message
+           where deleted_at is null and source_event_order > ?`,
+        )
+        .get(viewRow.compact_point) as unknown as { t: number };
+      contextTokens = bands.t + tail.t;
+    }
+
     return {
       eventCount: events.c,
       messageCount: messages.c,
       turnCount: turns.c,
       closedTurnCount: turns.closed ?? 0,
-      totalTokenEstimate: messages.tokens ?? 0,
+      totalTokenEstimate: totalTokens,
+      contextTokens,
       lastEventAt: events.last,
       lastCompactAt: view.last,
       pendingWork: work.c,
       failedDerivations: failed.c,
+      summary: threadSummaryText(db),
     };
   });
+}
+
+/**
+ * Best available one-line description of a thread: the content of the latest
+ * ready `chunk_summary_brief` (highest chunk_order), falling back to the
+ * decoded text of the first user prompt. Null when the thread has neither.
+ */
+function threadSummaryText(db: DatabaseSync): string | null {
+  const brief = db
+    .prepare(
+      `select d.content from derivation d
+       join chunk c on c.chunk_id = d.subject_id
+       where d.subject_kind = 'chunk'
+         and d.derivation_type = 'chunk_summary_brief'
+         and d.state = 'ready'
+         and d.content is not null
+       order by c.chunk_order desc limit 1`,
+    )
+    .get() as unknown as { content: string } | undefined;
+  if (brief?.content) return tidySummary(brief.content);
+
+  const prompt = db
+    .prepare(
+      `select mb.content from message m
+       join message_block mb on mb.message_id = m.message_id
+       where m.kind = 'user_prompt' and m.deleted_at is null
+       order by m.source_event_order, mb.block_index limit 1`,
+    )
+    .get() as unknown as { content: string } | undefined;
+  if (!prompt) return null;
+  const text = tidySummary(decodeBlockContent("text", prompt.content).text);
+  return text.length > 0 ? text : null;
+}
+
+/** Summary text for one thread file, opened on its own. */
+export function threadSummary(filePath: string): string | null {
+  return withDb(filePath, threadSummaryText);
 }
 
 export interface ThreadOverview {

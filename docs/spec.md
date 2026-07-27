@@ -156,3 +156,15 @@ and fast (avoid N+1 file opens; the aggregate list must stay instant on cached m
   files; no blocking the event loop with huge JSON payloads (cap content transport).
 - Handle absent data gracefully everywhere: missing thread file, no view, no
   derivations, open turns, deleted messages.
+
+### Hidden threads
+
+Console-owned overlay, never written to host registries: `~/.lhc-console/prefs.json`
+(`LHC_CONSOLE_HOME` override; atomic tmp+rename writes; corrupt file backed up to
+`.bad` and reset). `/api/threads?includeHidden=1` returns all rows with a `hidden`
+flag (the client always uses this and filters); default excludes hidden.
+`POST`/`DELETE /api/threads/:host/:id/hide` toggle, keyed by resolved full thread
+id. UI: hover "hide" on list rows, a quiet `hidden (N)` chip to reveal dimmed rows
+with unhide, and a hidden badge + unhide on the detail header. The terminals
+devCommand escape requires loopback AND `x-lhc-dev` matching
+`LHC_CONSOLE_DEV_SECRET` (absent secret = disabled).

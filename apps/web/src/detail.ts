@@ -262,6 +262,19 @@ function threadHeader(
     cwd.title = thread.cwd;
     meta.append(cwd);
   }
+  // A deep link to a hidden thread still works; say so, and offer the way back.
+  if (st.ov.hidden) {
+    const tag = el("span", "hidden-tag");
+    tag.append(el("span", "badge hidden-badge", "hidden"));
+    const unhide = el("button", "linkish", "unhide") as HTMLButtonElement;
+    unhide.type = "button";
+    unhide.title = "show this thread in the list again";
+    unhide.onclick = () => {
+      void api.hideThread(thread.hostId, thread.threadId, false).then(reload, reload);
+    };
+    tag.append(unhide);
+    meta.append(tag);
+  }
   top.append(meta);
   head.append(top);
 

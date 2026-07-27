@@ -1080,7 +1080,7 @@ a.kv-link:hover {
 
 /* launch affordance + modal */
 .col-launch {
-  width: 60px;
+  width: 110px;
   text-align: right;
   white-space: nowrap;
 }
@@ -1102,6 +1102,69 @@ tr.thread-row:hover button.launch-link {
 button.launch-link:hover {
   color: var(--accent);
   text-decoration: underline;
+}
+
+/* hidden threads: a quiet, instantly reversible per-row preference */
+button.hide-link {
+  margin-left: 10px;
+  color: transparent;
+}
+
+tr.thread-row:hover button.hide-link {
+  color: var(--dim);
+}
+
+tr.thread-row.is-hidden button.hide-link {
+  color: var(--dim);
+}
+
+button.hide-link:hover {
+  color: var(--text);
+}
+
+tr.thread-row.is-hidden {
+  opacity: 0.45;
+}
+
+tr.thread-row.is-hidden:hover {
+  opacity: 0.75;
+}
+
+button.chip {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font: inherit;
+  color: var(--dim);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+button.chip:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--dim);
+}
+
+button.chip.on {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+button.chip:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.hidden-tag {
+  display: inline-flex;
+  gap: 6px;
+  align-items: baseline;
+}
+
+.badge.hidden-badge {
+  margin-right: 0;
+  opacity: 0.8;
 }
 
 .dir-profile {

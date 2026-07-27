@@ -46,7 +46,8 @@ Thread ids accept unique prefixes (e.g. `th_a485`).
 
 ## Features
 
-- **Finder** — cross-host list with per-thread summaries (latest brief chunk summary), context tokens, sortable columns, host/directory/text filters, health dots, live refresh
+- **Finder** — cross-host list with per-thread summaries (latest brief chunk summary), context tokens, sortable columns, host/directory/text filters, health dots, live refresh. Hosts: cc-lhc, pi-lhc, codex-lhc, t3code-lhc, and hermes (registry-less: scans `~/.hermes{,/profiles/<name>}/lhc/threads`)
+- **Launch** — non-t3code threads get a launch link (list + detail) opening a modal that copies the one-shot resume command (`cd … && cc-lhc --resume …`, `pi-lhc --lhc-thread …`, `hermes --profile … --resume …`) to the clipboard
 - **Detail tabs** — overview (identity/volume/view/health), histogram (per-turn stacked token bars by message kind, compact-point marker, click-through), turns (keyboard-navigable turn browser with full message content), thread view (band ribbon + per-turn projection with the derivation content actually used, plus the live tail since compact)
 - Deep links throughout (`#/thread/<host>/<id>/<tab>[/<turn>]`), `/` to search, Esc to go back, j/k in turns
 

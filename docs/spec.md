@@ -84,6 +84,41 @@ all message tokens.
    membership visually (color-coded rail), the summary/rendering content actually used
    for that band entry, and degraded/gap markers. No projection → whole thread is live.
 
+### Hermes host (registry-less)
+
+The Hermes agent (python fork at /srv/work/hermes-agent) embeds lhc-py. Storage is
+per profile, with NO registry.sqlite:
+
+- default profile: `~/.hermes/lhc/threads/*.sqlite`
+- named profiles: `~/.hermes/profiles/<name>/lhc/threads/*.sqlite`
+- `HERMES_HOME` env overrides `~/.hermes`.
+
+Thread files use the identical schema (lhc-py is a byte-parity port). The filename
+stem is the Hermes session id (e.g. `20260721_174211_b5d6a6`); thread id and
+created_at come from `thread_metadata` inside the file. Title: no registry title
+exists — use the session-id stem, plus the profile as a suffix or badge. cwd: null.
+The console lists these by scanning the threads dirs (mtime-cached identity reads).
+
+### Launch commands
+
+Every non-t3code thread carries a launch recipe (server-computed):
+
+- pi-lhc: `cd <cwd> && pi-lhc --lhc-thread <threadId>` (no cd part when cwd null)
+- cc-lhc: `cd <cwd> && cc-lhc --resume <rolloutSessionId>` where rolloutSessionId is
+  the newest `cc_session_lineage` row for the thread in `~/.cc-lhc/cc-lhc.sqlite`
+  (read-only). No lineage row → no launch (null with a reason).
+- codex-lhc: `cd <cwd> && codex-lhc resume <sessionId>` from `codex_session_lineage`
+  in `~/.codex-lhc/codex-lhc.sqlite`; same null fallback.
+- hermes: `hermes --resume <sessionStem>` plus `--profile <name>` when the thread
+  lives under a profile; no cd (hermes restores the session's recorded cwd itself).
+- t3code: null (web-managed host).
+
+UI: a "launch" affordance on list rows and the detail header opens a modal showing
+the command; it auto-copies to the clipboard on open when the Clipboard API allows
+(plain-http origins over Tailscale do NOT have `navigator.clipboard` — fall back to
+a hidden textarea + `document.execCommand("copy")`), and always offers a copy
+button (copy → close). Esc, ✕, and backdrop click close it.
+
 ## API surface (server)
 
 Existing: `/api/hosts`, `/api/threads` (aggregated + quick stats, mtime-cached),

@@ -8,6 +8,7 @@ import {
 } from "./api.ts";
 import { el, fmtAgo, fmtBytes, fmtCount, fmtStamp, fmtTokens } from "./format.ts";
 import { histogramPanel } from "./histogram.ts";
+import { closeLaunchModal, openLaunchModal } from "./launchmodal.ts";
 import { viewTabPanel } from "./viewtab.ts";
 
 export type Tab = "overview" | "histogram" | "turns" | "view";
@@ -85,6 +86,7 @@ let detachPage: (() => void) | null = null;
 
 /** Drop any tab-scoped bindings; the router calls this before each render. */
 export function teardownDetail(): void {
+  closeLaunchModal();
   detachKeys?.();
   detachKeys = null;
   detachChart?.();
@@ -235,7 +237,7 @@ function threadHeader(
   st: ThreadState,
   reload: () => void,
 ): { node: HTMLElement; paintFresh: () => void } {
-  const { thread, overview } = st.ov;
+  const { thread, launch, overview } = st.ov;
   const s = overview.stats;
   const head = el("div", "detail-head");
 
@@ -261,6 +263,14 @@ function threadHeader(
   refreshBtn.title = "re-read the thread file now";
   refreshBtn.onclick = reload;
   fresh.append(freshLabel, el("span", "dim", " · "), refreshBtn);
+  // No resume path for this host (or no lineage row) — show no dead affordance.
+  if (launch) {
+    const launchBtn = el("button", "linkish launch-link", "launch") as HTMLButtonElement;
+    launchBtn.type = "button";
+    launchBtn.title = launch.command;
+    launchBtn.onclick = () => openLaunchModal(launch.command);
+    fresh.append(el("span", "dim", " · "), launchBtn);
+  }
   stamps.append(fresh);
   head.append(stamps);
 

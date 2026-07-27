@@ -12,6 +12,10 @@ export interface QuickStats {
   summary: string | null;
 }
 
+export interface LaunchRecipe {
+  command: string;
+}
+
 export interface ThreadRow {
   hostId: string;
   threadId: string;
@@ -21,7 +25,13 @@ export interface ThreadRow {
   createdAt: string;
   fileSizeBytes: number | null;
   fileMtime: string | null;
+  /** Host profile (registry-less hosts like hermes). */
+  profile?: string | null;
+  /** Host session id — the thread file's stem (registry-less hosts). */
+  sessionId?: string | null;
   stats: QuickStats | null;
+  /** Resume command, null when the host has no resume path. */
+  launch?: LaunchRecipe | null;
 }
 
 export interface HostRow {
@@ -92,6 +102,7 @@ export interface ViewInfo {
 
 export interface OverviewResponse {
   thread: ThreadRow;
+  launch: LaunchRecipe | null;
   overview: {
     threadId: string;
     createdAt: string;

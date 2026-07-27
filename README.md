@@ -44,9 +44,14 @@ vp run -r test
 
 Thread ids accept unique prefixes (e.g. `th_a485`).
 
+## Features
+
+- **Finder** — cross-host list with per-thread summaries (latest brief chunk summary), context tokens, sortable columns, host/directory/text filters, health dots, live refresh
+- **Detail tabs** — overview (identity/volume/view/health), histogram (per-turn stacked token bars by message kind, compact-point marker, click-through), turns (keyboard-navigable turn browser with full message content), thread view (band ribbon + per-turn projection with the derivation content actually used, plus the live tail since compact)
+- Deep links throughout (`#/thread/<host>/<id>/<tab>[/<turn>]`), `/` to search, Esc to go back, j/k in turns
+
 ## Roadmap
 
-1. **Finder** (done, first pass) — cross-host list, filter/search, thread drill-down
-2. **Navigator/visualizations** — band ribbons, token mass over time, chunk maps, lineage/fork graphs
-3. **Search** — content search across threads (FTS index in a console-owned cache DB)
-4. **Actions** — relaunch helpers, then edit/prune/smart-compact (via the LHC SDK, which owns mutation invariants)
+1. **Search** — content search across threads (FTS index in a console-owned cache DB)
+2. **More visualizations** — token mass over time, chunk maps, lineage/fork graphs
+3. **Actions** — relaunch helpers, then edit/prune/smart-compact (via the LHC SDK, which owns mutation invariants)

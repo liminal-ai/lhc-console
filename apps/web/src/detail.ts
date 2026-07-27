@@ -4,9 +4,11 @@ import {
   type OverviewResponse,
   type TurnKindRow,
   type TurnRow,
+  type ViewArrangement,
 } from "./api.ts";
 import { el, fmtAgo, fmtBytes, fmtCount, fmtStamp, fmtTokens } from "./format.ts";
 import { histogramPanel } from "./histogram.ts";
+import { viewTabPanel } from "./viewtab.ts";
 
 export type Tab = "overview" | "histogram" | "turns" | "view";
 
@@ -31,6 +33,8 @@ interface ThreadState {
   messages: Map<string, MessageRow[]>;
   /** Histogram data, loaded on first visit to that tab and kept after. */
   kinds: TurnKindRow[] | null;
+  /** Thread-view projection, loaded on first visit to that tab and kept after. */
+  arrangement: ViewArrangement | null;
   selectedTurnOrder: number | null;
 }
 
@@ -57,6 +61,7 @@ async function loadThread(hostId: string, threadId: string): Promise<ThreadState
     turns,
     messages: new Map(),
     kinds: null,
+    arrangement: null,
     selectedTurnOrder: null,
   };
   cache.set(key, st);
@@ -139,7 +144,7 @@ export async function renderThread(
       root.append(histogramTab(st));
       break;
     case "view":
-      root.append(stubPanel("thread view"));
+      root.append(viewTab(st));
       break;
   }
 
@@ -186,10 +191,37 @@ function threadHeader(st: ThreadState): HTMLElement {
   return head;
 }
 
-function stubPanel(label: string): HTMLElement {
-  const panel = el("div", "panel stub");
-  panel.append(el("div", "hint", `${label} — coming in a later slice`));
-  return panel;
+// --- thread view tab --------------------------------------------------------
+
+function viewTab(st: ThreadState): HTMLElement {
+  const host = el("div", "vt-host");
+
+  const mount = (data: ViewArrangement): void => {
+    host.replaceChildren(
+      viewTabPanel({
+        data,
+        turnHref: (turnOrder) => `#${threadPath(st, "turns", turnOrder)}`,
+      }),
+    );
+  };
+
+  if (st.arrangement) {
+    mount(st.arrangement);
+    return host;
+  }
+
+  host.append(el("div", "hint", "loading…"));
+  api
+    .viewArrangement(st.hostId, st.threadId)
+    .then((data) => {
+      st.arrangement = data;
+      // The tab may have been navigated away from while the fetch was in flight.
+      if (host.isConnected) mount(data);
+    })
+    .catch((e: unknown) => {
+      if (host.isConnected) host.replaceChildren(el("div", "error", String(e)));
+    });
+  return host;
 }
 
 // --- histogram tab ----------------------------------------------------------

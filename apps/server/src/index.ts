@@ -1,6 +1,7 @@
 import Fastify from "fastify";
 import {
   discoverHosts,
+  launchRecipe,
   listMessages,
   listThreads,
   listTurns,
@@ -78,7 +79,11 @@ app.get("/api/threads", async (req, reply) => {
     }
   });
   if (q.cwd) threads = threads.filter((t) => t.cwd === q.cwd);
-  let enriched = threads.map((t) => ({ ...t, stats: cachedQuickStats(t) }));
+  let enriched = threads.map((t) => ({
+    ...t,
+    stats: cachedQuickStats(t),
+    launch: launchRecipe(t),
+  }));
   if (q.q) {
     const needle = q.q.toLowerCase();
     enriched = enriched.filter(
@@ -105,7 +110,11 @@ app.get("/api/threads/:hostId/:threadId", async (req, reply) => {
   const found = lookupThread(hostId, threadId);
   if ("error" in found) return reply.code(found.code).send({ error: found.error });
   const { thread } = found;
-  return { thread, overview: threadOverview(thread.filePath) };
+  return {
+    thread,
+    launch: launchRecipe(thread),
+    overview: threadOverview(thread.filePath),
+  };
 });
 
 app.get("/api/threads/:hostId/:threadId/turns", async (req, reply) => {

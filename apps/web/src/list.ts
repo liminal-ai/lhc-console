@@ -1,5 +1,6 @@
 import { api, type ThreadRow } from "./api.ts";
 import { el, fmtAgo, fmtStamp, fmtTokens, splitDir } from "./format.ts";
+import { closeLaunchModal, openLaunchModal } from "./launchmodal.ts";
 
 type SortKey = "host" | "title" | "dir" | "summary" | "turns" | "context" | "created" | "activity";
 
@@ -23,6 +24,23 @@ const COLUMNS: Column[] = [
   { key: "activity", label: "last activity", cls: "col-when", numeric: true },
 ];
 
+/**
+ * The directory bucket a thread belongs to. Registry hosts bucket by cwd;
+ * registry-less hosts (hermes) have no cwd, so they bucket by profile.
+ */
+function dirBucket(t: ThreadRow): { key: string; label: string; title: string } | null {
+  if (t.cwd) return { key: t.cwd, label: splitDir(t.cwd).base, title: t.cwd };
+  if (t.profile !== undefined) {
+    const name = t.profile ?? "default";
+    return {
+      key: `${t.hostId}:profile:${name}`,
+      label: `profile:${name}`,
+      title: `${t.hostId} profile ${name}`,
+    };
+  }
+  return null;
+}
+
 function lastActivity(t: ThreadRow): string {
   return t.stats?.lastEventAt ?? t.fileMtime ?? t.createdAt;
 }
@@ -35,7 +53,7 @@ function sortValue(t: ThreadRow, key: SortKey): string | number {
     case "title":
       return (t.title ?? t.threadId).toLowerCase();
     case "dir":
-      return (t.cwd ?? "￿").toLowerCase();
+      return (dirBucket(t)?.label ?? "￿").toLowerCase();
     case "summary":
       return (t.stats?.summary ?? "￿").toLowerCase();
     case "turns":
@@ -66,6 +84,7 @@ let teardown: (() => void) | null = null;
 
 /** Drop the poll loop and key bindings; the router calls this before routing. */
 export function teardownList(): void {
+  closeLaunchModal();
   teardown?.();
   teardown = null;
 }
@@ -132,6 +151,7 @@ export async function renderList(app: HTMLElement): Promise<void> {
     headCells.set(col.key, th);
     headRow.append(th);
   }
+  headRow.append(el("th", "col-launch"));
   thead.append(headRow);
   table.append(thead);
   const tbody = el("tbody");
@@ -147,17 +167,23 @@ export async function renderList(app: HTMLElement): Promise<void> {
   /** Rebuild directory options from whatever the host filter admits. */
   function paintDirOptions(): void {
     const scope = filterHost ? threads.filter((t) => t.hostId === filterHost) : threads;
-    const dirs = [...new Set(scope.map((t) => t.cwd).filter((c): c is string => !!c))].sort(
-      (a, b) => splitDir(a).base.localeCompare(splitDir(b).base) || a.localeCompare(b),
+    const buckets = new Map<string, { label: string; title: string }>();
+    let hasNone = false;
+    for (const t of scope) {
+      const b = dirBucket(t);
+      if (b) buckets.set(b.key, { label: b.label, title: b.title });
+      else hasNone = true;
+    }
+    const keys = [...buckets.keys()].sort(
+      (a, b) => buckets.get(a)!.label.localeCompare(buckets.get(b)!.label) || a.localeCompare(b),
     );
-    const hasNone = scope.some((t) => !t.cwd);
-    if (filterDir && filterDir !== NO_DIR && !dirs.includes(filterDir)) filterDir = "";
+    if (filterDir && filterDir !== NO_DIR && !buckets.has(filterDir)) filterDir = "";
     if (filterDir === NO_DIR && !hasNone) filterDir = "";
     dirSel.replaceChildren();
     dirSel.append(new Option("all directories", ""));
-    for (const d of dirs) {
-      const opt = new Option(splitDir(d).base, d);
-      opt.title = d;
+    for (const k of keys) {
+      const opt = new Option(buckets.get(k)!.label, k);
+      opt.title = buckets.get(k)!.title;
       dirSel.append(opt);
     }
     if (hasNone) dirSel.append(new Option("no directory", NO_DIR));
@@ -182,12 +208,14 @@ export async function renderList(app: HTMLElement): Promise<void> {
     const needle = filterText.trim().toLowerCase();
     const rows = threads.filter((t) => {
       if (filterHost && t.hostId !== filterHost) return false;
-      if (filterDir === NO_DIR && t.cwd) return false;
-      if (filterDir && filterDir !== NO_DIR && t.cwd !== filterDir) return false;
+      const bucket = dirBucket(t);
+      if (filterDir === NO_DIR && bucket) return false;
+      if (filterDir && filterDir !== NO_DIR && bucket?.key !== filterDir) return false;
       if (!needle) return true;
       return (
         t.threadId.toLowerCase().includes(needle) ||
         (t.title ?? "").toLowerCase().includes(needle) ||
+        (dirBucket(t)?.label ?? "").toLowerCase().includes(needle) ||
         (t.cwd ?? "").toLowerCase().includes(needle) ||
         (t.stats?.summary ?? "").toLowerCase().includes(needle)
       );
@@ -349,10 +377,18 @@ function threadRow(t: ThreadRow): HTMLElement {
   tr.append(title);
 
   const dir = el("td", "col-dir");
-  const { parent, base } = splitDir(t.cwd);
-  if (t.cwd) dir.title = t.cwd;
-  if (parent) dir.append(el("span", "dir-parent", parent));
-  dir.append(el("span", t.cwd ? "dir-base" : "dim", base));
+  const bucket = dirBucket(t);
+  if (t.cwd) {
+    dir.title = t.cwd;
+    const { parent, base } = splitDir(t.cwd);
+    if (parent) dir.append(el("span", "dir-parent", parent));
+    dir.append(el("span", "dir-base", base));
+  } else if (bucket) {
+    dir.title = bucket.title;
+    dir.append(el("span", "dir-profile", bucket.label));
+  } else {
+    dir.append(el("span", "dim", "—"));
+  }
   tr.append(dir);
 
   const summary = el("td", "col-summary");
@@ -367,5 +403,21 @@ function threadRow(t: ThreadRow): HTMLElement {
   const activity = el("td", "col-when", fmtAgo(lastActivity(t)));
   activity.title = new Date(lastActivity(t)).toLocaleString();
   tr.append(activity);
+
+  const launchCell = el("td", "col-launch");
+  const cmd = t.launch?.command;
+  if (cmd) {
+    const btn = el("button", "launch-link", "launch") as HTMLButtonElement;
+    btn.type = "button";
+    btn.title = cmd;
+    // The row is clickable; the launch affordance must not navigate.
+    btn.onclick = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      openLaunchModal(cmd);
+    };
+    launchCell.append(btn);
+  }
+  tr.append(launchCell);
   return tr;
 }

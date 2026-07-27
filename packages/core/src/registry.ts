@@ -1,6 +1,7 @@
 import { statSync } from "node:fs";
 import type { HostDescriptor } from "./hosts.ts";
 import { withDb } from "./db.ts";
+import { scanHostThreads } from "./scan.ts";
 
 export interface ThreadSummary {
   hostId: string;
@@ -13,6 +14,10 @@ export interface ThreadSummary {
   fileSizeBytes: number | null;
   /** mtime of the thread file (ISO), null when missing. */
   fileMtime: string | null;
+  /** Host profile the thread lives under (scan hosts only). */
+  profile?: string | null;
+  /** Host session id — the thread file's stem (scan hosts only). */
+  sessionId?: string | null;
 }
 
 interface RegistryRow {
@@ -23,8 +28,30 @@ interface RegistryRow {
   created_at: string;
 }
 
-/** List every thread in a host's registry, stat-enriched. */
+/**
+ * Registry-less hosts: identity comes from each thread file, the title from
+ * its filename stem (the host session id), and there is no recorded cwd.
+ */
+function listScannedThreads(host: HostDescriptor): ThreadSummary[] {
+  return scanHostThreads(host)
+    .map((t) => ({
+      hostId: host.id,
+      threadId: t.threadId,
+      filePath: t.filePath,
+      title: t.sessionId,
+      cwd: null,
+      createdAt: t.createdAt,
+      fileSizeBytes: t.fileSizeBytes,
+      fileMtime: t.fileMtime,
+      profile: t.profile,
+      sessionId: t.sessionId,
+    }))
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+
+/** List every thread a host exposes, stat-enriched. */
 export function listThreads(host: HostDescriptor): ThreadSummary[] {
+  if (host.kind === "scan" || !host.registryPath) return listScannedThreads(host);
   const rows = withDb(host.registryPath, (db) =>
     db
       .prepare(

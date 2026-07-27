@@ -462,14 +462,24 @@ function threadRow(t: ThreadRow, setHidden: (t: ThreadRow, hidden: boolean) => v
     ) as HTMLButtonElement;
     btn.type = "button";
     btn.title = live ? `running: ${cmd}` : cmd;
+    /*
+     * Something outside the console holds this session. Mark it so a glance
+     * down the list shows which threads already have a live window somewhere —
+     * our own terminals are not marked; they get the "terminal" affordance.
+     */
+    const strangers = (t.launch?.attached ?? []).filter((a) => a.source === "process");
+    const mark =
+      t.launch?.inUse && strangers.length > 0 ? el("span", "attached-mark dim", "attached") : null;
+    if (mark) mark.title = strangers.map((a) => `pid ${a.pid}: ${a.args}`).join("\n");
     // The row is clickable; the launch affordance must not navigate.
     btn.onclick = (e) => {
       e.preventDefault();
       e.stopPropagation();
       if (live) void openThreadTerminal(t.hostId, t.threadId);
-      else openLaunchModal(cmd, { hostId: t.hostId, threadId: t.threadId });
+      else openLaunchModal(t.launch ?? cmd, { hostId: t.hostId, threadId: t.threadId });
     };
     launchCell.append(btn);
+    if (mark) launchCell.append(mark);
   }
   // Hide/unhide sits at the row's right end, dim until the row is hovered.
   // No confirm: it is instantly reversible from the hidden toggle.

@@ -12,8 +12,24 @@ export interface QuickStats {
   summary: string | null;
 }
 
+/** A live process (or console terminal) already attached to a session. */
+export interface Attachment {
+  pid: number;
+  source: "process" | "terminal";
+  args: string;
+  startedAt?: string;
+}
+
 export interface LaunchRecipe {
   command: string;
+  /** Identifier the host resumes by; null when it resumes without one. */
+  sessionRef?: string | null;
+  /**
+   * Something OTHER than one of our terminals is already attached. A second
+   * writer on one session corrupts capture, so this gates the launch UI.
+   */
+  inUse?: boolean;
+  attached?: Attachment[];
 }
 
 export interface ThreadRow {
@@ -263,6 +279,8 @@ export const api = {
     hostId?: string;
     threadId?: string;
     fresh?: boolean;
+    /** Spawn even though the one-writer guard found an attachment. */
+    force?: boolean;
     cols?: number;
     rows?: number;
     devCommand?: string;

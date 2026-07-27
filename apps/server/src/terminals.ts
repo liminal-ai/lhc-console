@@ -15,6 +15,7 @@ import { spawn, type IPty } from "@lydell/node-pty";
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import type { WebSocket } from "@fastify/websocket";
 import { launchRecipe, type ThreadSummary } from "@lhc-console/core";
+import { detectAttachedOne, invalidateProcessScan, type OwnTerminal } from "./attach-detect.ts";
 
 /** Total scrollback kept per terminal. Oldest output is dropped first. */
 const BUFFER_CAP = 2_000_000;
@@ -201,6 +202,20 @@ function findRunningFor(hostId: string, threadId: string): Terminal | undefined 
   return undefined;
 }
 
+/**
+ * Running PTYs and the thread each was launched for, for the one-writer guard:
+ * a terminal of ours counts as an attachment, and anything under its pid is
+ * that terminal rather than a stranger.
+ */
+export function ownTerminals(): OwnTerminal[] {
+  const out: OwnTerminal[] = [];
+  for (const t of terminals.values()) {
+    if (t.status !== "running") continue;
+    out.push({ pid: t.pty.pid, hostId: t.threadRef.hostId, threadId: t.threadRef.threadId });
+  }
+  return out;
+}
+
 function removeTerminal(t: Terminal): void {
   if (t.status === "exited") {
     terminals.delete(t.id);
@@ -273,6 +288,7 @@ export function registerTerminalRoutes(
       hostId?: string;
       threadId?: string;
       fresh?: boolean;
+      force?: boolean;
       cols?: number;
       rows?: number;
       devCommand?: string;
@@ -319,8 +335,26 @@ export function registerTerminalRoutes(
 
     if (!body.fresh) {
       const existing = findRunningFor(thread.hostId, thread.threadId);
+      // Idempotent return: this IS the attached writer, so no guard applies.
       if (existing) return reply.send(publicView(existing));
     }
+
+    /*
+     * One-writer guard. Past the idempotent return, spawning means adding a
+     * writer to this session — and a second writer freezes capture for one of
+     * them. Refuse when anything already holds it (including one of our own
+     * terminals, when `fresh` asked for a second) unless the caller insists.
+     */
+    if (!body.force) {
+      const info = detectAttachedOne(
+        { hostId: thread.hostId, threadId: thread.threadId, recipe },
+        ownTerminals(),
+      );
+      if (info.attached.length > 0) {
+        return reply.code(409).send({ error: "session in use", attached: info.attached });
+      }
+    }
+
     if (runningCount() >= MAX_RUNNING) {
       return reply.code(429).send({ error: `terminal limit reached (${MAX_RUNNING})` });
     }
@@ -335,6 +369,9 @@ export function registerTerminalRoutes(
       cols,
       rows,
     });
+    // The new pty must be visible to the next guard check, not hidden behind
+    // the 3s scan cache — otherwise a double click spawns two writers.
+    invalidateProcessScan();
     return reply.code(201).send(publicView(t));
   });
 

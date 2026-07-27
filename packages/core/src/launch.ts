@@ -1,12 +1,21 @@
 import { statSync } from "node:fs";
 import { join } from "node:path";
+import { recoverRolloutSessionId } from "./cc-rollout.ts";
 import { describeHost } from "./hosts.ts";
 import type { ThreadSummary } from "./registry.ts";
 import { withDb } from "./db.ts";
 
-/** The command that resumes a thread in its own host. */
+/**
+ * How a thread resumes on its host.
+ *
+ * Every non-t3code thread gets one of these, even when there is no command to
+ * run: "no recipe → no affordance" left the user staring at rows with nothing
+ * to click and no explanation, which is worse than an honest dead end. When
+ * `command` is null, `reason` says why in one sentence the UI can print.
+ */
 export interface LaunchRecipe {
-  command: string;
+  /** The command to run, or null when this thread cannot be resumed. */
+  command: string | null;
   /**
    * The identifier the host resumes by — cc/codex lineage session id, the
    * hermes session stem, the thread id for pi-lhc. Null when the host resumes
@@ -14,6 +23,15 @@ export interface LaunchRecipe {
    * it is computed here rather than re-derived (and re-read) downstream.
    */
   sessionRef: string | null;
+  /** Why there is no command. Only set when `command` is null. */
+  reason?: string;
+  /** Session id found in the rollout files rather than the lineage DB. */
+  recovered?: boolean;
+  /**
+   * The command resumes something weaker than this exact session:
+   * `"continue"` means `--continue`, i.e. the newest session in the cwd.
+   */
+  fallback?: "continue";
 }
 
 /** Shell-quote only when the value has characters a shell would treat specially. */
@@ -80,9 +98,14 @@ function lineageFor(hostId: string): Map<string, string> {
   return byThread;
 }
 
+function unavailable(reason: string): LaunchRecipe {
+  return { command: null, sessionRef: null, reason };
+}
+
 /**
- * The command that resumes this thread on its host, or null when the host has
- * no resume path (t3code is web-managed) or its lineage is unknown.
+ * How this thread resumes on its host. Null only for hosts with no resume path
+ * at all (t3code is web-managed) — every other thread gets a recipe, which may
+ * itself carry `command: null` plus a reason.
  */
 export function launchRecipe(thread: ThreadSummary): LaunchRecipe | null {
   switch (thread.hostId) {
@@ -93,18 +116,45 @@ export function launchRecipe(thread: ThreadSummary): LaunchRecipe | null {
       };
     case "cc-lhc": {
       const sid = lineageFor("cc-lhc").get(thread.threadId);
-      return sid
-        ? { command: withCwd(thread.cwd, `cc-lhc --resume ${shArg(sid)}`), sessionRef: sid }
-        : null;
+      if (sid)
+        return { command: withCwd(thread.cwd, `cc-lhc --resume ${shArg(sid)}`), sessionRef: sid };
+      /*
+       * No lineage row. That DB is wipeable and has been wiped, so treat its
+       * silence as missing bookkeeping rather than a missing session: look the
+       * id up in Claude Code's own rollout files, and fall back to
+       * `--continue` (newest session in this directory) when even that misses.
+       */
+      if (!thread.cwd) {
+        return unavailable(
+          "no lineage row for this thread and no recorded directory, so there is nothing to resume by",
+        );
+      }
+      const recovered = recoverRolloutSessionId(thread.filePath, thread.cwd, thread.fileMtime);
+      if (recovered) {
+        return {
+          command: withCwd(thread.cwd, `cc-lhc --resume ${shArg(recovered)}`),
+          sessionRef: recovered,
+          recovered: true,
+        };
+      }
+      return {
+        command: withCwd(thread.cwd, `cc-lhc --continue`),
+        sessionRef: null,
+        fallback: "continue",
+      };
     }
     case "codex-lhc": {
       const sid = lineageFor("codex-lhc").get(thread.threadId);
       return sid
         ? { command: withCwd(thread.cwd, `codex-lhc resume ${shArg(sid)}`), sessionRef: sid }
-        : null;
+        : unavailable(
+            "no codex session lineage row for this thread, so the session id to resume is unknown",
+          );
     }
     case "hermes": {
-      if (!thread.sessionId) return null;
+      if (!thread.sessionId) {
+        return unavailable("this hermes thread has no session file stem to resume by");
+      }
       // Hermes restores the session's own recorded cwd, so no `cd` part.
       const profile = thread.profile ? `--profile ${shArg(thread.profile)} ` : "";
       return {
@@ -112,7 +162,9 @@ export function launchRecipe(thread: ThreadSummary): LaunchRecipe | null {
         sessionRef: thread.sessionId,
       };
     }
+    case "t3code-lhc":
+      return null; // web-managed host: nothing to launch, no affordance
     default:
-      return null;
+      return unavailable(`no resume path is known for host ${thread.hostId}`);
   }
 }

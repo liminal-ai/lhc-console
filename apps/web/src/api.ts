@@ -21,15 +21,24 @@ export interface Attachment {
 }
 
 export interface LaunchRecipe {
-  command: string;
+  /** The command to run, or null when this thread cannot be resumed. */
+  command: string | null;
   /** Identifier the host resumes by; null when it resumes without one. */
   sessionRef?: string | null;
-  /**
-   * Something OTHER than one of our terminals is already attached. A second
-   * writer on one session corrupts capture, so this gates the launch UI.
-   */
+  /** Why there is no command. Only set when `command` is null. */
+  reason?: string;
+  /** Session id found in the rollout files because the lineage DB had no row. */
+  recovered?: boolean;
+  /** The command resumes something weaker: `--continue`, not this session. */
+  fallback?: "continue";
+  /** Something OTHER than one of our terminals is already attached. */
   inUse?: boolean;
   attached?: Attachment[];
+  /**
+   * Whether a second writer is destructive on this host. "single" (cc-lhc,
+   * codex-lhc) warns and needs `force`; "shared" (hermes, pi-lhc) just notes it.
+   */
+  writerPolicy?: "single" | "shared";
 }
 
 export interface ThreadRow {
@@ -46,7 +55,7 @@ export interface ThreadRow {
   /** Host session id — the thread file's stem (registry-less hosts). */
   sessionId?: string | null;
   stats: QuickStats | null;
-  /** Resume command, null when the host has no resume path. */
+  /** Resume recipe, null only for hosts with no resume path at all (t3code). */
   launch?: LaunchRecipe | null;
   /** Hidden from the default list by a console-side preference. */
   hidden?: boolean;

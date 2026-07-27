@@ -450,8 +450,11 @@ function threadRow(t: ThreadRow, setHidden: (t: ThreadRow, hidden: boolean) => v
   tr.append(activity);
 
   const launchCell = el("td", "col-launch");
-  const cmd = t.launch?.command;
-  if (cmd) {
+  const launch = t.launch;
+  const cmd = launch?.command;
+  // The affordance is present whenever the host has any resume path at all —
+  // even with no command, the modal is where the "why not" lives.
+  if (launch) {
     // A live terminal for this thread takes over the affordance: no modal,
     // straight to the workspace screen it is already on.
     const live = terminalFor(t.hostId, t.threadId);
@@ -461,22 +464,27 @@ function threadRow(t: ThreadRow, setHidden: (t: ThreadRow, hidden: boolean) => v
       live ? "terminal" : "launch",
     ) as HTMLButtonElement;
     btn.type = "button";
-    btn.title = live ? `running: ${cmd}` : cmd;
+    btn.title = live ? `running: ${cmd}` : (cmd ?? launch.reason ?? "no resume path");
     /*
      * Something outside the console holds this session. Mark it so a glance
      * down the list shows which threads already have a live window somewhere —
      * our own terminals are not marked; they get the "terminal" affordance.
+     * The marker is a warning only on single-writer hosts; on shared ones it is
+     * neutral information, and styled to say so.
      */
-    const strangers = (t.launch?.attached ?? []).filter((a) => a.source === "process");
+    const strangers = (launch.attached ?? []).filter((a) => a.source === "process");
+    const shared = launch.writerPolicy === "shared";
     const mark =
-      t.launch?.inUse && strangers.length > 0 ? el("span", "attached-mark dim", "attached") : null;
+      strangers.length > 0 && (shared || launch.inUse)
+        ? el("span", shared ? "attached-mark shared dim" : "attached-mark dim", "attached")
+        : null;
     if (mark) mark.title = strangers.map((a) => `pid ${a.pid}: ${a.args}`).join("\n");
     // The row is clickable; the launch affordance must not navigate.
     btn.onclick = (e) => {
       e.preventDefault();
       e.stopPropagation();
       if (live) void openThreadTerminal(t.hostId, t.threadId);
-      else openLaunchModal(t.launch ?? cmd, { hostId: t.hostId, threadId: t.threadId });
+      else openLaunchModal(launch, { hostId: t.hostId, threadId: t.threadId });
     };
     launchCell.append(btn);
     if (mark) launchCell.append(mark);

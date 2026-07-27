@@ -1,10 +1,12 @@
 /**
  * One-writer guard: find processes already attached to a thread's session.
  *
- * Two writers on one agent session corrupt capture — the rollout file freezes
- * for one of them and its turns are lost for good. This module is the console's
- * best-effort answer to "is something already holding this session?", built on
- * a single `ps` scan matched against per-host argv patterns.
+ * On a "single" writer-policy host (cc-lhc, codex-lhc) two writers on one
+ * session corrupt capture — the rollout file freezes for one of them and its
+ * turns are lost for good. On "shared" hosts (hermes, pi-lhc) a second
+ * attachment is ordinary and merely worth mentioning. This module answers "is
+ * something already holding this session?" from a single `ps` scan matched
+ * against per-host argv patterns; what that answer *means* is the policy's job.
  *
  * It is pattern matching, not bookkeeping: a host started without a session
  * argument (a fresh `cc-lhc` with no `--resume`) is invisible here, and a
@@ -13,7 +15,7 @@
  */
 
 import { execFileSync } from "node:child_process";
-import type { LaunchRecipe } from "@lhc-console/core";
+import { writerPolicyFor, type LaunchRecipe, type WriterPolicy } from "@lhc-console/core";
 
 /** One live process (or console terminal) holding a thread's session. */
 export interface Attachment {
@@ -29,6 +31,12 @@ export interface AttachInfo {
   attached: Attachment[];
   /** Any attachment that is NOT one of our own terminals. */
   inUse: boolean;
+  /**
+   * The host's writer policy, carried alongside the hits so every consumer
+   * reads the same answer to "does this attachment matter?". "single" hosts
+   * warn and refuse; "shared" hosts merely mention it.
+   */
+  writerPolicy: WriterPolicy;
 }
 
 const ARGS_CAP = 120;
@@ -194,7 +202,7 @@ export function detectAttached(
         attached.push({
           pid: t.pid,
           source: "terminal",
-          args: (p?.args ?? s.recipe!.command).slice(0, ARGS_CAP),
+          args: (p?.args ?? s.recipe!.command ?? "").slice(0, ARGS_CAP),
           ...(p?.startedAt ? { startedAt: p.startedAt } : {}),
         });
       }
@@ -216,7 +224,11 @@ export function detectAttached(
       });
     }
     if (attached.length === 0) continue;
-    result.set(key, { attached, inUse: attached.some((a) => a.source === "process") });
+    result.set(key, {
+      attached,
+      inUse: attached.some((a) => a.source === "process"),
+      writerPolicy: writerPolicyFor(s.hostId),
+    });
   }
   return result;
 }
@@ -230,6 +242,7 @@ export function detectAttachedOne(
     detectAttached([subject], ownTerminals).get(`${subject.hostId}/${subject.threadId}`) ?? {
       attached: [],
       inUse: false,
+      writerPolicy: writerPolicyFor(subject.hostId),
     }
   );
 }

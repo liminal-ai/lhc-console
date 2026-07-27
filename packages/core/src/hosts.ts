@@ -10,6 +10,28 @@ export interface ScanRoot {
   profile: string | null;
 }
 
+/**
+ * How many live writers a host's session tolerates.
+ *
+ * "single": a second writer on the same session is destructive — the rollout
+ * file freezes for one of them and its turns are lost. Observed on cc-lhc;
+ * presumed for codex-lhc, whose rollout format and closed session handling are
+ * the same shape.
+ *
+ * "shared": multiple attachments are ordinary. hermes and pi-lhc both write
+ * through lhc's own store rather than a harness-owned rollout file, and a real
+ * hermes double-attach has been observed doing no harm. Not formally
+ * confirmed — treated as shared because warning on it was pure noise.
+ */
+export type WriterPolicy = "single" | "shared";
+
+/** Hosts where a second writer is known or presumed to destroy capture. */
+const SINGLE_WRITER_HOSTS = new Set(["cc-lhc", "codex-lhc"]);
+
+export function writerPolicyFor(hostId: string): WriterPolicy {
+  return SINGLE_WRITER_HOSTS.has(hostId) ? "single" : "shared";
+}
+
 export interface HostDescriptor {
   /** Stable host id, e.g. "cc-lhc". */
   id: string;
@@ -28,6 +50,8 @@ export interface HostDescriptor {
   threadsDir: string;
   /** Directories scanned for thread files; empty for registry hosts. */
   scanRoots: ScanRoot[];
+  /** Whether a second live writer on one session is destructive here. */
+  writerPolicy: WriterPolicy;
 }
 
 const REGISTRY_HOST_IDS = [
@@ -84,6 +108,7 @@ export function describeHost(id: string): HostDescriptor {
       registryPath: null,
       threadsDir: join(home, "lhc", "threads"),
       scanRoots,
+      writerPolicy: writerPolicyFor(id),
     };
   }
   return {
@@ -94,6 +119,7 @@ export function describeHost(id: string): HostDescriptor {
     registryPath: join(home, "registry.sqlite"),
     threadsDir: join(home, "threads"),
     scanRoots: [],
+    writerPolicy: writerPolicyFor(id),
   };
 }
 

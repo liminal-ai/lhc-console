@@ -106,12 +106,37 @@ Every non-t3code thread carries a launch recipe (server-computed):
 - pi-lhc: `cd <cwd> && pi-lhc --lhc-thread <threadId>` (no cd part when cwd null)
 - cc-lhc: `cd <cwd> && cc-lhc --resume <rolloutSessionId>` where rolloutSessionId is
   the newest `cc_session_lineage` row for the thread in `~/.cc-lhc/cc-lhc.sqlite`
-  (read-only). No lineage row → no launch (null with a reason).
+  (read-only). No lineage row → recover the id from the rollout files (below),
+  else `cd <cwd> && cc-lhc --continue` with `fallback: "continue"`.
 - codex-lhc: `cd <cwd> && codex-lhc resume <sessionId>` from `codex_session_lineage`
-  in `~/.codex-lhc/codex-lhc.sqlite`; same null fallback.
+  in `~/.codex-lhc/codex-lhc.sqlite`; no row → no command, with a reason.
 - hermes: `hermes --resume <sessionStem>` plus `--profile <name>` when the thread
   lives under a profile; no cd (hermes restores the session's recorded cwd itself).
 - t3code: null (web-managed host).
+
+**Every non-t3code thread has the affordance**, recipe or not — "no recipe → no
+affordance" left rows that were perfectly resumable looking dead, with nowhere to
+ask why. So `launchRecipe` returns null only for t3code; every other host returns a
+recipe whose `command` may be null, carrying `reason` (one sentence the modal
+prints). Recipes also carry `recovered: true` (id found in the rollout files, not
+the lineage DB) and `fallback: "continue"`, both of which the modal states in dim
+text so the user knows how sure the command is.
+
+**cc-lhc lineage-independent recovery** (`packages/core/src/cc-rollout.ts`), for
+when `cc-lhc.sqlite` is wiped or corrupt — which it has been, repeatedly. Every
+cc-lhc event's idempotency key is `cc-lhc:rollout:<lineUuid>:<blockIndex>:<kind>`,
+and `lineUuid` is the `uuid` of a line in Claude Code's own rollout JSONL under
+`~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl`. Encoding is per character:
+every non-`[a-zA-Z0-9]` becomes `-` (`/srv/work/lhc-console` →
+`-srv-work-lhc-console`; case is preserved). Take the newest 20 rollout-keyed
+idempotency keys from the thread file, list the cwd's rollouts, and open them in an
+interleaved order — newest mtime ⊕ mtime nearest the thread's last event — because
+newest alone misses a thread parked months ago in a directory of 160 rollouts and
+proximity alone misses the session that is live right now. First file containing any
+uuid names the session; its stem is the id. Bounded at 6 files, tail 512KB then head
+128KB (tail first: a resumed session appends), tail only past 50MB, cached per
+thread file mtime, entirely read-only. On the real host this recovers 9 of 10 cc-lhc
+threads that have zero lineage rows (the tenth has no rollout-keyed events at all).
 
 UI: a "launch" affordance on list rows and the detail header opens a modal showing
 the command; it auto-copies to the clipboard on open when the Clipboard API allows
@@ -159,10 +184,27 @@ and fast (avoid N+1 file opens; the aggregate list must stay instant on cached m
 
 ### One-writer guard
 
-A session takes one writer. Two hosts attached to the same session id fight over
-the rollout file: it freezes for one of them and that side's turns are lost for
-good (this happened — a second `cc-lhc --resume <sid>` started while the first
-was still alive). So before the console helps anyone attach, it looks for a
+Some sessions take one writer, and only those. On cc-lhc, two hosts attached to
+the same session id fight over the rollout file: it freezes for one of them and
+that side's turns are lost for good (this happened — a second
+`cc-lhc --resume <sid>` started while the first was still alive).
+
+So the guard is scoped by **host writer policy** (`writerPolicyFor` in
+`packages/core/src/hosts.ts`, surfaced on `HostDescriptor.writerPolicy` and on
+every launch recipe the API serves):
+
+- **`"single"` — cc-lhc, codex-lhc.** Closed harnesses owning a rollout file that
+  demonstrably (cc-lhc) or presumably (codex-lhc, same shape) takes one writer.
+  These keep the full treatment: warn strip, "attach anyway", 409-unless-`force`.
+- **`"shared"` — hermes, pi-lhc.** Both write through lhc's own store rather than
+  a harness-owned rollout file, and a real hermes double-attach has been observed
+  doing no harm. **This is not confirmed** — it is a presumption, and if a
+  shared-host double-attach is ever seen to lose turns, move the host back to
+  `"single"`. Multi-attach here is reported as neutral dim information ("also
+  attached: pid 465727 · hermes --resume …"), the primary button stays an ordinary
+  "open in terminal", and `POST /api/terminals` does not 409.
+
+Before the console helps anyone attach on a single-writer host, it looks for a
 process that already has the session.
 
 `apps/server/src/attach-detect.ts` runs one `ps -eo pid,ppid,lstart,args`
@@ -176,23 +218,26 @@ is attributed to that terminal rather than reported as a stranger, and the
 server's own process tree is ignored. Launch recipes in `/api/threads` and
 `/api/threads/:host/:id` gain `inUse` (true only for a NON-console attachment)
 and `attached: [{pid, source, args, startedAt}]`. `POST /api/terminals` answers
-`409 {error: "session in use", attached}` when anything is attached and the body
-lacks `force: true` — the idempotent "you already have a terminal for this
-thread" return happens first, so the ordinary path is unchanged. The launch
-modal shows a warn strip with the offending pids and turns its primary button
-into "attach anyway" (which posts `force`); list rows and the detail header
-carry a small dim `attached` marker with the pid in the title.
+`409 {error: "session in use", attached}` when something is attached to a
+**single**-policy thread and the body lacks `force: true` — the idempotent "you
+already have a terminal for this thread" return happens first, so the ordinary
+path is unchanged. On shared-policy hosts POST never 409s for attachment. The
+launch modal shows a warn strip with the offending pids and an "attach anyway"
+button (posting `force`) on single-policy hosts, and a plain dim "also attached"
+line on shared ones; list rows and the detail header carry a small `attached`
+marker with the pid in the title, warn-coloured for single and dim-neutral for
+shared.
 
 **This is best-effort pattern matching, and it can miss.** It only matches
 explicit session-id / thread-id arguments, so a host started fresh rather than
 resumed is invisible: a bare `node …/cc-lhc/dist/bin.js` with no `--resume` (and
 its `claude` child) is a real live writer that this guard does not see — a bare
 `cc-lhc` line is deliberately not matched, because it could belong to any
-session and matching it would flag every cc-lhc thread at once. Detection also
-needs a launch recipe, so a thread whose lineage row is missing gets no guard.
-False positives are possible in the other direction: any command line that
-happens to contain the id (a script, an editor, a `grep`) reads as an
-attachment. Treat a hit as a strong warning and a miss as "unknown" — never as
+session and matching it would flag every cc-lhc thread at once. Detection needs
+a `sessionRef`, so a `--continue` fallback recipe gets no guard. False positives
+are possible in the other direction: any command line that happens to contain
+the id (a script, an editor, a `grep`) reads as an attachment. Treat a hit on a
+single-writer host as a strong warning and a miss as "unknown" — never as
 "nothing is attached".
 
 ### Hidden threads

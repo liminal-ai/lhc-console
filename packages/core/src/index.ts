@@ -1,5 +1,6 @@
-export { describeHost, discoverHosts } from "./hosts.ts";
-export type { HostDescriptor, ScanRoot } from "./hosts.ts";
+export { describeHost, discoverHosts, writerPolicyFor } from "./hosts.ts";
+export type { HostDescriptor, ScanRoot, WriterPolicy } from "./hosts.ts";
+export { encodeProjectDir, recoverRolloutSessionId } from "./cc-rollout.ts";
 export { launchRecipe } from "./launch.ts";
 export type { LaunchRecipe } from "./launch.ts";
 export { listThreads, resolveThread } from "./registry.ts";

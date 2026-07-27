@@ -555,13 +555,6 @@ function paintBar(): void {
     };
     controlsEl.append(split);
   }
-  if (s) {
-    const kill = confirmingButton("kill pane", () => {
-      if (focusedPane) removeTerm(focusedPane, true);
-    });
-    kill.className = "ws-btn ws-kill";
-    controlsEl.append(kill);
-  }
 }
 
 // --- split popover ----------------------------------------------------------

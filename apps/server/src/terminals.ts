@@ -14,7 +14,7 @@ import { homedir } from "node:os";
 import { spawn, type IPty } from "@lydell/node-pty";
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import type { WebSocket } from "@fastify/websocket";
-import { launchRecipe, type ThreadSummary } from "@lhc-console/core";
+import { launchRecipe, writerPolicyFor, type ThreadSummary } from "@lhc-console/core";
 import { detectAttachedOne, invalidateProcessScan, type OwnTerminal } from "./attach-detect.ts";
 
 /** Total scrollback kept per terminal. Oldest output is dropped first. */
@@ -331,7 +331,12 @@ export function registerTerminalRoutes(
 
     // The command is always recomputed here; a client never gets to name it.
     const recipe = launchRecipe(thread);
-    if (!recipe) return reply.code(409).send({ error: "thread has no launch recipe" });
+    if (!recipe?.command) {
+      return reply
+        .code(409)
+        .send({ error: recipe?.reason ?? "thread has no launch recipe", reason: recipe?.reason });
+    }
+    const command = recipe.command;
 
     if (!body.fresh) {
       const existing = findRunningFor(thread.hostId, thread.threadId);
@@ -340,12 +345,13 @@ export function registerTerminalRoutes(
     }
 
     /*
-     * One-writer guard. Past the idempotent return, spawning means adding a
-     * writer to this session — and a second writer freezes capture for one of
-     * them. Refuse when anything already holds it (including one of our own
-     * terminals, when `fresh` asked for a second) unless the caller insists.
+     * One-writer guard, and only where it is real. On a "single" writer-policy
+     * host (cc-lhc, codex-lhc) spawning past the idempotent return means adding
+     * a second writer to a session that tolerates one, so refuse unless the
+     * caller insists. On "shared" hosts (hermes, pi-lhc) a second attachment is
+     * ordinary: the UI mentions it and the spawn goes through.
      */
-    if (!body.force) {
+    if (!body.force && writerPolicyFor(thread.hostId) === "single") {
       const info = detectAttachedOne(
         { hostId: thread.hostId, threadId: thread.threadId, recipe },
         ownTerminals(),
@@ -359,7 +365,7 @@ export function registerTerminalRoutes(
       return reply.code(429).send({ error: `terminal limit reached (${MAX_RUNNING})` });
     }
     const t = spawnTerminal({
-      command: recipe.command,
+      command,
       cwd: thread.cwd ?? process.env.HOME ?? homedir(),
       threadRef: {
         hostId: thread.hostId,

@@ -1234,6 +1234,12 @@ button.modal-x:hover {
   font-size: 11px;
 }
 
+/* The whole body of the modal when there is no command: give it room. */
+.modal-hint.modal-why {
+  margin-top: 12px;
+  line-height: 1.5;
+}
+
 .modal-status {
   margin-top: 10px;
   font-size: 11px;
@@ -1339,6 +1345,20 @@ button.modal-open.danger:hover {
   background: rgb(224 176 85 / 22%);
 }
 
+/*
+ * A shared-writer host's attachments are information, not a hazard: no strip,
+ * no colour, just a dim line above the command stating what else is on it.
+ */
+.modal-note {
+  margin-top: 12px;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.modal-note-proc {
+  overflow-wrap: anywhere;
+}
+
 /* The at-a-glance marker on list rows and the detail header. */
 .attached-mark {
   margin-left: 8px;
@@ -1346,6 +1366,12 @@ button.modal-open.danger:hover {
   color: var(--warn);
   opacity: 0.75;
   cursor: help;
+}
+
+/* Same marker, shared-writer host: neutral dim, no warning colour. */
+.attached-mark.shared {
+  color: var(--dim);
+  opacity: 0.7;
 }
 
 /* --- terminal workspace ---------------------------------------------------

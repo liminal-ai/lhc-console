@@ -13,7 +13,9 @@ import {
   turnKinds,
   viewBands,
   type ThreadSummary,
+  writerPolicyFor,
   type ThreadQuickStats,
+  type WriterPolicy,
 } from "@lhc-console/core";
 import { hiddenCount, hideThread, isHidden, loadPrefs, unhideThread } from "./prefs.ts";
 import { ownTerminals, registerTerminalRoutes, shutdownTerminals } from "./terminals.ts";
@@ -45,17 +47,30 @@ function cachedQuickStats(t: ThreadSummary): ThreadQuickStats | null {
 type Lookup = { thread: ThreadSummary } | { code: number; error: string };
 
 /**
- * Carry the one-writer guard on the launch recipe itself: `inUse` is true only
- * for attachments that are NOT one of our terminals (those the UI already
- * handles by jumping to the screen), and `attached` names the pids so a row can
- * say which process it means.
+ * Carry the attach state on the launch recipe itself: `inUse` is true only for
+ * attachments that are NOT one of our terminals (those the UI already handles
+ * by jumping to the screen), `attached` names the pids so a row can say which
+ * process it means, and `writerPolicy` says whether that is a warning
+ * ("single") or a neutral note ("shared").
  */
 function withAttach(
+  hostId: string,
   recipe: ReturnType<typeof launchRecipe>,
   info: AttachInfo | undefined,
-): (ReturnType<typeof launchRecipe> & { inUse: boolean; attached: AttachInfo["attached"] }) | null {
+):
+  | (ReturnType<typeof launchRecipe> & {
+      inUse: boolean;
+      attached: AttachInfo["attached"];
+      writerPolicy: WriterPolicy;
+    })
+  | null {
   if (!recipe) return null;
-  return { ...recipe, inUse: info?.inUse ?? false, attached: info?.attached ?? [] };
+  return {
+    ...recipe,
+    inUse: info?.inUse ?? false,
+    attached: info?.attached ?? [],
+    writerPolicy: info?.writerPolicy ?? writerPolicyFor(hostId),
+  };
 }
 
 /**
@@ -119,6 +134,7 @@ app.get("/api/threads", async (req, reply) => {
     hidden: isHidden(t.hostId, t.threadId),
     stats: cachedQuickStats(t),
     launch: withAttach(
+      t.hostId,
       recipes.get(`${t.hostId}/${t.threadId}`) ?? null,
       attachments.get(`${t.hostId}/${t.threadId}`),
     ),
@@ -158,7 +174,7 @@ app.get("/api/threads/:hostId/:threadId", async (req, reply) => {
   return {
     thread,
     hidden: isHidden(thread.hostId, thread.threadId),
-    launch: withAttach(recipe, attach),
+    launch: withAttach(thread.hostId, recipe, attach),
     overview: threadOverview(thread.filePath),
   };
 });

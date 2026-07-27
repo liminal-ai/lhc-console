@@ -287,7 +287,8 @@ function threadHeader(
   refreshBtn.title = "re-read the thread file now";
   refreshBtn.onclick = reload;
   fresh.append(freshLabel, el("span", "dim", " · "), refreshBtn);
-  // No resume path for this host (or no lineage row) — show no dead affordance.
+  // Present for every host with a resume path. A missing command is not a
+  // missing affordance: the modal explains why instead of leaving a blank.
   if (launch) {
     const launchBtn = el("button", "linkish launch-link") as HTMLButtonElement;
     launchBtn.type = "button";
@@ -295,7 +296,9 @@ function threadHeader(
       const live = terminalFor(thread.hostId, thread.threadId);
       launchBtn.textContent = live ? "terminal" : "launch";
       launchBtn.classList.toggle("has-term", !!live);
-      launchBtn.title = live ? `running: ${launch.command}` : launch.command;
+      launchBtn.title = live
+        ? `running: ${launch.command}`
+        : (launch.command ?? launch.reason ?? "no resume path");
     };
     paintLaunch();
     launchBtn.onclick = () => {
@@ -308,17 +311,23 @@ function threadHeader(
     // The modal stays reachable even when a terminal is already running.
     const cmdBtn = el("button", "linkish launch-cmd", "launch cmd") as HTMLButtonElement;
     cmdBtn.type = "button";
-    cmdBtn.title = launch.command;
+    cmdBtn.title = launch.command ?? launch.reason ?? "no resume path";
     cmdBtn.onclick = () =>
       openLaunchModal(launch, { hostId: thread.hostId, threadId: thread.threadId });
     const unsub = subscribeTerminals(paintLaunch);
     detachLaunch?.();
     detachLaunch = unsub;
     fresh.append(el("span", "dim", " · "), launchBtn, el("span", "dim", " · "), cmdBtn);
-    // A live writer outside the console: the same marker the list rows carry.
+    // A live writer outside the console: the same marker the list rows carry,
+    // neutral rather than warn-toned on shared-writer hosts.
     const strangers = (launch.attached ?? []).filter((a) => a.source === "process");
-    if (launch.inUse && strangers.length > 0) {
-      const mark = el("span", "attached-mark dim", "attached");
+    const shared = launch.writerPolicy === "shared";
+    if (strangers.length > 0 && (shared || launch.inUse)) {
+      const mark = el(
+        "span",
+        shared ? "attached-mark shared dim" : "attached-mark dim",
+        "attached",
+      );
       mark.title = strangers.map((a) => `pid ${a.pid}: ${a.args}`).join("\n");
       fresh.append(el("span", "dim", " · "), mark);
     }

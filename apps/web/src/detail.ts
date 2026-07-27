@@ -36,6 +36,8 @@ interface ThreadState {
   /** Thread-view projection, loaded on first visit to that tab and kept after. */
   arrangement: ViewArrangement | null;
   selectedTurnOrder: number | null;
+  /** When this state's payloads were fetched — drives the freshness readout. */
+  loadedAt: number;
 }
 
 /** Small LRU so revisiting a thread is instant without unbounded retention. */
@@ -63,6 +65,7 @@ async function loadThread(hostId: string, threadId: string): Promise<ThreadState
     kinds: null,
     arrangement: null,
     selectedTurnOrder: null,
+    loadedAt: Date.now(),
   };
   cache.set(key, st);
   while (cache.size > CACHE_MAX) cache.delete(cache.keys().next().value!);
@@ -78,6 +81,7 @@ function threadPath(st: ThreadState, tab: Tab, turnOrder?: number | null): strin
 
 let detachKeys: (() => void) | null = null;
 let detachChart: (() => void) | null = null;
+let detachPage: (() => void) | null = null;
 
 /** Drop any tab-scoped bindings; the router calls this before each render. */
 export function teardownDetail(): void {
@@ -85,6 +89,8 @@ export function teardownDetail(): void {
   detachKeys = null;
   detachChart?.();
   detachChart = null;
+  detachPage?.();
+  detachPage = null;
 }
 
 function isTypingTarget(t: EventTarget | null): boolean {
@@ -101,6 +107,19 @@ function isTypingTarget(t: EventTarget | null): boolean {
 
 let renderSeq = 0;
 
+/** Threads are appended to live; re-check the file mtime on this cadence. */
+const FRESH_MS = 30_000;
+const TICK_MS = 5_000;
+
+/**
+ * Drop this thread's cached payloads and re-run the router, which rebuilds the
+ * active tab from the hash (tab and selected turn both live there).
+ */
+function reloadThread(hostId: string, threadId: string): void {
+  cache.delete(cacheKey(hostId, threadId));
+  window.dispatchEvent(new HashChangeEvent("hashchange"));
+}
+
 export async function renderThread(
   app: HTMLElement,
   hostId: string,
@@ -115,11 +134,18 @@ export async function renderThread(
     st.selectedTurnOrder = turnOrder;
   }
 
+  document.title = `${st.ov.thread.title ?? st.threadId} · ${
+    TABS.find((t) => t.id === tab)?.label ?? tab
+  } · lhc console`;
+
+  const reload = (): void => reloadThread(hostId, threadId);
+
   const root = el("div", "page");
   const back = el("a", "back", "← all threads") as HTMLAnchorElement;
   back.href = "#/";
   root.append(back);
-  root.append(threadHeader(st));
+  const head = threadHeader(st, reload);
+  root.append(head.node);
 
   const bar = el("div", "tabbar");
   for (const t of TABS) {
@@ -149,9 +175,66 @@ export async function renderThread(
   }
 
   app.replaceChildren(root);
+
+  // --- freshness poll + page keys ------------------------------------------
+
+  let checking = false;
+  /** Cheap overview call, used purely to compare the thread file's mtime. */
+  async function checkFresh(): Promise<void> {
+    if (checking || !root.isConnected) return;
+    checking = true;
+    try {
+      const fresh = await api.overview(hostId, threadId);
+      if (!root.isConnected) return;
+      if (fresh.thread.fileMtime !== st.ov.thread.fileMtime) {
+        reload();
+        return;
+      }
+      // Nothing changed on disk — the payloads we hold are current again.
+      st.loadedAt = Date.now();
+      head.paintFresh();
+    } catch {
+      // A failed poll changes nothing; the next tick tries again.
+    } finally {
+      checking = false;
+    }
+  }
+
+  const tick = setInterval(() => {
+    if (document.hidden || !root.isConnected) return;
+    if (Date.now() - st.loadedAt >= FRESH_MS) void checkFresh();
+    else head.paintFresh();
+  }, TICK_MS);
+
+  const onFocus = (): void => {
+    if (!document.hidden && Date.now() - st.loadedAt >= TICK_MS) void checkFresh();
+  };
+  window.addEventListener("focus", onFocus);
+  document.addEventListener("visibilitychange", onFocus);
+
+  const onPageKey = (e: KeyboardEvent): void => {
+    if (e.metaKey || e.ctrlKey || e.altKey || isTypingTarget(e.target)) return;
+    if (e.key === "Escape") {
+      e.preventDefault();
+      location.hash = "/";
+    }
+  };
+  window.addEventListener("keydown", onPageKey);
+
+  detachPage?.();
+  detachPage = () => {
+    clearInterval(tick);
+    window.removeEventListener("focus", onFocus);
+    document.removeEventListener("visibilitychange", onFocus);
+    window.removeEventListener("keydown", onPageKey);
+  };
 }
 
-function threadHeader(st: ThreadState): HTMLElement {
+/** The header, plus a hook to repaint just its freshness readout. */
+function threadHeader(
+  st: ThreadState,
+  reload: () => void,
+): { node: HTMLElement; paintFresh: () => void } {
   const { thread, overview } = st.ov;
   const s = overview.stats;
   const head = el("div", "detail-head");
@@ -171,7 +254,21 @@ function threadHeader(st: ThreadState): HTMLElement {
 
   const stamps = el("div", "head-stamps dim");
   stamps.textContent = `created ${fmtStamp(overview.createdAt)}  ·  last activity ${fmtStamp(s.lastEventAt)} (${fmtAgo(s.lastEventAt)})`;
+  const fresh = el("span", "head-fresh");
+  const freshLabel = el("span", "dim");
+  const refreshBtn = el("button", "linkish", "refresh") as HTMLButtonElement;
+  refreshBtn.type = "button";
+  refreshBtn.title = "re-read the thread file now";
+  refreshBtn.onclick = reload;
+  fresh.append(freshLabel, el("span", "dim", " · "), refreshBtn);
+  stamps.append(fresh);
   head.append(stamps);
+
+  const paintFresh = (): void => {
+    const secs = Math.round((Date.now() - st.loadedAt) / 1000);
+    freshLabel.textContent = secs < 5 ? "updated just now" : `updated ${secs}s ago`;
+  };
+  paintFresh();
 
   const nums = el("div", "head-nums");
   const bits: [string, string][] = [
@@ -188,7 +285,7 @@ function threadHeader(st: ThreadState): HTMLElement {
     nums.append(item);
   }
   head.append(nums);
-  return head;
+  return { node: head, paintFresh };
 }
 
 // --- thread view tab --------------------------------------------------------
@@ -219,7 +316,9 @@ function viewTab(st: ThreadState): HTMLElement {
       if (host.isConnected) mount(data);
     })
     .catch((e: unknown) => {
-      if (host.isConnected) host.replaceChildren(el("div", "error", String(e)));
+      if (host.isConnected) {
+        host.replaceChildren(el("div", "error", e instanceof Error ? e.message : String(e)));
+      }
     });
   return host;
 }
@@ -257,7 +356,9 @@ function histogramTab(st: ThreadState): HTMLElement {
       if (host.isConnected) mount(rows);
     })
     .catch((e: unknown) => {
-      if (host.isConnected) host.replaceChildren(el("div", "error", String(e)));
+      if (host.isConnected) {
+        host.replaceChildren(el("div", "error", e instanceof Error ? e.message : String(e)));
+      }
     });
   return host;
 }
@@ -268,6 +369,16 @@ function kv(label: string, value: string, cls?: string): HTMLElement {
   const row = el("div", "kv");
   row.append(el("span", "kv-k", label));
   row.append(el("span", ["kv-v", cls].filter(Boolean).join(" "), value));
+  return row;
+}
+
+/** Same shape as `kv`, but the value navigates — used to cross-link tabs. */
+function kvLink(label: string, value: string, href: string): HTMLElement {
+  const row = el("div", "kv");
+  row.append(el("span", "kv-k", label));
+  const a = el("a", "kv-v kv-link", value) as HTMLAnchorElement;
+  a.href = href;
+  row.append(a);
   return row;
 }
 
@@ -320,7 +431,11 @@ function overviewPanel(st: ThreadState): HTMLElement {
   if (kinds.childElementCount > 0) volume.append(kinds);
   const open = s.turnCount - s.closedTurnCount;
   volume.append(
-    kv("turns", `${fmtCount(s.turnCount)} (${s.closedTurnCount} closed, ${open} open)`),
+    kvLink(
+      "turns",
+      `${fmtCount(s.turnCount)} (${s.closedTurnCount} closed, ${open} open)`,
+      `#${threadPath(st, "turns", st.selectedTurnOrder)}`,
+    ),
   );
   volume.append(kv("chunks", fmtCount(overview.chunkCount)));
   volume.append(kv("total tokens", fmtTokens(s.totalTokenEstimate)));
@@ -335,12 +450,17 @@ function overviewPanel(st: ThreadState): HTMLElement {
     view.append(kv("created", `${fmtStamp(v.createdAt)} (${fmtAgo(v.createdAt)})`));
     view.append(kv("compact point", `event ${fmtCount(v.compactPoint)}`));
     view.append(kv("covered from", `event ${fmtCount(v.coveredFrom)}`));
+    const viewHref = `#${threadPath(st, "view")}`;
     const bands = el("div", "kv-sub");
-    for (const b of v.bands) bands.append(kv(`${b.band} band`, `${fmtTokens(b.tokenCount)} tok`));
-    if (v.bands.length === 0) bands.append(kv("bands", "none stored", "dim"));
+    for (const b of v.bands) {
+      bands.append(kvLink(`${b.band} band`, `${fmtTokens(b.tokenCount)} tok`, viewHref));
+    }
+    if (v.bands.length === 0) bands.append(kvLink("bands", "none stored", viewHref));
     view.append(bands);
   } else {
-    view.append(el("div", "kv-note dim", "never compacted — whole thread is live"));
+    const note = el("a", "kv-note kv-link", "never compacted — whole thread is live");
+    (note as HTMLAnchorElement).href = `#${threadPath(st, "view")}`;
+    view.append(note);
   }
   grid.append(view);
 
@@ -410,32 +530,41 @@ function turnsPanel(st: ThreadState): HTMLElement {
     st.selectedTurnOrder = order;
     for (const [o, c] of cards) c.classList.toggle("selected", o === order);
     const card = cards.get(order);
+    // `nearest` only: never yank the list to centre a card that is already visible.
     if (card && scroll) card.scrollIntoView({ block: "nearest" });
 
     mini.className = "msg-mini";
     mini.textContent = `turn #${turn.turnOrder} · ${turn.messageCount} msgs · ${fmtTokens(turn.tokenEstimate)} tokens`;
     history.replaceState(null, "", `#${threadPath(st, "turns", order)}`);
 
+    // Bumped for cached turns too, so an in-flight chunked render is abandoned.
+    const seq = ++loadSeq;
+    const stale = (): boolean => seq !== loadSeq;
+
     const cached = st.messages.get(turn.turnId);
     if (cached) {
-      msgBody.replaceChildren(...cached.map(messageCard));
-      msgBody.scrollTop = 0;
+      paintMessages(msgBody, cached, stale);
       return;
     }
-    const seq = ++loadSeq;
-    msgBody.replaceChildren(el("div", "hint", "loading…"));
+    msgBody.replaceChildren(
+      el(
+        "div",
+        "hint msg-pending",
+        `${fmtCount(turn.messageCount)} message${turn.messageCount === 1 ? "" : "s"} · ` +
+          `${fmtTokens(turn.tokenEstimate)} tokens · loading…`,
+      ),
+    );
     api
       .messages(st.hostId, st.threadId, turn.turnId)
       .then((msgs) => {
         st.messages.set(turn.turnId, msgs);
-        if (seq !== loadSeq) return;
-        msgBody.replaceChildren(
-          ...(msgs.length ? msgs.map(messageCard) : [el("div", "hint", "no messages")]),
-        );
-        msgBody.scrollTop = 0;
+        if (stale()) return;
+        paintMessages(msgBody, msgs, stale);
       })
       .catch((e: unknown) => {
-        if (seq === loadSeq) msgBody.replaceChildren(el("div", "error", String(e)));
+        if (!stale()) {
+          msgBody.replaceChildren(el("div", "error", e instanceof Error ? e.message : String(e)));
+        }
       });
   }
 
@@ -457,7 +586,7 @@ function turnsPanel(st: ThreadState): HTMLElement {
     e.preventDefault();
     move(delta);
   };
-  teardownDetail();
+  detachKeys?.();
   window.addEventListener("keydown", onKey);
   detachKeys = () => window.removeEventListener("keydown", onKey);
 
@@ -468,6 +597,52 @@ function turnsPanel(st: ThreadState): HTMLElement {
   // Scroll happens after the list is in the document.
   queueMicrotask(() => cards.get(initial)?.scrollIntoView({ block: "nearest" }));
   return cols;
+}
+
+/** Above this, building every card in one go is long enough to drop frames. */
+const SYNC_MESSAGES = 150;
+/** First paint of a big turn: enough to fill the pane, cheap to build. */
+const FIRST_CHUNK = 100;
+/** Cards appended per animation frame after that. */
+const CHUNK = 40;
+
+/**
+ * Render a turn's messages into the pane. Small turns paint in one go; a turn
+ * with hundreds of messages paints its first screenful immediately and appends
+ * the rest in animation-frame batches, so switching tabs or turns never blocks.
+ */
+function paintMessages(body: HTMLElement, msgs: MessageRow[], stale: () => boolean): void {
+  if (msgs.length === 0) {
+    body.replaceChildren(el("div", "hint", "no messages"));
+    return;
+  }
+  if (msgs.length <= SYNC_MESSAGES) {
+    body.replaceChildren(...msgs.map(messageCard));
+    body.scrollTop = 0;
+    return;
+  }
+
+  body.replaceChildren(...msgs.slice(0, FIRST_CHUNK).map(messageCard));
+  body.scrollTop = 0;
+  const more = el("div", "hint msg-more");
+  const remaining = (): number => msgs.length - i;
+  let i = FIRST_CHUNK;
+  more.textContent = `rendering ${fmtCount(remaining())} more messages…`;
+  body.append(more);
+
+  const step = (): void => {
+    if (stale() || !body.isConnected) return;
+    const frag = document.createDocumentFragment();
+    for (let n = 0; n < CHUNK && i < msgs.length; n++, i++) frag.append(messageCard(msgs[i]));
+    body.insertBefore(frag, more);
+    if (i < msgs.length) {
+      more.textContent = `rendering ${fmtCount(remaining())} more messages…`;
+      requestAnimationFrame(step);
+    } else {
+      more.remove();
+    }
+  };
+  requestAnimationFrame(step);
 }
 
 function turnCard(t: TurnRow): HTMLElement {

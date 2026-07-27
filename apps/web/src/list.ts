@@ -58,29 +58,55 @@ let sortDesc = true;
 /** Sentinel for the "no directory" bucket — distinct from "all". */
 const NO_DIR = " none";
 
+/** Threads grow while the console is open; re-poll on this cadence. */
+const REFRESH_MS = 30_000;
+const TICK_MS = 5_000;
+
+let teardown: (() => void) | null = null;
+
+/** Drop the poll loop and key bindings; the router calls this before routing. */
+export function teardownList(): void {
+  teardown?.();
+  teardown = null;
+}
+
+function isTypingTarget(t: EventTarget | null): boolean {
+  if (!(t instanceof HTMLElement)) return false;
+  return (
+    t.isContentEditable ||
+    t.tagName === "INPUT" ||
+    t.tagName === "TEXTAREA" ||
+    t.tagName === "SELECT"
+  );
+}
+
 export async function renderList(app: HTMLElement): Promise<void> {
-  const [hosts, threads] = await Promise.all([api.hosts(), api.threads()]);
+  const [hosts, initial] = await Promise.all([api.hosts(), api.threads()]);
+  let threads = initial;
+  let fetchedAt = Date.now();
+  let inFlight = false;
 
   const root = el("div", "page");
   const header = el("header");
   header.append(el("h1", undefined, "lhc console"));
   const sub = el("div", "subtitle");
-  sub.textContent = hosts.map((h) => `${h.id} · ${h.threadCount}`).join("   ");
   header.append(sub);
   root.append(header);
 
   const controls = el("div", "controls");
 
   const hostSel = el("select") as HTMLSelectElement;
+  hostSel.title = "filter by host";
   hostSel.append(new Option("all hosts", ""));
   for (const h of hosts) hostSel.append(new Option(h.id, h.id));
   hostSel.value = filterHost;
 
   const dirSel = el("select") as HTMLSelectElement;
   dirSel.className = "dir-select";
+  dirSel.title = "filter by directory";
   const search = el("input") as HTMLInputElement;
   search.type = "search";
-  search.placeholder = "search title, directory, thread id, summary…";
+  search.placeholder = "search title, directory, thread id, summary…   ( / )";
   search.value = filterText;
 
   controls.append(hostSel, dirSel, search);
@@ -113,6 +139,9 @@ export async function renderList(app: HTMLElement): Promise<void> {
   root.append(table);
 
   const count = el("div", "list-count");
+  const countText = el("span", "count-text");
+  const freshness = el("span", "freshness dim");
+  count.append(countText, freshness);
   root.append(count);
 
   /** Rebuild directory options from whatever the host filter admits. */
@@ -135,8 +164,21 @@ export async function renderList(app: HTMLElement): Promise<void> {
     dirSel.value = filterDir;
   }
 
+  function paintFreshness(): void {
+    const secs = Math.round((Date.now() - fetchedAt) / 1000);
+    freshness.textContent = inFlight
+      ? " · refreshing…"
+      : secs < TICK_MS / 1000
+        ? " · just updated"
+        : ` · updated ${secs}s ago`;
+  }
+
   function paint(): void {
     paintDirOptions();
+    const counts = new Map<string, number>();
+    for (const t of threads) counts.set(t.hostId, (counts.get(t.hostId) ?? 0) + 1);
+    sub.textContent = hosts.map((h) => `${h.id} · ${counts.get(h.id) ?? 0}`).join("   ");
+
     const needle = filterText.trim().toLowerCase();
     const rows = threads.filter((t) => {
       if (filterHost && t.hostId !== filterHost) return false;
@@ -168,11 +210,37 @@ export async function renderList(app: HTMLElement): Promise<void> {
       th.querySelector(".sort-mark")!.textContent = active ? (sortDesc ? "▾" : "▲") : "";
     }
 
+    // A poll can change row count; keep the reader where they were.
+    const scrollY = window.scrollY;
     tbody.replaceChildren(...rows.map(threadRow));
-    count.textContent =
+    if (scrollY > 0 && window.scrollY !== scrollY) window.scrollTo({ top: scrollY });
+
+    const ctx = rows.reduce((s, t) => s + (t.stats?.contextTokens ?? 0), 0);
+    const shown =
       rows.length === threads.length
         ? `${threads.length} threads`
         : `${rows.length} of ${threads.length} threads`;
+    countText.textContent = `${shown} · ${fmtTokens(ctx)} context tokens`;
+    paintFreshness();
+  }
+
+  /**
+   * Re-poll the aggregate list. Filters, sort and the search caret all live
+   * outside the rows, so re-rendering rows keeps every bit of interaction state.
+   */
+  async function refresh(): Promise<void> {
+    if (inFlight) return;
+    inFlight = true;
+    paintFreshness();
+    try {
+      threads = await api.threads();
+      fetchedAt = Date.now();
+    } catch {
+      // A transient poll failure keeps the last good rows on screen.
+    } finally {
+      inFlight = false;
+      if (root.isConnected) paint();
+    }
   }
 
   hostSel.onchange = () => {
@@ -192,22 +260,92 @@ export async function renderList(app: HTMLElement): Promise<void> {
     }, 120);
   };
 
+  // --- freshness + shortcuts -----------------------------------------------
+
+  const tick = setInterval(() => {
+    if (document.hidden) return;
+    if (Date.now() - fetchedAt >= REFRESH_MS) void refresh();
+    else paintFreshness();
+  }, TICK_MS);
+
+  const onFocus = (): void => {
+    if (!document.hidden && Date.now() - fetchedAt >= TICK_MS) void refresh();
+  };
+  window.addEventListener("focus", onFocus);
+  document.addEventListener("visibilitychange", onFocus);
+
+  const onKey = (e: KeyboardEvent): void => {
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.key === "/" && !isTypingTarget(e.target)) {
+      e.preventDefault();
+      search.focus();
+      search.select();
+      return;
+    }
+    if (e.key === "Escape" && (search.value || document.activeElement === search)) {
+      e.preventDefault();
+      clearTimeout(debounce);
+      search.value = "";
+      filterText = "";
+      search.blur();
+      paint();
+    }
+  };
+  window.addEventListener("keydown", onKey);
+
+  teardownList();
+  teardown = () => {
+    clearInterval(tick);
+    clearTimeout(debounce);
+    window.removeEventListener("focus", onFocus);
+    document.removeEventListener("visibilitychange", onFocus);
+    window.removeEventListener("keydown", onKey);
+  };
+
   paint();
   app.replaceChildren(root);
   search.focus();
 }
 
+/** Health dot: failed derivations are bad, queued work is a warning. */
+function healthDot(t: ThreadRow): HTMLElement | null {
+  const s = t.stats;
+  if (!s) return null;
+  if (s.failedDerivations > 0) {
+    const dot = el("span", "health-dot bad");
+    dot.title = `${s.failedDerivations} failed derivation${s.failedDerivations === 1 ? "" : "s"}`;
+    return dot;
+  }
+  if (s.pendingWork > 0) {
+    const dot = el("span", "health-dot warn");
+    dot.title = `${s.pendingWork} queued work item${s.pendingWork === 1 ? "" : "s"}`;
+    return dot;
+  }
+  return null;
+}
+
 function threadRow(t: ThreadRow): HTMLElement {
+  const href = `#/thread/${t.hostId}/${t.threadId}`;
   const tr = el("tr", "thread-row");
-  tr.onclick = () => {
-    location.hash = `/thread/${t.hostId}/${t.threadId}`;
+  tr.onclick = (e) => {
+    // The title is a real link, so the browser owns modified and middle clicks.
+    if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+    if ((e.target as HTMLElement).closest("a")) return;
+    location.hash = href.slice(1);
   };
 
   tr.append(el("td", `col-host host host-${t.hostId}`, t.hostId));
 
   const title = el("td", "col-title");
-  title.append(el("div", "title-text", t.title ?? t.threadId));
-  title.append(el("div", "thread-id", t.threadId));
+  const link = el("a", "title-link") as HTMLAnchorElement;
+  link.href = href;
+  const line = el("div", "title-text");
+  const dot = healthDot(t);
+  if (dot) line.append(dot);
+  line.append(el("span", "title-label", t.title ?? t.threadId));
+  link.append(line);
+  link.append(el("div", "thread-id", t.threadId));
+  title.append(link);
   tr.append(title);
 
   const dir = el("td", "col-dir");

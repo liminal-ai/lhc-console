@@ -45,7 +45,12 @@ function subjectLabel(e: ViewEntry): string {
   return span ?? `turn ${e.subjectId}`;
 }
 
-function entryCard(e: ViewEntry): HTMLElement {
+/** A clamped entry, exposed so the strip's expand-all can drive every one. */
+interface Clamp {
+  setExpanded: (on: boolean) => void;
+}
+
+function entryCard(e: ViewEntry, clamps: Clamp[]): HTMLElement {
   const card = el("div", `vt-entry ${bandClass(e.band)}`);
 
   const head = el("div", "vt-entry-head");
@@ -79,9 +84,12 @@ function entryCard(e: ViewEntry): HTMLElement {
     body.classList.add("clamped");
     const toggle = el("button", "vt-toggle", "expand");
     (toggle as HTMLButtonElement).type = "button";
-    toggle.onclick = () => {
-      toggle.textContent = body.classList.toggle("clamped") ? "expand" : "collapse";
+    const setExpanded = (on: boolean): void => {
+      body.classList.toggle("clamped", !on);
+      toggle.textContent = on ? "collapse" : "expand";
     };
+    toggle.onclick = () => setExpanded(body.classList.contains("clamped"));
+    clamps.push({ setExpanded });
     card.append(toggle);
   }
   return card;
@@ -152,6 +160,7 @@ export interface ViewTabArgs {
 export function viewTabPanel(args: ViewTabArgs): HTMLElement {
   const { data, turnHref } = args;
   const panel = el("div", "vt-panel");
+  const clamps: Clamp[] = [];
 
   // --- top strip ------------------------------------------------------------
   const strip = el("div", "vt-strip");
@@ -183,6 +192,16 @@ export function viewTabPanel(args: ViewTabArgs): HTMLElement {
       ribbon([{ band: "live", tokens: data.tailTokens }]),
     );
   }
+  // Expand-all sits with the meta, but only matters once something is clamped.
+  const expandAll = el("button", "vt-expand-all linkish", "expand all") as HTMLButtonElement;
+  expandAll.type = "button";
+  let allOpen = false;
+  expandAll.onclick = () => {
+    allOpen = !allOpen;
+    for (const c of clamps) c.setExpanded(allOpen);
+    expandAll.textContent = allOpen ? "collapse all" : "expand all";
+  };
+  strip.append(expandAll);
   panel.append(strip);
 
   // --- entries + tail, one scrolling column ---------------------------------
@@ -191,7 +210,8 @@ export function viewTabPanel(args: ViewTabArgs): HTMLElement {
   if (data.view && data.entries.length === 0) {
     list.append(el("div", "hint", "the view covers no turns — its arrangement is empty"));
   }
-  for (const e of data.entries) list.append(entryCard(e));
+  for (const e of data.entries) list.append(entryCard(e, clamps));
+  expandAll.hidden = clamps.length === 0;
 
   const tailLabel = `live tail · ${fmtCount(data.tail.length)} turn${
     data.tail.length === 1 ? "" : "s"

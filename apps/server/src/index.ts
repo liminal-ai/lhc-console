@@ -1,7 +1,6 @@
 import Fastify from "fastify";
 import {
   discoverHosts,
-  describeHost,
   listMessages,
   listThreads,
   listTurns,
@@ -38,11 +37,24 @@ function cachedQuickStats(t: ThreadSummary): ThreadQuickStats | null {
   }
 }
 
-function requireThread(hostId: string, threadId: string) {
-  const host = describeHost(hostId);
-  const thread = resolveThread(host, threadId);
-  if (!thread || !thread.fileMtime) return null;
-  return thread;
+type Lookup = { thread: ThreadSummary } | { code: number; error: string };
+
+/**
+ * Resolve `:host/:id`, distinguishing an unknown host (404 "unknown host")
+ * from a known host with no such thread (404 "thread not found") and from an
+ * ambiguous id prefix (400) — the old path let all three fall out as a 500.
+ */
+function lookupThread(hostId: string, threadId: string): Lookup {
+  const host = discoverHosts().find((h) => h.id === hostId);
+  if (!host) return { code: 404, error: "unknown host" };
+  let thread;
+  try {
+    thread = resolveThread(host, threadId);
+  } catch (e) {
+    return { code: 400, error: e instanceof Error ? e.message : String(e) };
+  }
+  if (!thread || !thread.fileMtime) return { code: 404, error: "thread not found" };
+  return { thread };
 }
 
 app.get("/api/hosts", async () => {
@@ -52,9 +64,12 @@ app.get("/api/hosts", async () => {
   }));
 });
 
-app.get("/api/threads", async (req) => {
+app.get("/api/threads", async (req, reply) => {
   const q = req.query as { host?: string; cwd?: string; q?: string };
-  const hosts = q.host ? [describeHost(q.host)] : discoverHosts();
+  const known = discoverHosts();
+  const scoped = q.host ? known.filter((h) => h.id === q.host) : known;
+  if (q.host && scoped.length === 0) return reply.code(404).send({ error: "unknown host" });
+  const hosts = scoped;
   let threads = hosts.flatMap((h) => {
     try {
       return listThreads(h);
@@ -87,8 +102,9 @@ app.get("/api/threads/:hostId/:threadId", async (req, reply) => {
     hostId: string;
     threadId: string;
   };
-  const thread = requireThread(hostId, threadId);
-  if (!thread) return reply.code(404).send({ error: "thread not found" });
+  const found = lookupThread(hostId, threadId);
+  if ("error" in found) return reply.code(found.code).send({ error: found.error });
+  const { thread } = found;
   return { thread, overview: threadOverview(thread.filePath) };
 });
 
@@ -97,8 +113,9 @@ app.get("/api/threads/:hostId/:threadId/turns", async (req, reply) => {
     hostId: string;
     threadId: string;
   };
-  const thread = requireThread(hostId, threadId);
-  if (!thread) return reply.code(404).send({ error: "thread not found" });
+  const found = lookupThread(hostId, threadId);
+  if ("error" in found) return reply.code(found.code).send({ error: found.error });
+  const { thread } = found;
   return listTurns(thread.filePath);
 });
 
@@ -107,8 +124,9 @@ app.get("/api/threads/:hostId/:threadId/turn-kinds", async (req, reply) => {
     hostId: string;
     threadId: string;
   };
-  const thread = requireThread(hostId, threadId);
-  if (!thread) return reply.code(404).send({ error: "thread not found" });
+  const found = lookupThread(hostId, threadId);
+  if ("error" in found) return reply.code(found.code).send({ error: found.error });
+  const { thread } = found;
   return turnKinds(thread.filePath);
 });
 
@@ -124,8 +142,9 @@ app.get("/api/threads/:hostId/:threadId/messages", async (req, reply) => {
     limit?: string;
     cap?: string;
   };
-  const thread = requireThread(hostId, threadId);
-  if (!thread) return reply.code(404).send({ error: "thread not found" });
+  const found = lookupThread(hostId, threadId);
+  if ("error" in found) return reply.code(found.code).send({ error: found.error });
+  const { thread } = found;
   return listMessages(thread.filePath, {
     turnId: q.turn,
     fromOrder: q.from !== undefined ? Number(q.from) : undefined,
@@ -140,8 +159,9 @@ app.get("/api/threads/:hostId/:threadId/view", async (req, reply) => {
     hostId: string;
     threadId: string;
   };
-  const thread = requireThread(hostId, threadId);
-  if (!thread) return reply.code(404).send({ error: "thread not found" });
+  const found = lookupThread(hostId, threadId);
+  if ("error" in found) return reply.code(found.code).send({ error: found.error });
+  const { thread } = found;
   return viewBands(thread.filePath);
 });
 
@@ -150,8 +170,9 @@ app.get("/api/threads/:hostId/:threadId/view-arrangement", async (req, reply) =>
     hostId: string;
     threadId: string;
   };
-  const thread = requireThread(hostId, threadId);
-  if (!thread) return reply.code(404).send({ error: "thread not found" });
+  const found = lookupThread(hostId, threadId);
+  if ("error" in found) return reply.code(found.code).send({ error: found.error });
+  const { thread } = found;
   return threadViewArrangement(thread.filePath);
 });
 

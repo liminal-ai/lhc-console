@@ -158,9 +158,33 @@ export interface ViewArrangement {
   turnCount: number;
 }
 
-async function get<T>(url: string): Promise<T> {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`${url} → ${res.status}`);
+/** A non-2xx API response, carrying the status so callers can branch on 404. */
+export class ApiError extends Error {
+  status: number;
+  detail: string;
+  url: string;
+
+  constructor(status: number, detail: string, url: string) {
+    super(`${url} → ${status} ${detail}`);
+    this.name = "ApiError";
+    this.status = status;
+    this.detail = detail;
+    this.url = url;
+  }
+}
+
+async function get<T>(url: string, signal?: AbortSignal): Promise<T> {
+  const res = await fetch(url, { signal });
+  if (!res.ok) {
+    let detail = `${res.status} ${res.statusText}`;
+    try {
+      const body = (await res.json()) as { error?: string };
+      if (body?.error) detail = body.error;
+    } catch {
+      // non-JSON error body — the status line is the best we have
+    }
+    throw new ApiError(res.status, detail, url);
+  }
   return res.json() as Promise<T>;
 }
 

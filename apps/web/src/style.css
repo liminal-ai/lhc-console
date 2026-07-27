@@ -12,6 +12,19 @@
   --bad: #e0685f;
   --think: #9d7fd6;
   --tool-result: #5da8a0;
+
+  /*
+   * Fidelity ramp for the thread-view tab — a different dimension from the
+   * message-kind hues: one hue, four steps from the panel border (most
+   * compressed) up to the accent (live/uncompressed).
+   */
+  --band-brief: #3d4553;
+
+  /* The brief rail is deliberately near-invisible; its label still has to read. */
+  --band-brief-ink: #79839a;
+  --band-detailed: #4a6a94;
+  --band-smooth: #5b87c4;
+  --band-live: var(--accent);
   font-family: "SF Mono", ui-monospace, "Cascadia Code", Menlo, monospace;
   font-size: 13px;
 }
@@ -321,13 +334,6 @@ button.tab:hover {
 button.tab.active {
   color: var(--text);
   border-bottom-color: var(--accent);
-}
-
-.panel.stub {
-  border: 1px dashed var(--border);
-  border-radius: 8px;
-  padding: 28px;
-  text-align: center;
 }
 
 /* overview tab */
@@ -711,4 +717,250 @@ button.tab.active {
 
 .hist-key-line.blank {
   background: none;
+}
+
+/* thread view tab */
+.vt-host {
+  min-width: 0;
+}
+
+.vt-strip {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 9px 12px 10px;
+  margin-bottom: 14px;
+}
+
+.vt-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 14px;
+  font-size: 12px;
+}
+
+.vt-profile {
+  color: var(--accent);
+}
+
+.vt-ribbon-wrap {
+  margin-top: 9px;
+}
+
+.vt-ribbon {
+  display: flex;
+  gap: 2px;
+  height: 10px;
+  border-radius: 5px;
+  overflow: hidden;
+}
+
+.vt-seg {
+  min-width: 2px;
+}
+
+.vt-seg.band-brief {
+  background: var(--band-brief);
+}
+
+.vt-seg.band-detailed {
+  background: var(--band-detailed);
+}
+
+.vt-seg.band-smooth {
+  background: var(--band-smooth);
+}
+
+.vt-seg.band-live {
+  background: var(--band-live);
+}
+
+.vt-seg.band-unknown {
+  background: var(--dim);
+}
+
+.vt-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin-top: 7px;
+  font-size: 11px;
+  color: var(--dim);
+}
+
+.vt-key {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.vt-key .num {
+  color: var(--text);
+}
+
+.vt-chip {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  flex: none;
+}
+
+.vt-list {
+  max-height: calc(100vh - 300px);
+  overflow-y: auto;
+  padding-right: 6px;
+}
+
+.vt-entry {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--dim);
+  border-radius: 6px;
+  padding: 7px 11px 9px;
+  margin-bottom: 8px;
+}
+
+.vt-entry.band-brief {
+  border-left-color: var(--band-brief);
+}
+
+.vt-entry.band-detailed {
+  border-left-color: var(--band-detailed);
+}
+
+.vt-entry.band-smooth {
+  border-left-color: var(--band-smooth);
+}
+
+.vt-entry-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+
+.vt-band {
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 10px;
+}
+
+.band-brief .vt-band {
+  color: var(--band-brief-ink);
+}
+
+.band-detailed .vt-band {
+  color: var(--band-detailed);
+}
+
+.band-smooth .vt-band {
+  color: var(--band-smooth);
+}
+
+.vt-subject {
+  color: var(--text);
+}
+
+.vt-spacer {
+  flex: 1;
+}
+
+.vt-deriv {
+  font-size: 11px;
+}
+
+.vt-content {
+  margin: 6px 0 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text);
+}
+
+.vt-content.clamped {
+  max-height: calc(12 * 1.45em);
+  overflow: hidden;
+  mask-image: linear-gradient(to bottom, #000 72%, transparent);
+}
+
+.vt-toggle {
+  background: none;
+  border: none;
+  color: var(--accent);
+  font: inherit;
+  font-size: 11px;
+  padding: 4px 0 0;
+  cursor: pointer;
+}
+
+.vt-toggle:hover {
+  text-decoration: underline;
+}
+
+.vt-gap {
+  margin-top: 5px;
+  font-size: 12px;
+  color: var(--bad);
+}
+
+.vt-divider {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 18px 0 12px;
+}
+
+.vt-rule {
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(to right, transparent, var(--band-live), transparent);
+  opacity: 0.6;
+}
+
+.vt-divider-label {
+  color: var(--band-live);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+a.vt-tail {
+  display: block;
+  text-decoration: none;
+  color: inherit;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--band-live);
+  border-radius: 6px;
+  padding: 7px 11px 8px;
+  margin-bottom: 8px;
+}
+
+a.vt-tail:hover {
+  border-color: var(--accent);
+  border-left-color: var(--accent);
+  background: var(--panel-2);
+}
+
+a.vt-tail.open {
+  border-left-color: var(--warn);
+}
+
+.vt-tail-top {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 12px;
+}
+
+.vt-tail-order {
+  color: var(--band-live);
+}
+
+.vt-unit {
+  font-size: 11px;
 }

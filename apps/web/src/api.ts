@@ -107,6 +107,57 @@ export interface OverviewResponse {
   };
 }
 
+export interface ViewEntryTurn {
+  turnId: string;
+  turnOrder: number | null;
+  status: string | null;
+  missing: boolean;
+}
+
+export interface ViewEntry {
+  index: number;
+  band: string;
+  subjectKind: string;
+  subjectId: string;
+  derivationUsed: string | null;
+  degraded: boolean;
+  turns: ViewEntryTurn[];
+  turnOrderFrom: number | null;
+  turnOrderTo: number | null;
+  derivationState: string | null;
+  gap: boolean;
+  content: string;
+  contentLength: number;
+}
+
+export interface ViewTailTurn {
+  turnId: string;
+  turnOrder: number;
+  status: string;
+  messageCount: number;
+  tokenEstimate: number;
+  firstEventOrder: number | null;
+  afterCompact: boolean;
+  promptExcerpt: string | null;
+}
+
+export interface ViewArrangement {
+  view: {
+    viewId: string;
+    createdAt: string;
+    profileName: string | null;
+    compactPoint: number;
+    coveredFrom: number;
+    bands: { band: string; tokenCount: number }[];
+    gaps: unknown[];
+  } | null;
+  entries: ViewEntry[];
+  tail: ViewTailTurn[];
+  tailTokens: number;
+  turnsSinceView: number;
+  turnCount: number;
+}
+
 async function get<T>(url: string): Promise<T> {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`${url} → ${res.status}`);
@@ -128,6 +179,8 @@ export const api = {
     get<TurnRow[]>(`/api/threads/${hostId}/${threadId}/turns`),
   turnKinds: (hostId: string, threadId: string) =>
     get<TurnKindRow[]>(`/api/threads/${hostId}/${threadId}/turn-kinds`),
+  viewArrangement: (hostId: string, threadId: string) =>
+    get<ViewArrangement>(`/api/threads/${hostId}/${threadId}/view-arrangement`),
   messages: (hostId: string, threadId: string, turnId?: string) => {
     const suffix = turnId ? `?turn=${encodeURIComponent(turnId)}` : "";
     return get<MessageRow[]>(`/api/threads/${hostId}/${threadId}/messages${suffix}`);

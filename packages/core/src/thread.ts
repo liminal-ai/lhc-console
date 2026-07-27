@@ -572,6 +572,293 @@ export function listMessages(filePath: string, opts: ListMessagesOptions = {}): 
   });
 }
 
+// --- thread-view arrangement ------------------------------------------------
+
+/** Max characters of one entry's derivation content carried over the wire. */
+const VIEW_CONTENT_CAP = 6000;
+
+/** One turn covered by a view entry; `missing` when the row is gone or deleted. */
+export interface ViewEntryTurn {
+  turnId: string;
+  turnOrder: number | null;
+  status: string | null;
+  missing: boolean;
+}
+
+/** One arrangement entry, resolved to its turns and its rendered content. */
+export interface ViewArrangementEntry {
+  /** Position in `arrangement_json`, so the UI can key without a synthetic id. */
+  index: number;
+  band: string;
+  subjectKind: string;
+  subjectId: string;
+  derivationUsed: string | null;
+  degraded: boolean;
+  turns: ViewEntryTurn[];
+  /** Turn-order span of the resolved turns; null when none resolve. */
+  turnOrderFrom: number | null;
+  turnOrderTo: number | null;
+  /** State of the derivation actually used; null when the row is absent. */
+  derivationState: string | null;
+  /** No usable content: derivation missing, not ready, or empty. */
+  gap: boolean;
+  /** Derivation content, capped at `VIEW_CONTENT_CAP`. */
+  content: string;
+  contentLength: number;
+}
+
+/** One live-tail turn — the same shape the turn list shows, plus placement. */
+export interface ViewTailTurn {
+  turnId: string;
+  turnOrder: number;
+  status: string;
+  messageCount: number;
+  tokenEstimate: number;
+  firstEventOrder: number | null;
+  /** False for a turn the projection skipped rather than one that arrived after. */
+  afterCompact: boolean;
+  promptExcerpt: string | null;
+}
+
+export interface ViewArrangementMeta {
+  viewId: string;
+  createdAt: string;
+  profileName: string | null;
+  compactPoint: number;
+  coveredFrom: number;
+  bands: { band: string; tokenCount: number }[];
+  /** Parsed `gaps_json`; empty array when absent or unparseable. */
+  gaps: unknown[];
+}
+
+export interface ThreadViewArrangement {
+  /** Null when the thread has never been compacted; then every turn is tail. */
+  view: ViewArrangementMeta | null;
+  entries: ViewArrangementEntry[];
+  tail: ViewTailTurn[];
+  tailTokens: number;
+  /** Tail turns that begin at or after the compact point. */
+  turnsSinceView: number;
+  turnCount: number;
+}
+
+/** Turn facts the arrangement and the tail both need, in one pass. */
+interface ViewTurnRow {
+  turnId: string;
+  turnOrder: number;
+  status: string;
+  messageCount: number;
+  tokenEstimate: number;
+  firstEventOrder: number | null;
+}
+
+function viewTurnRows(db: DatabaseSync): ViewTurnRow[] {
+  const rows = db
+    .prepare(
+      `select t.turn_id, t.turn_order, t.status,
+              count(m.message_id) message_count,
+              coalesce(sum(m.token_estimate), 0) token_estimate,
+              coalesce(min(m.source_event_order), t.opened_at_event_order) first_event_order
+       from turns t
+       left join message m on m.turn_id = t.turn_id and m.deleted_at is null
+       where t.deleted_at is null
+       group by t.turn_id
+       order by t.turn_order`,
+    )
+    .all() as unknown as {
+    turn_id: string;
+    turn_order: number;
+    status: string;
+    message_count: number;
+    token_estimate: number;
+    first_event_order: number | null;
+  }[];
+  return rows.map((r) => ({
+    turnId: r.turn_id,
+    turnOrder: r.turn_order,
+    status: r.status,
+    messageCount: r.message_count,
+    tokenEstimate: r.token_estimate,
+    firstEventOrder: r.first_event_order,
+  }));
+}
+
+function parseJsonArray(raw: string | null): unknown[] {
+  if (!raw) return [];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function asString(v: unknown): string | null {
+  return typeof v === "string" && v.length > 0 ? v : null;
+}
+
+/**
+ * The latest thread-view projection, entry by entry, in thread order — each
+ * arrangement entry resolved to the turns it covers and to the derivation
+ * content the compact actually used — followed by the live tail.
+ *
+ * The tail is every non-deleted turn the arrangement does not cover, so
+ * `entries ∪ tail` is exactly the thread's turns: nothing can fall between the
+ * two. Turns that start at or after the compact point are the ones that truly
+ * arrived since (`afterCompact`); a tail turn before it is one the projection
+ * left out, and says so rather than being quietly dropped.
+ */
+export function threadViewArrangement(filePath: string): ThreadViewArrangement {
+  return withDb(filePath, (db) => {
+    const turnRows = viewTurnRows(db);
+    const byTurnId = new Map(turnRows.map((t) => [t.turnId, t]));
+
+    const viewRow = db
+      .prepare(
+        `select view_id, created_at, compact_point, covered_from, profile_name,
+                arrangement_json, gaps_json
+         from thread_view where singleton = 1`,
+      )
+      .get() as unknown as
+      | {
+          view_id: string;
+          created_at: string;
+          compact_point: number;
+          covered_from: number;
+          profile_name: string | null;
+          arrangement_json: string | null;
+          gaps_json: string | null;
+        }
+      | undefined;
+
+    const promptStmt = db.prepare(
+      `select mb.content from message m
+       join message_block mb on mb.message_id = m.message_id
+       where m.turn_id = ? and m.kind = 'user_prompt' and m.deleted_at is null
+       order by m.source_event_order, mb.block_index limit 1`,
+    );
+
+    const tailTurn = (t: ViewTurnRow, compactPoint: number | null): ViewTailTurn => {
+      const prompt = promptStmt.get(t.turnId) as unknown as { content: string } | undefined;
+      return {
+        turnId: t.turnId,
+        turnOrder: t.turnOrder,
+        status: t.status,
+        messageCount: t.messageCount,
+        tokenEstimate: t.tokenEstimate,
+        firstEventOrder: t.firstEventOrder,
+        afterCompact:
+          compactPoint == null || (t.firstEventOrder != null && t.firstEventOrder >= compactPoint),
+        promptExcerpt: prompt
+          ? decodeBlockContent("text", prompt.content).text.slice(0, 200)
+          : null,
+      };
+    };
+
+    // Never compacted: the whole thread is live.
+    if (!viewRow) {
+      const tail = turnRows.map((t) => tailTurn(t, null));
+      return {
+        view: null,
+        entries: [],
+        tail,
+        tailTokens: tail.reduce((s, t) => s + t.tokenEstimate, 0),
+        turnsSinceView: tail.length,
+        turnCount: turnRows.length,
+      };
+    }
+
+    const members = new Map<string, string[]>();
+    for (const r of db
+      .prepare("select chunk_id, turn_id from chunk_member order by chunk_id, member_idx")
+      .all() as unknown as { chunk_id: string; turn_id: string }[]) {
+      const list = members.get(r.chunk_id);
+      if (list) list.push(r.turn_id);
+      else members.set(r.chunk_id, [r.turn_id]);
+    }
+
+    const derivStmt = db.prepare(
+      `select state, content from derivation
+       where subject_kind = ? and subject_id = ? and derivation_type = ?`,
+    );
+
+    const covered = new Set<string>();
+    const entries: ViewArrangementEntry[] = [];
+
+    for (const [index, raw] of parseJsonArray(viewRow.arrangement_json).entries()) {
+      const e = (raw ?? {}) as Record<string, unknown>;
+      const subjectKind = asString(e.subjectKind) ?? "turn";
+      const subjectId = asString(e.subjectId) ?? "";
+      const derivationUsed = asString(e.derivationUsed);
+
+      const memberIds =
+        subjectKind === "chunk" ? (members.get(subjectId) ?? []) : subjectId ? [subjectId] : [];
+      const turns: ViewEntryTurn[] = memberIds.map((id) => {
+        const t = byTurnId.get(id);
+        if (t) covered.add(id);
+        return {
+          turnId: id,
+          turnOrder: t?.turnOrder ?? null,
+          status: t?.status ?? null,
+          missing: !t,
+        };
+      });
+      const orders = turns.map((t) => t.turnOrder).filter((o): o is number => o != null);
+
+      const deriv = derivationUsed
+        ? (derivStmt.get(subjectKind, subjectId, derivationUsed) as unknown as
+            | { state: string; content: string | null }
+            | undefined)
+        : undefined;
+      const content = deriv?.state === "ready" ? (deriv.content ?? "") : "";
+
+      entries.push({
+        index,
+        band: asString(e.band) ?? "unknown",
+        subjectKind,
+        subjectId,
+        derivationUsed,
+        degraded: e.degraded === true,
+        turns,
+        turnOrderFrom: orders.length ? Math.min(...orders) : null,
+        turnOrderTo: orders.length ? Math.max(...orders) : null,
+        derivationState: deriv?.state ?? null,
+        gap: content.length === 0,
+        content: content.slice(0, VIEW_CONTENT_CAP),
+        contentLength: content.length,
+      });
+    }
+
+    const tail = turnRows
+      .filter((t) => !covered.has(t.turnId))
+      .map((t) => tailTurn(t, viewRow.compact_point));
+
+    const bands = db
+      .prepare(
+        `select band, token_count from thread_view_band where view_id = ?
+         order by case band when 'brief' then 0 when 'detailed' then 1 else 2 end`,
+      )
+      .all(viewRow.view_id) as unknown as { band: string; token_count: number }[];
+
+    return {
+      view: {
+        viewId: viewRow.view_id,
+        createdAt: viewRow.created_at,
+        profileName: viewRow.profile_name,
+        compactPoint: viewRow.compact_point,
+        coveredFrom: viewRow.covered_from,
+        bands: bands.map((b) => ({ band: b.band, tokenCount: b.token_count })),
+        gaps: parseJsonArray(viewRow.gaps_json),
+      },
+      entries,
+      tail,
+      tailTokens: tail.reduce((s, t) => s + t.tokenEstimate, 0),
+      turnsSinceView: tail.filter((t) => t.afterCompact).length,
+      turnCount: turnRows.length,
+    };
+  });
+}
+
 /** Full stored view bands (rendered text) for a thread, if a compact exists. */
 export function viewBands(
   filePath: string,

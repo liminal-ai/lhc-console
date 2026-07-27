@@ -8,6 +8,7 @@ import {
   resolveThread,
   threadOverview,
   threadQuickStats,
+  threadViewArrangement,
   turnKinds,
   viewBands,
   type ThreadSummary,
@@ -142,6 +143,16 @@ app.get("/api/threads/:hostId/:threadId/view", async (req, reply) => {
   const thread = requireThread(hostId, threadId);
   if (!thread) return reply.code(404).send({ error: "thread not found" });
   return viewBands(thread.filePath);
+});
+
+app.get("/api/threads/:hostId/:threadId/view-arrangement", async (req, reply) => {
+  const { hostId, threadId } = req.params as {
+    hostId: string;
+    threadId: string;
+  };
+  const thread = requireThread(hostId, threadId);
+  if (!thread) return reply.code(404).send({ error: "thread not found" });
+  return threadViewArrangement(thread.filePath);
 });
 
 const addr = await app.listen({ port: PORT, host: "127.0.0.1" });

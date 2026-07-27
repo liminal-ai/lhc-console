@@ -704,10 +704,18 @@ export async function openThreadTerminal(
   enterWorkspace();
 }
 
-/** Loopback-only dev spawn; used by the browser tests. */
-export async function openDevTerminal(devCommand: string, threadId?: string): Promise<TerminalRow> {
+/**
+ * Dev spawn; used by the browser tests. Needs loopback AND the shared secret
+ * (`LHC_CONSOLE_DEV_SECRET`), and is disabled outright when none is set.
+ */
+export async function openDevTerminal(
+  devCommand: string,
+  threadId?: string,
+  devSecret?: string,
+): Promise<TerminalRow> {
   const info = await api.openTerminal({
     devCommand,
+    devSecret,
     hostId: "dev",
     threadId,
     cols: 100,

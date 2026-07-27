@@ -231,10 +231,27 @@ function removeTerminal(t: Terminal): void {
   }, KILL_GRACE_MS);
 }
 
-/** Only loopback callers may name their own command (see the devCommand note). */
 function isLoopback(req: FastifyRequest): boolean {
   const ip = req.socket.remoteAddress ?? "";
   return ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1";
+}
+
+/**
+ * Gate on the devCommand escape.
+ *
+ * Loopback alone is NOT a gate: every browser request arrives through the Vite
+ * dev proxy, which connects from 127.0.0.1, so any tailnet browser looked like
+ * a local caller and could spawn an arbitrary command. Require a shared secret
+ * as well, and when no secret is configured disable the escape outright.
+ */
+function devCommandGate(req: FastifyRequest): { code: number; error: string } | null {
+  const secret = process.env.LHC_CONSOLE_DEV_SECRET;
+  if (!secret) return { code: 403, error: "devCommand is disabled (no LHC_CONSOLE_DEV_SECRET)" };
+  if (!isLoopback(req)) return { code: 403, error: "devCommand is loopback-only" };
+  const offered = req.headers["x-lhc-dev"];
+  const value = Array.isArray(offered) ? offered[0] : offered;
+  if (value !== secret) return { code: 403, error: "devCommand requires a valid x-lhc-dev header" };
+  return null;
 }
 
 function clampDim(v: unknown, fallback: number, max: number): number {
@@ -264,13 +281,14 @@ export function registerTerminalRoutes(
     const rows = clampDim(body.rows, 24, 200);
 
     /*
-     * Dev escape: a loopback caller may spawn an arbitrary command, so the
-     * terminal plumbing can be exercised end to end without starting a real
-     * agent session. Never available off-loopback, and it is the only path
-     * where a client-supplied command is honoured.
+     * Dev escape: a loopback caller holding the shared secret may spawn an
+     * arbitrary command, so the terminal plumbing can be exercised end to end
+     * without starting a real agent session. It is the only path where a
+     * client-supplied command is honoured, and it is off unless configured.
      */
     if (body.devCommand) {
-      if (!isLoopback(req)) return reply.code(403).send({ error: "devCommand is loopback-only" });
+      const denied = devCommandGate(req);
+      if (denied) return reply.code(denied.code).send({ error: denied.error });
       if (runningCount() >= MAX_RUNNING) {
         return reply.code(429).send({ error: `terminal limit reached (${MAX_RUNNING})` });
       }

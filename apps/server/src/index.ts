@@ -15,6 +15,7 @@ import {
   type ThreadSummary,
   type ThreadQuickStats,
 } from "@lhc-console/core";
+import { hiddenCount, hideThread, isHidden, loadPrefs, unhideThread } from "./prefs.ts";
 import { registerTerminalRoutes, shutdownTerminals } from "./terminals.ts";
 
 const PORT = Number(process.env.LHC_CONSOLE_PORT ?? 5959);
@@ -71,7 +72,8 @@ app.get("/api/hosts", async () => {
 });
 
 app.get("/api/threads", async (req, reply) => {
-  const q = req.query as { host?: string; cwd?: string; q?: string };
+  const q = req.query as { host?: string; cwd?: string; q?: string; includeHidden?: string };
+  const includeHidden = q.includeHidden === "1" || q.includeHidden === "true";
   const known = discoverHosts();
   const scoped = q.host ? known.filter((h) => h.id === q.host) : known;
   if (q.host && scoped.length === 0) return reply.code(404).send({ error: "unknown host" });
@@ -84,8 +86,12 @@ app.get("/api/threads", async (req, reply) => {
     }
   });
   if (q.cwd) threads = threads.filter((t) => t.cwd === q.cwd);
+  // Hidden threads are a console-side preference: excluded by default, and
+  // carried with a `hidden` flag when the client asks for them.
+  if (!includeHidden) threads = threads.filter((t) => !isHidden(t.hostId, t.threadId));
   let enriched = threads.map((t) => ({
     ...t,
+    hidden: isHidden(t.hostId, t.threadId),
     stats: cachedQuickStats(t),
     launch: launchRecipe(t),
   }));
@@ -117,10 +123,38 @@ app.get("/api/threads/:hostId/:threadId", async (req, reply) => {
   const { thread } = found;
   return {
     thread,
+    hidden: isHidden(thread.hostId, thread.threadId),
     launch: launchRecipe(thread),
     overview: threadOverview(thread.filePath),
   };
 });
+
+/*
+ * Hide / unhide. The id in the path may be a prefix, so both write the
+ * RESOLVED full thread id — otherwise a prefix hide would never match the
+ * full-id rows the list serves.
+ */
+app.post("/api/threads/:hostId/:threadId/hide", async (req, reply) => {
+  const { hostId, threadId } = req.params as { hostId: string; threadId: string };
+  const found = lookupThread(hostId, threadId);
+  if ("error" in found) return reply.code(found.code).send({ error: found.error });
+  const { thread } = found;
+  return { hidden: hideThread(thread.hostId, thread.threadId), threadId: thread.threadId };
+});
+
+app.delete("/api/threads/:hostId/:threadId/hide", async (req, reply) => {
+  const { hostId, threadId } = req.params as { hostId: string; threadId: string };
+  const found = lookupThread(hostId, threadId);
+  if ("error" in found) return reply.code(found.code).send({ error: found.error });
+  const { thread } = found;
+  return { hidden: unhideThread(thread.hostId, thread.threadId), threadId: thread.threadId };
+});
+
+/** The raw map, for tooling and tests; the UI gets `hidden` on each row. */
+app.get("/api/prefs/hidden", async () => ({
+  hidden: hiddenCount(),
+  hiddenThreads: loadPrefs().hiddenThreads,
+}));
 
 app.get("/api/threads/:hostId/:threadId/turns", async (req, reply) => {
   const { hostId, threadId } = req.params as {

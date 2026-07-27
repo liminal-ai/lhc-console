@@ -32,6 +32,8 @@ export interface ThreadRow {
   stats: QuickStats | null;
   /** Resume command, null when the host has no resume path. */
   launch?: LaunchRecipe | null;
+  /** Hidden from the default list by a console-side preference. */
+  hidden?: boolean;
 }
 
 export interface HostRow {
@@ -102,6 +104,7 @@ export interface ViewInfo {
 
 export interface OverviewResponse {
   thread: ThreadRow;
+  hidden: boolean;
   launch: LaunchRecipe | null;
   overview: {
     threadId: string;
@@ -230,13 +233,23 @@ async function get<T>(url: string, signal?: AbortSignal): Promise<T> {
 
 export const api = {
   hosts: () => get<HostRow[]>("/api/hosts"),
-  threads: (params: { host?: string; q?: string } = {}) => {
+  /**
+   * One fetch for the whole list. The client always asks for hidden rows and
+   * filters them itself — the list is small and client-side filtering is
+   * already how host/dir/search work, so the hidden count stays live for free.
+   */
+  threads: (params: { host?: string; q?: string; includeHidden?: boolean } = {}) => {
     const qs = new URLSearchParams();
     if (params.host) qs.set("host", params.host);
     if (params.q) qs.set("q", params.q);
+    if (params.includeHidden !== false) qs.set("includeHidden", "1");
     const suffix = qs.size ? `?${qs}` : "";
     return get<ThreadRow[]>(`/api/threads${suffix}`);
   },
+  hideThread: (hostId: string, threadId: string, hidden: boolean) =>
+    send<{ hidden: number; threadId: string }>(`/api/threads/${hostId}/${threadId}/hide`, {
+      method: hidden ? "POST" : "DELETE",
+    }),
   overview: (hostId: string, threadId: string) =>
     get<OverviewResponse>(`/api/threads/${hostId}/${threadId}`),
   turns: (hostId: string, threadId: string) =>
@@ -253,12 +266,18 @@ export const api = {
     cols?: number;
     rows?: number;
     devCommand?: string;
-  }) =>
-    send<TerminalRow>("/api/terminals", {
+    /** Shared secret for the devCommand escape; tests only. */
+    devSecret?: string;
+  }) => {
+    const { devSecret, ...payload } = body;
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    if (devSecret) headers["x-lhc-dev"] = devSecret;
+    return send<TerminalRow>("/api/terminals", {
       method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body),
-    }),
+      headers,
+      body: JSON.stringify(payload),
+    });
+  },
   killTerminal: (id: string) =>
     send<{ ok: boolean }>(`/api/terminals/${encodeURIComponent(id)}`, { method: "DELETE" }),
   messages: (hostId: string, threadId: string, turnId?: string) => {

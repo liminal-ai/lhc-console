@@ -77,6 +77,8 @@ function sortValue(t: ThreadRow, key: SortKey): string | number {
 let filterHost = "";
 let filterDir = "";
 let filterText = "";
+/** Hidden rows are off by default and survive a refresh (module state). */
+let showHidden = false;
 let sortKey: SortKey = "activity";
 let sortDesc = true;
 
@@ -135,7 +137,16 @@ export async function renderList(app: HTMLElement): Promise<void> {
   search.placeholder = "search title, directory, thread id, summary…   ( / )";
   search.value = filterText;
 
-  controls.append(hostSel, dirSel, search);
+  // Quiet toggle for the hidden set; disabled (but present) when nothing is
+  // hidden, so the control never moves around under the pointer.
+  const hiddenChip = el("button", "chip hidden-chip") as HTMLButtonElement;
+  hiddenChip.type = "button";
+  hiddenChip.onclick = () => {
+    showHidden = !showHidden;
+    paint();
+  };
+
+  controls.append(hostSel, dirSel, search, hiddenChip);
   root.append(controls);
 
   const table = el("table", "threads");
@@ -206,14 +217,37 @@ export async function renderList(app: HTMLElement): Promise<void> {
         : ` · updated ${secs}s ago`;
   }
 
+  /**
+   * Flip one thread's hidden state. The server owns the prefs file; the row is
+   * updated in place so the list settles without waiting for the next poll.
+   */
+  async function setHidden(t: ThreadRow, hidden: boolean): Promise<void> {
+    try {
+      await api.hideThread(t.hostId, t.threadId, hidden);
+      t.hidden = hidden;
+    } catch {
+      // Nothing changed server-side; leave the row where it was.
+    }
+    if (root.isConnected) paint();
+  }
+
   function paint(): void {
     paintDirOptions();
+    const hiddenN = threads.filter((t) => t.hidden).length;
+    hiddenChip.textContent = `hidden (${hiddenN})`;
+    hiddenChip.classList.toggle("on", showHidden);
+    hiddenChip.disabled = hiddenN === 0 && !showHidden;
+    hiddenChip.title = showHidden ? "stop showing hidden threads" : "show hidden threads";
+
+    // Hidden rows join the pool only when the toggle is on; every other
+    // filter, the search and the sort then apply to them like any other row.
+    const pool = showHidden ? threads : threads.filter((t) => !t.hidden);
     const counts = new Map<string, number>();
-    for (const t of threads) counts.set(t.hostId, (counts.get(t.hostId) ?? 0) + 1);
+    for (const t of pool) counts.set(t.hostId, (counts.get(t.hostId) ?? 0) + 1);
     sub.textContent = hosts.map((h) => `${h.id} · ${counts.get(h.id) ?? 0}`).join("   ");
 
     const needle = filterText.trim().toLowerCase();
-    const rows = threads.filter((t) => {
+    const rows = pool.filter((t) => {
       if (filterHost && t.hostId !== filterHost) return false;
       const bucket = dirBucket(t);
       if (filterDir === NO_DIR && bucket) return false;
@@ -247,14 +281,14 @@ export async function renderList(app: HTMLElement): Promise<void> {
 
     // A poll can change row count; keep the reader where they were.
     const scrollY = window.scrollY;
-    tbody.replaceChildren(...rows.map(threadRow));
+    tbody.replaceChildren(...rows.map((t) => threadRow(t, setHidden)));
     if (scrollY > 0 && window.scrollY !== scrollY) window.scrollTo({ top: scrollY });
 
     const ctx = rows.reduce((s, t) => s + (t.stats?.contextTokens ?? 0), 0);
     const shown =
-      rows.length === threads.length
-        ? `${threads.length} threads`
-        : `${rows.length} of ${threads.length} threads`;
+      rows.length === pool.length
+        ? `${pool.length} threads`
+        : `${rows.length} of ${pool.length} threads`;
     countText.textContent = `${shown} · ${fmtTokens(ctx)} context tokens`;
     paintFreshness();
   }
@@ -363,9 +397,9 @@ function healthDot(t: ThreadRow): HTMLElement | null {
   return null;
 }
 
-function threadRow(t: ThreadRow): HTMLElement {
+function threadRow(t: ThreadRow, setHidden: (t: ThreadRow, hidden: boolean) => void): HTMLElement {
   const href = `#/thread/${t.hostId}/${t.threadId}`;
-  const tr = el("tr", "thread-row");
+  const tr = el("tr", t.hidden ? "thread-row is-hidden" : "thread-row");
   tr.onclick = (e) => {
     // The title is a real link, so the browser owns modified and middle clicks.
     if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
@@ -437,6 +471,23 @@ function threadRow(t: ThreadRow): HTMLElement {
     };
     launchCell.append(btn);
   }
+  // Hide/unhide sits at the row's right end, dim until the row is hovered.
+  // No confirm: it is instantly reversible from the hidden toggle.
+  const hideBtn = el(
+    "button",
+    "launch-link hide-link",
+    t.hidden ? "unhide" : "hide",
+  ) as HTMLButtonElement;
+  hideBtn.type = "button";
+  hideBtn.title = t.hidden
+    ? "show this thread in the list again"
+    : "hide this thread from the list";
+  hideBtn.onclick = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setHidden(t, !t.hidden);
+  };
+  launchCell.append(hideBtn);
   tr.append(launchCell);
   return tr;
 }

@@ -35,7 +35,7 @@ export interface LaunchRecipe {
 }
 
 /** Shell-quote only when the value has characters a shell would treat specially. */
-function shArg(value: string): string {
+export function shArg(value: string): string {
   return /^[\w@%+=:,./-]+$/.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`;
 }
 

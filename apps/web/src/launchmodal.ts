@@ -1,45 +1,7 @@
 import type { LaunchRecipe } from "./api.ts";
+import { copyText } from "./clipboard.ts";
 import { el } from "./format.ts";
 import { openThreadTerminal } from "./workspace.ts";
-
-/**
- * Copy via a hidden textarea. Synchronous, so it still counts as part of the
- * user gesture that opened the modal — the only path that works on the plain
- * http origin this console is served from (no `navigator.clipboard` there).
- */
-function copyViaTextarea(text: string): boolean {
-  const hadFocus = document.activeElement;
-  const ta = el("textarea") as HTMLTextAreaElement;
-  ta.value = text;
-  ta.setAttribute("readonly", "");
-  ta.style.cssText = "position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;";
-  document.body.append(ta);
-  ta.select();
-  ta.setSelectionRange(0, text.length);
-  let ok = false;
-  try {
-    ok = document.execCommand("copy");
-  } catch {
-    ok = false;
-  }
-  ta.remove();
-  // Selecting the textarea took focus off whatever had it — put it back.
-  if (hadFocus instanceof HTMLElement && hadFocus.isConnected) hadFocus.focus();
-  return ok;
-}
-
-/** Clipboard API when the origin allows it, hidden textarea otherwise. */
-async function copyText(text: string): Promise<boolean> {
-  if (navigator.clipboard?.writeText) {
-    try {
-      await navigator.clipboard.writeText(text);
-      return true;
-    } catch {
-      // permission denied or insecure context — fall through to the old way
-    }
-  }
-  return copyViaTextarea(text);
-}
 
 /** Whatever modal is on screen; opening a second one replaces the first. */
 let close: (() => void) | null = null;

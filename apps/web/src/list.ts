@@ -1,6 +1,7 @@
 import { api, type ThreadRow } from "./api.ts";
 import { el, fmtAgo, fmtStamp, fmtTokens, splitDir } from "./format.ts";
 import { closeLaunchModal, openLaunchModal } from "./launchmodal.ts";
+import { closeNewSessionModal, openNewSessionModal } from "./newsessionmodal.ts";
 import {
   openThreadTerminal,
   subscribeTerminals,
@@ -85,6 +86,9 @@ let sortDesc = true;
 /** Sentinel for the "no directory" bucket — distinct from "all". */
 const NO_DIR = " none";
 
+/** Terminal output older than this predates the page and is not "activity". */
+const PAGE_LOADED_AT = Date.now();
+
 /** Threads grow while the console is open; re-poll on this cadence. */
 const REFRESH_MS = 30_000;
 const TICK_MS = 5_000;
@@ -94,6 +98,7 @@ let teardown: (() => void) | null = null;
 /** Drop the poll loop and key bindings; the router calls this before routing. */
 export function teardownList(): void {
   closeLaunchModal();
+  closeNewSessionModal();
   teardown?.();
   teardown = null;
 }
@@ -116,7 +121,16 @@ export async function renderList(app: HTMLElement): Promise<void> {
 
   const root = el("div", "page");
   const header = el("header");
-  header.append(el("h1", undefined, "lhc console"));
+  const titleRow = el("div", "head-row");
+  titleRow.append(el("h1", undefined, "lhc console"));
+  // Starting work is a first-class act here, not something you go elsewhere
+  // for: one button, always present, with a one-key shortcut.
+  const newBtn = el("button", "chip new-session-btn", "new session") as HTMLButtonElement;
+  newBtn.type = "button";
+  newBtn.title = "start a new session or shell (n)";
+  newBtn.onclick = () => openNewSessionModal();
+  titleRow.append(newBtn);
+  header.append(titleRow);
   const sub = el("div", "subtitle");
   header.append(sub);
   root.append(header);
@@ -346,6 +360,11 @@ export async function renderList(app: HTMLElement): Promise<void> {
   const onKey = (e: KeyboardEvent): void => {
     if (e.metaKey || e.ctrlKey || e.altKey) return;
     if (workspaceActive() || workspaceContains(e.target)) return;
+    if (e.key === "n" && !isTypingTarget(e.target)) {
+      e.preventDefault();
+      openNewSessionModal();
+      return;
+    }
     if (e.key === "/" && !isTypingTarget(e.target)) {
       e.preventDefault();
       search.focus();
@@ -377,7 +396,12 @@ export async function renderList(app: HTMLElement): Promise<void> {
 
   paint();
   app.replaceChildren(root);
-  search.focus();
+  /*
+   * The search box is deliberately NOT focused on arrival. It used to be, and
+   * that quietly ate every single-key shortcut on the page — `n` and `/` both
+   * land in the field instead of doing their job. `/` is one keystroke away
+   * and now actually reachable, which is the better trade.
+   */
 }
 
 /** Health dot: failed derivations are bad, queued work is a warning. */
@@ -458,13 +482,18 @@ function threadRow(t: ThreadRow, setHidden: (t: ThreadRow, hidden: boolean) => v
     // A live terminal for this thread takes over the affordance: no modal,
     // straight to the workspace screen it is already on.
     const live = terminalFor(t.hostId, t.threadId);
+    // A terminal that has produced output since this page loaded is doing
+    // something; the marker says so quietly rather than with a new column.
+    const active = !!live?.lastOutputAt && Date.parse(live.lastOutputAt) > PAGE_LOADED_AT;
     const btn = el(
       "button",
-      live ? "launch-link has-term" : "launch-link",
+      live ? `launch-link has-term${active ? " active" : ""}` : "launch-link",
       live ? "terminal" : "launch",
     ) as HTMLButtonElement;
     btn.type = "button";
-    btn.title = live ? `running: ${cmd}` : (cmd ?? launch.reason ?? "no resume path");
+    btn.title = live
+      ? `${active ? "active — " : ""}running: ${cmd}`
+      : (cmd ?? launch.reason ?? "no resume path");
     /*
      * Something outside the console holds this session. Mark it so a glance
      * down the list shows which threads already have a live window somewhere —

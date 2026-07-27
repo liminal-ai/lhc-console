@@ -10,11 +10,25 @@
  * stays in the map with its final screen until someone dismisses it.
  */
 
+import { statSync } from "node:fs";
 import { homedir } from "node:os";
 import { spawn, type IPty } from "@lydell/node-pty";
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import type { WebSocket } from "@fastify/websocket";
-import { launchRecipe, writerPolicyFor, type ThreadSummary } from "@lhc-console/core";
+import {
+  discoverHosts,
+  hermesProfiles,
+  isExistingDir,
+  launchableHostIds,
+  launchRecipe,
+  listThreads,
+  matchNewborn,
+  planNewSession,
+  writerPolicyFor,
+  type NewSessionEnv,
+  type NewTerminalKind,
+  type ThreadSummary,
+} from "@lhc-console/core";
 import { detectAttachedOne, invalidateProcessScan, type OwnTerminal } from "./attach-detect.ts";
 
 /** Total scrollback kept per terminal. Oldest output is dropped first. */
@@ -23,17 +37,34 @@ const BUFFER_CAP = 2_000_000;
 const MAX_RUNNING = 8;
 /** Grace between SIGHUP and SIGKILL on delete. */
 const KILL_GRACE_MS = 3000;
+/** How often an unassociated new session looks for its registry row. */
+const ASSOCIATE_POLL_MS = 3000;
+/** After this long with no matching row, stop looking. */
+const ASSOCIATE_WINDOW_MS = 5 * 60_000;
 
 export interface ThreadRef {
   hostId: string;
-  threadId: string;
+  /** Null for a session that has not written its registry row yet, and for shells. */
+  threadId: string | null;
   title: string | null;
+}
+
+/** A new session waiting for the host to write its registry row. */
+interface PendingAssociation {
+  hostId: string;
+  cwd: string;
+  spawnedAt: string;
 }
 
 interface Terminal {
   id: string;
   pty: IPty;
   threadRef: ThreadRef;
+  /**
+   * How this terminal came to exist: resuming a thread, starting a fresh LHC
+   * session, or a plain shell. Only "newSession" ever waits for association.
+   */
+  kind: "thread" | NewTerminalKind;
   command: string;
   cwd: string;
   createdAt: string;
@@ -48,6 +79,11 @@ interface Terminal {
   /** DELETE arrived while still running: drop it once the exit is delivered. */
   removeOnExit: boolean;
   killTimer: NodeJS.Timeout | null;
+  /** Last byte out of the pty / in from a client. Drives the activity dots. */
+  lastOutputAt: string | null;
+  lastInputAt: string | null;
+  /** Set while a newborn session is still looking for its thread row. */
+  pending: PendingAssociation | null;
 }
 
 const terminals = new Map<string, Terminal>();
@@ -64,6 +100,7 @@ function publicView(t: Terminal): Record<string, unknown> {
     hostId: t.threadRef.hostId,
     threadId: t.threadRef.threadId,
     title: t.threadRef.title,
+    kind: t.kind,
     command: t.command,
     cwd: t.cwd,
     status: t.status,
@@ -71,11 +108,16 @@ function publicView(t: Terminal): Record<string, unknown> {
     createdAt: t.createdAt,
     cols: t.cols,
     rows: t.rows,
+    lastOutputAt: t.lastOutputAt,
+    lastInputAt: t.lastInputAt,
+    /** Still hunting for the thread row this session is writing. */
+    awaitingThread: t.pending !== null,
   };
 }
 
 /** Append to the ring buffer, dropping whole chunks off the front when over cap. */
 function record(t: Terminal, data: string): void {
+  t.lastOutputAt = new Date().toISOString();
   t.chunks.push(data);
   t.chars += data.length;
   while (t.chars > BUFFER_CAP && t.chunks.length > 1) {
@@ -146,6 +188,9 @@ export interface SpawnSpec {
   threadRef: ThreadRef;
   cols: number;
   rows: number;
+  kind?: "thread" | NewTerminalKind;
+  /** Newborn LHC session: watch this host's registry for the row it writes. */
+  pending?: PendingAssociation | null;
 }
 
 /**
@@ -180,6 +225,7 @@ function spawnTerminal(spec: SpawnSpec): Terminal {
     id: newId(),
     pty,
     threadRef: spec.threadRef,
+    kind: spec.kind ?? "thread",
     command: spec.command,
     cwd: spec.cwd,
     createdAt: new Date().toISOString(),
@@ -192,6 +238,9 @@ function spawnTerminal(spec: SpawnSpec): Terminal {
     sockets: new Set(),
     removeOnExit: false,
     killTimer: null,
+    lastOutputAt: null,
+    lastInputAt: null,
+    pending: spec.pending ?? null,
   };
   // node-pty hands us decoded strings, so UTF-8 sequences never split here.
   pty.onData((data) => {
@@ -200,7 +249,132 @@ function spawnTerminal(spec: SpawnSpec): Terminal {
   });
   pty.onExit(({ exitCode, signal }) => onExit(t, exitCode, signal));
   terminals.set(t.id, t);
+  if (t.pending) startAssociationPoll();
   return t;
+}
+
+// --- newborn-thread association ---------------------------------------------
+
+/*
+ * A session started fresh has no thread id: the host writes its registry row a
+ * second or two after boot. Rather than make the client poll (and guess), the
+ * server watches the host's registry — mtime-gated, so an idle registry costs
+ * one stat — and pushes a control frame the moment the row appears. Until then
+ * the tab wears `<host>: <dir basename>`, which is at least true.
+ */
+
+let associateTimer: NodeJS.Timeout | null = null;
+/** Registry identity (mtime:size) at the last look, per host. */
+const registryKeys = new Map<string, string>();
+
+function pendingTerminals(): Terminal[] {
+  return [...terminals.values()].filter((t) => t.pending !== null);
+}
+
+function startAssociationPoll(): void {
+  if (associateTimer) return;
+  associateTimer = setInterval(pollAssociations, ASSOCIATE_POLL_MS);
+  // Never hold the process open for this.
+  associateTimer.unref();
+}
+
+function stopAssociationPoll(): void {
+  if (!associateTimer) return;
+  clearInterval(associateTimer);
+  associateTimer = null;
+}
+
+/**
+ * Has this host's registry changed since the last look?
+ *
+ * Returns the key to remember rather than remembering it here: the gate may
+ * only advance once the read that follows has actually succeeded. Recording
+ * it up front would turn a registry caught mid-write — the very case the read
+ * is expected to fail on — into a permanently skipped poll, and the newborn
+ * row would go unseen for the rest of the five-minute window.
+ */
+function registryChange(hostId: string): { changed: boolean; key: string | null } {
+  const host = discoverHosts().find((h) => h.id === hostId);
+  if (!host?.registryPath) return { changed: true, key: null }; // scan host: no cheap gate
+  let key: string;
+  try {
+    const st = statSync(host.registryPath);
+    key = `${st.mtimeMs}:${st.size}`;
+  } catch {
+    return { changed: false, key: null }; // no registry to read
+  }
+  return { changed: registryKeys.get(hostId) !== key, key };
+}
+
+function pollAssociations(): void {
+  const waiting = pendingTerminals();
+  if (waiting.length === 0) {
+    stopAssociationPoll();
+    return;
+  }
+  const now = Date.now();
+  const live: Terminal[] = [];
+  for (const t of waiting) {
+    const expired = now - Date.parse(t.pending!.spawnedAt) > ASSOCIATE_WINDOW_MS;
+    // A session that died without writing a row is never going to write one.
+    if (expired || t.status !== "running") t.pending = null;
+    else live.push(t);
+  }
+  if (live.length === 0) {
+    stopAssociationPoll();
+    return;
+  }
+  const taken = new Set(
+    [...terminals.values()].map((t) => t.threadRef.threadId).filter((id): id is string => !!id),
+  );
+  const byHost = new Map<string, Terminal[]>();
+  for (const t of live) {
+    const list = byHost.get(t.pending!.hostId);
+    if (list) list.push(t);
+    else byHost.set(t.pending!.hostId, [t]);
+  }
+  for (const [hostId, group] of byHost) {
+    const { changed, key } = registryChange(hostId);
+    if (!changed) continue;
+    const host = discoverHosts().find((h) => h.id === hostId);
+    if (!host) continue;
+    let rows: ThreadSummary[];
+    try {
+      rows = listThreads(host);
+    } catch {
+      continue; // registry mid-write; the gate has NOT moved, so we look again
+    }
+    // Read succeeded: this state of the registry is now accounted for.
+    if (key) registryKeys.set(hostId, key);
+    const candidates = rows.map((r) => ({
+      threadId: r.threadId,
+      cwd: r.cwd,
+      createdAt: r.createdAt,
+      title: r.title,
+    }));
+    for (const t of group) {
+      const hit = matchNewborn(candidates, {
+        cwd: t.pending!.cwd,
+        spawnedAt: t.pending!.spawnedAt,
+        taken,
+      });
+      if (!hit) continue;
+      taken.add(hit.threadId);
+      t.pending = null;
+      t.threadRef = {
+        hostId,
+        threadId: hit.threadId,
+        title: hit.title ?? t.threadRef.title,
+      };
+      broadcastControl(t, {
+        type: "associated",
+        hostId,
+        threadId: hit.threadId,
+        title: t.threadRef.title,
+      });
+    }
+  }
+  if (pendingTerminals().length === 0) stopAssociationPoll();
 }
 
 function runningCount(): number {
@@ -231,6 +405,8 @@ export function ownTerminals(): OwnTerminal[] {
   const out: OwnTerminal[] = [];
   for (const t of terminals.values()) {
     if (t.status !== "running") continue;
+    // A newborn session with no thread id yet holds nothing detection can match.
+    if (!t.threadRef.threadId) continue;
     out.push({ pid: t.pty.pid, hostId: t.threadRef.hostId, threadId: t.threadRef.threadId });
   }
   return out;
@@ -297,6 +473,20 @@ function clampDim(v: unknown, fallback: number, max: number): number {
 
 type Lookup = { thread: ThreadSummary } | { code: number; error: string };
 
+/**
+ * What this machine offers a new session. Cheap enough to build per request
+ * (host discovery is a handful of `existsSync` calls) and always current, so a
+ * host installed while the server runs needs no restart.
+ */
+export function newSessionEnv(): NewSessionEnv {
+  return {
+    launchable: launchableHostIds(discoverHosts().map((h) => h.id)),
+    hermesProfiles: hermesProfiles(),
+    home: process.env.HOME ?? homedir(),
+    shell: process.env.SHELL ?? null,
+  };
+}
+
 export function registerTerminalRoutes(
   app: FastifyInstance,
   lookupThread: (hostId: string, threadId: string) => Lookup,
@@ -312,6 +502,10 @@ export function registerTerminalRoutes(
       cols?: number;
       rows?: number;
       devCommand?: string;
+      /** Start a fresh LHC session here, rather than resume a thread. */
+      newSession?: { hostId?: string; cwd?: string; profile?: string | null };
+      /** Start a plain login shell here. */
+      shell?: { cwd?: string };
     };
     const cols = clampDim(body.cols, 80, 500);
     const rows = clampDim(body.rows, 24, 200);
@@ -339,6 +533,43 @@ export function registerTerminalRoutes(
         cols,
         rows,
       });
+      return reply.code(201).send(publicView(t));
+    }
+
+    /*
+     * New session / plain shell. The client names a host and a directory; the
+     * command is built here from those two facts alone, so there is still no
+     * path by which a client-supplied string reaches a shell. Nothing exists
+     * to collide with yet, so the one-writer guard does not apply.
+     */
+    if (body.newSession || body.shell) {
+      const req_ = body.newSession
+        ? {
+            kind: "newSession" as const,
+            hostId: body.newSession.hostId,
+            cwd: body.newSession.cwd,
+            profile: body.newSession.profile,
+          }
+        : { kind: "shell" as const, cwd: body.shell?.cwd };
+      const plan = planNewSession(req_, newSessionEnv());
+      if (!plan.ok) return reply.code(400).send({ error: plan.error });
+      if (!isExistingDir(plan.cwd)) {
+        return reply.code(400).send({ error: `not a directory: ${plan.cwd}` });
+      }
+      if (runningCount() >= MAX_RUNNING) {
+        return reply.code(429).send({ error: `terminal limit reached (${MAX_RUNNING})` });
+      }
+      const spawnedAt = new Date().toISOString();
+      const t = spawnTerminal({
+        command: plan.command,
+        cwd: plan.cwd,
+        kind: plan.kind,
+        threadRef: { hostId: plan.hostId, threadId: null, title: plan.title },
+        pending: plan.matchCwd ? { hostId: plan.hostId, cwd: plan.matchCwd, spawnedAt } : null,
+        cols,
+        rows,
+      });
+      invalidateProcessScan();
       return reply.code(201).send(publicView(t));
     }
 
@@ -457,9 +688,11 @@ export function registerTerminalRoutes(
         } catch {
           // not JSON — fall through and treat it as keystrokes
         }
+        t.lastInputAt = new Date().toISOString();
         t.pty.write(text);
         return;
       }
+      t.lastInputAt = new Date().toISOString();
       t.pty.write(Buffer.isBuffer(raw) ? raw.toString("utf8") : String(raw));
     });
 

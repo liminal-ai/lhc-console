@@ -1,7 +1,13 @@
 import Fastify from "fastify";
 import websocket from "@fastify/websocket";
 import {
+  browseDirs,
   discoverHosts,
+  hermesProfiles,
+  isExistingDir,
+  launchableHostIds,
+  planNewSession,
+  quickDirs,
   launchRecipe,
   listMessages,
   listThreads,
@@ -17,8 +23,20 @@ import {
   type ThreadQuickStats,
   type WriterPolicy,
 } from "@lhc-console/core";
-import { hiddenCount, hideThread, isHidden, loadPrefs, unhideThread } from "./prefs.ts";
-import { ownTerminals, registerTerminalRoutes, shutdownTerminals } from "./terminals.ts";
+import {
+  hiddenCount,
+  hideThread,
+  isHidden,
+  loadPrefs,
+  newSessionRoots,
+  unhideThread,
+} from "./prefs.ts";
+import {
+  newSessionEnv,
+  ownTerminals,
+  registerTerminalRoutes,
+  shutdownTerminals,
+} from "./terminals.ts";
 import { detectAttached, type AttachInfo } from "./attach-detect.ts";
 
 const PORT = Number(process.env.LHC_CONSOLE_PORT ?? 5959);
@@ -42,6 +60,17 @@ function cachedQuickStats(t: ThreadSummary): ThreadQuickStats | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Cache-only read of the same stats. Quick-dirs wants a "last active" per
+ * thread but must not become a reason to open forty thread files: when the
+ * stats are already cached it uses the real last-event time, otherwise the
+ * file's mtime, which is within seconds of it anyway.
+ */
+function peekQuickStats(t: ThreadSummary): ThreadQuickStats | null {
+  const hit = statsCache.get(t.filePath);
+  return hit && hit.mtime === t.fileMtime ? hit.stats : null;
 }
 
 type Lookup = { thread: ThreadSummary } | { code: number; error: string };
@@ -95,10 +124,102 @@ await app.register(websocket);
 registerTerminalRoutes(app, lookupThread);
 
 app.get("/api/hosts", async () => {
+  const launchable = new Set(launchableHostIds(discoverHosts().map((h) => h.id)));
   return discoverHosts().map((h) => ({
     ...h,
     threadCount: listThreads(h).length,
+    /** A new session can be started here (never t3code, which is web-managed). */
+    launchable: launchable.has(h.id),
   }));
+});
+
+/**
+ * Everything the new-session modal needs to open: which hosts can be started,
+ * which hermes profiles exist, and where the directory picker should begin.
+ * One fetch, because the modal opens on a keystroke.
+ */
+app.get("/api/new-session/options", async () => {
+  const hostIds = launchableHostIds(discoverHosts().map((h) => h.id));
+  const roots = newSessionRoots();
+  return {
+    hosts: hostIds.map((id) => ({
+      id,
+      writerPolicy: writerPolicyFor(id),
+      /** Hermes picks a profile instead of a directory. */
+      picks: id === "hermes" ? "profile" : "directory",
+    })),
+    hermesProfiles: hermesProfiles(),
+    defaultRoot: roots.defaultRoot,
+    rootByHost: roots.rootByHost,
+  };
+});
+
+/**
+ * What would run, without running it. The modal shows this and the copy
+ * button hands it over, so the previewed string is the command itself rather
+ * than a client-side reconstruction of it that could drift.
+ */
+app.get("/api/new-session/preview", async (req) => {
+  // `hostId` everywhere: the POST body and the options response both call it
+  // that, and a query parameter spelled differently is a trap for whoever
+  // probes this next. `host` stays as an alias for anything already using it.
+  const q = req.query as {
+    hostId?: string;
+    host?: string;
+    cwd?: string;
+    profile?: string;
+    kind?: string;
+  };
+  const plan =
+    q.kind === "shell"
+      ? planNewSession({ kind: "shell", cwd: q.cwd }, newSessionEnv())
+      : planNewSession(
+          {
+            kind: "newSession",
+            hostId: q.hostId ?? q.host,
+            cwd: q.cwd,
+            profile: q.profile ?? null,
+          },
+          newSessionEnv(),
+        );
+  if (!plan.ok) return { command: null, error: plan.error };
+  // Existence is checked here too: the modal should say "not a directory"
+  // before the user presses the button, not after.
+  if (!isExistingDir(plan.cwd)) {
+    return { command: null, error: `not a directory: ${plan.cwd}` };
+  }
+  return { command: plan.command, cwd: plan.cwd, title: plan.title };
+});
+
+/**
+ * Directory completion for the path picker. Always 200: a half-typed path
+ * naming nothing is an ordinary state, and the picker prints the reason
+ * inline rather than treating it as a failure.
+ */
+app.get("/api/fs/browse", async (req) => {
+  const q = req.query as { path?: string };
+  return browseDirs(q.path ?? "");
+});
+
+/**
+ * The directories work actually happens in, most recent first. Derived from
+ * the rows the list already reads — no thread files are opened for this.
+ */
+app.get("/api/quick-dirs", async () => {
+  const rows = discoverHosts().flatMap((h) => {
+    try {
+      return listThreads(h);
+    } catch {
+      return [];
+    }
+  });
+  return quickDirs(
+    rows.map((t) => ({
+      hostId: t.hostId,
+      cwd: t.cwd,
+      lastActiveAt: peekQuickStats(t)?.lastEventAt ?? t.fileMtime ?? t.createdAt,
+    })),
+  );
 });
 
 app.get("/api/threads", async (req, reply) => {

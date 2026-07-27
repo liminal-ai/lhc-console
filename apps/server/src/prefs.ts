@@ -12,9 +12,23 @@ export interface HiddenEntry {
   hiddenAt: string;
 }
 
+/**
+ * Where the new-session path picker starts. One default root, plus a per-host
+ * override the file shape supports and no UI writes yet — the shape is here so
+ * a hand-edited prefs file already works when the UI arrives.
+ */
+export interface NewSessionPrefs {
+  defaultRoot: string;
+  rootByHost: Record<string, string>;
+}
+
 export interface Prefs {
   hiddenThreads: Record<string, HiddenEntry>;
+  newSession: NewSessionPrefs;
 }
+
+/** The root the picker seeds with when nothing else says otherwise. */
+export const DEFAULT_NEW_SESSION_ROOT = "/srv/work";
 
 function prefsDir(): string {
   return process.env.LHC_CONSOLE_HOME ?? join(homedir(), ".lhc-console");
@@ -36,17 +50,33 @@ let cachedDir: string | null = null;
 let salvaged = false;
 
 function empty(): Prefs {
-  return { hiddenThreads: {} };
+  return {
+    hiddenThreads: {},
+    newSession: { defaultRoot: DEFAULT_NEW_SESSION_ROOT, rootByHost: {} },
+  };
 }
 
 function normalize(raw: unknown): Prefs {
   const p = empty();
   if (!raw || typeof raw !== "object") return p;
   const hidden = (raw as { hiddenThreads?: unknown }).hiddenThreads;
-  if (!hidden || typeof hidden !== "object") return p;
-  for (const [key, value] of Object.entries(hidden as Record<string, unknown>)) {
-    const at = (value as { hiddenAt?: unknown } | null)?.hiddenAt;
-    p.hiddenThreads[key] = { hiddenAt: typeof at === "string" ? at : new Date(0).toISOString() };
+  if (hidden && typeof hidden === "object") {
+    for (const [key, value] of Object.entries(hidden as Record<string, unknown>)) {
+      const at = (value as { hiddenAt?: unknown } | null)?.hiddenAt;
+      p.hiddenThreads[key] = { hiddenAt: typeof at === "string" ? at : new Date(0).toISOString() };
+    }
+  }
+  const ns = (raw as { newSession?: unknown }).newSession;
+  if (ns && typeof ns === "object") {
+    const root = (ns as { defaultRoot?: unknown }).defaultRoot;
+    if (typeof root === "string" && root.startsWith("/")) p.newSession.defaultRoot = root;
+    const byHost = (ns as { rootByHost?: unknown }).rootByHost;
+    if (byHost && typeof byHost === "object") {
+      for (const [host, value] of Object.entries(byHost as Record<string, unknown>)) {
+        if (typeof value === "string" && value.startsWith("/"))
+          p.newSession.rootByHost[host] = value;
+      }
+    }
   }
   return p;
 }
@@ -124,6 +154,11 @@ export function unhideThread(hostId: string, threadId: string): number {
     savePrefs(p);
   }
   return Object.keys(p.hiddenThreads).length;
+}
+
+/** Where the new-session picker should start, overall and per host. */
+export function newSessionRoots(): NewSessionPrefs {
+  return loadPrefs().newSession;
 }
 
 /** Test seam: drop the memo so a changed LHC_CONSOLE_HOME is re-read. */

@@ -65,6 +65,34 @@ export interface HostRow {
   id: string;
   home: string;
   threadCount: number;
+  /** A new session can be started on this host. */
+  launchable?: boolean;
+}
+
+/** Everything the new-session modal needs to open, in one fetch. */
+export interface NewSessionOptions {
+  hosts: { id: string; writerPolicy: "single" | "shared"; picks: "directory" | "profile" }[];
+  hermesProfiles: string[];
+  defaultRoot: string;
+  rootByHost: Record<string, string>;
+}
+
+/** A directory people actually work in, ranked by recent thread activity. */
+export interface QuickDir {
+  path: string;
+  basename: string;
+  threadCount: number;
+  hosts: string[];
+  lastActiveAt: string;
+}
+
+export interface BrowseResult {
+  parentDir: string;
+  prefix: string;
+  entries: { name: string; path: string }[];
+  truncated: boolean;
+  /** Short reason the listing is empty — shown inline, never thrown. */
+  error?: string;
 }
 
 export interface TurnRow {
@@ -200,8 +228,11 @@ export interface ViewArrangement {
 export interface TerminalRow {
   id: string;
   hostId: string;
-  threadId: string;
+  /** Null while a newborn session has not been matched to a thread row yet. */
+  threadId: string | null;
   title: string | null;
+  /** How it was started: resumed thread, fresh LHC session, or plain shell. */
+  kind?: "thread" | "newSession" | "shell";
   command: string;
   cwd: string;
   status: "running" | "exited";
@@ -209,6 +240,11 @@ export interface TerminalRow {
   createdAt: string;
   cols: number;
   rows: number;
+  /** Last pty output / client input, for the activity indicators. */
+  lastOutputAt?: string | null;
+  lastInputAt?: string | null;
+  /** Still watching the host registry for this session's thread row. */
+  awaitingThread?: boolean;
 }
 
 /** A non-2xx API response, carrying the status so callers can branch on 404. */
@@ -284,10 +320,34 @@ export const api = {
   viewArrangement: (hostId: string, threadId: string) =>
     get<ViewArrangement>(`/api/threads/${hostId}/${threadId}/view-arrangement`),
   terminals: () => get<TerminalRow[]>("/api/terminals"),
+  newSessionOptions: () => get<NewSessionOptions>("/api/new-session/options"),
+  quickDirs: () => get<QuickDir[]>("/api/quick-dirs"),
+  /** Directory completion. Always resolves — errors arrive as `error`. */
+  browse: (path: string, signal?: AbortSignal) =>
+    get<BrowseResult>(`/api/fs/browse?path=${encodeURIComponent(path)}`, signal),
+  /** What a new session would run, computed by the server that would run it. */
+  newSessionPreview: (params: {
+    kind: "newSession" | "shell";
+    hostId?: string;
+    cwd?: string;
+    profile?: string | null;
+  }) => {
+    const qs = new URLSearchParams({ kind: params.kind });
+    if (params.hostId) qs.set("hostId", params.hostId);
+    if (params.cwd) qs.set("cwd", params.cwd);
+    if (params.profile) qs.set("profile", params.profile);
+    return get<{ command: string | null; cwd?: string; title?: string; error?: string }>(
+      `/api/new-session/preview?${qs}`,
+    );
+  },
   openTerminal: (body: {
     hostId?: string;
     threadId?: string;
     fresh?: boolean;
+    /** Start a fresh session: the server builds the command from these. */
+    newSession?: { hostId: string; cwd?: string; profile?: string | null };
+    /** Start a plain login shell here. */
+    shell?: { cwd: string };
     /** Spawn even though the one-writer guard found an attachment. */
     force?: boolean;
     cols?: number;

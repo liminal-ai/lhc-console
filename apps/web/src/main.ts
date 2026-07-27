@@ -3,6 +3,7 @@ import { ApiError } from "./api.ts";
 import { isTab, renderThread, teardownDetail } from "./detail.ts";
 import { el } from "./format.ts";
 import { renderList, teardownList } from "./list.ts";
+import { mountWorkspace, rememberBrowserRoute, setWorkspaceVisible } from "./workspace.ts";
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
 
@@ -12,6 +13,16 @@ const THREAD_RE = /^\/thread\/([^/]+)\/([^/]+)(?:\/([^/]+))?(?:\/([^/]+))?$/;
 function route(): void {
   teardownDetail();
   teardownList();
+  // `#/term` is the second top-level mode: the workspace takes the viewport
+  // and the browser page steps aside (it re-renders on the way back).
+  if (location.hash === "#/term") {
+    app.style.display = "none";
+    setWorkspaceVisible(true);
+    return;
+  }
+  rememberBrowserRoute(location.hash || "#/");
+  setWorkspaceVisible(false);
+  app.style.display = "";
   const m = location.hash.slice(1).match(THREAD_RE);
   if (m) {
     const tab = isTab(m[3]) ? m[3] : "overview";
@@ -42,5 +53,6 @@ function showError(err: unknown): void {
   app.replaceChildren(box);
 }
 
+mountWorkspace();
 window.addEventListener("hashchange", route);
 route();

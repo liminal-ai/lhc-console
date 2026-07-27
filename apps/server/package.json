@@ -9,7 +9,9 @@
     "check": "vp check"
   },
   "dependencies": {
+    "@fastify/websocket": "^11.2.0",
     "@lhc-console/core": "workspace:*",
+    "@lydell/node-pty": "^1.1.0",
     "fastify": "^5.4.0"
   },
   "devDependencies": {

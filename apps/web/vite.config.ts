@@ -6,7 +6,7 @@ export default defineConfig({
     // reached through this proxy.
     host: true,
     proxy: {
-      "/api": "http://127.0.0.1:5959",
+      "/api": { target: "http://127.0.0.1:5959", ws: true },
     },
   },
 });

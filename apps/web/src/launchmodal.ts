@@ -1,4 +1,5 @@
 import { el } from "./format.ts";
+import { openThreadTerminal } from "./workspace.ts";
 
 /**
  * Copy via a hidden textarea. Synchronous, so it still counts as part of the
@@ -46,7 +47,13 @@ export function closeLaunchModal(): void {
   close?.();
 }
 
-export function openLaunchModal(command: string): void {
+/** Which thread the command belongs to, so the modal can actually run it. */
+export interface LaunchTarget {
+  hostId: string;
+  threadId: string;
+}
+
+export function openLaunchModal(command: string, target?: LaunchTarget): void {
   closeLaunchModal();
   const restoreFocus = document.activeElement;
 
@@ -72,6 +79,18 @@ export function openLaunchModal(command: string): void {
   box.append(status);
 
   const actions = el("div", "modal-actions");
+  if (target) {
+    const openBtn = el("button", "modal-open", "open in terminal") as HTMLButtonElement;
+    openBtn.type = "button";
+    openBtn.title = "run this on the server, in a workspace screen";
+    openBtn.onclick = () => {
+      dismiss();
+      void openThreadTerminal(target.hostId, target.threadId).catch((e: unknown) => {
+        setStatus(e instanceof Error ? e.message : String(e), "bad");
+      });
+    };
+    actions.append(openBtn);
+  }
   const copyBtn = el("button", "modal-copy", "copy") as HTMLButtonElement;
   copyBtn.type = "button";
   actions.append(copyBtn);

@@ -1,0 +1,405 @@
+/**
+ * Server-owned PTY sessions.
+ *
+ * The console is read-only wrt every SQLite file it touches; terminals are the
+ * one place it starts a process. The spawned host writes its own state — that
+ * is the point of the feature, and it never goes through this server.
+ *
+ * A terminal outlives the browser: output accumulates in a capped ring buffer,
+ * sockets attach and detach freely (several at once), and an exited terminal
+ * stays in the map with its final screen until someone dismisses it.
+ */
+
+import { homedir } from "node:os";
+import { spawn, type IPty } from "@lydell/node-pty";
+import type { FastifyInstance, FastifyRequest } from "fastify";
+import type { WebSocket } from "@fastify/websocket";
+import { launchRecipe, type ThreadSummary } from "@lhc-console/core";
+
+/** Total scrollback kept per terminal. Oldest output is dropped first. */
+const BUFFER_CAP = 2_000_000;
+/** Concurrently running terminals. Beyond this, POST answers 429. */
+const MAX_RUNNING = 8;
+/** Grace between SIGHUP and SIGKILL on delete. */
+const KILL_GRACE_MS = 3000;
+
+export interface ThreadRef {
+  hostId: string;
+  threadId: string;
+  title: string | null;
+}
+
+interface Terminal {
+  id: string;
+  pty: IPty;
+  threadRef: ThreadRef;
+  command: string;
+  cwd: string;
+  createdAt: string;
+  status: "running" | "exited";
+  exitCode: number | null;
+  cols: number;
+  rows: number;
+  /** Ring buffer of pty output, as strings — `chars` is their total length. */
+  chunks: string[];
+  chars: number;
+  sockets: Set<WebSocket>;
+  /** DELETE arrived while still running: drop it once the exit is delivered. */
+  removeOnExit: boolean;
+  killTimer: NodeJS.Timeout | null;
+}
+
+const terminals = new Map<string, Terminal>();
+let seq = 0;
+
+function newId(): string {
+  seq += 1;
+  return `t${seq}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function publicView(t: Terminal): Record<string, unknown> {
+  return {
+    id: t.id,
+    hostId: t.threadRef.hostId,
+    threadId: t.threadRef.threadId,
+    title: t.threadRef.title,
+    command: t.command,
+    cwd: t.cwd,
+    status: t.status,
+    exitCode: t.exitCode,
+    createdAt: t.createdAt,
+    cols: t.cols,
+    rows: t.rows,
+  };
+}
+
+/** Append to the ring buffer, dropping whole chunks off the front when over cap. */
+function record(t: Terminal, data: string): void {
+  t.chunks.push(data);
+  t.chars += data.length;
+  while (t.chars > BUFFER_CAP && t.chunks.length > 1) {
+    t.chars -= t.chunks.shift()!.length;
+  }
+  // A single chunk larger than the cap: keep its tail, which is the live screen.
+  if (t.chars > BUFFER_CAP && t.chunks.length === 1) {
+    const only = t.chunks[0].slice(-BUFFER_CAP);
+    t.chunks[0] = only;
+    t.chars = only.length;
+  }
+}
+
+function sendControl(socket: WebSocket, frame: Record<string, unknown>): void {
+  if (socket.readyState !== 1) return;
+  try {
+    socket.send(JSON.stringify(frame));
+  } catch {
+    // socket died mid-send; the close handler will clean it up
+  }
+}
+
+/**
+ * Output goes out as *binary* frames and control messages as JSON *text*, so
+ * the client never has to guess which is which — pty bytes can contain
+ * anything, including something that parses as JSON.
+ */
+function broadcastOutput(t: Terminal, data: string): void {
+  const bytes = Buffer.from(data, "utf8");
+  for (const s of t.sockets) {
+    if (s.readyState !== 1) continue;
+    try {
+      s.send(bytes);
+    } catch {
+      // ditto
+    }
+  }
+}
+
+function broadcastControl(t: Terminal, frame: Record<string, unknown>): void {
+  for (const s of t.sockets) sendControl(s, frame);
+}
+
+function onExit(t: Terminal, exitCode: number, signal?: number): void {
+  t.status = "exited";
+  t.exitCode = exitCode;
+  if (t.killTimer) {
+    clearTimeout(t.killTimer);
+    t.killTimer = null;
+  }
+  broadcastControl(t, { type: "exit", exitCode, signal: signal ?? null });
+  if (t.removeOnExit) {
+    terminals.delete(t.id);
+    for (const s of t.sockets) {
+      try {
+        s.close();
+      } catch {
+        // already gone
+      }
+    }
+    t.sockets.clear();
+  }
+}
+
+export interface SpawnSpec {
+  command: string;
+  cwd: string;
+  threadRef: ThreadRef;
+  cols: number;
+  rows: number;
+}
+
+function spawnTerminal(spec: SpawnSpec): Terminal {
+  const pty = spawn("bash", ["-lc", spec.command], {
+    name: "xterm-256color",
+    cols: spec.cols,
+    rows: spec.rows,
+    cwd: spec.cwd,
+    env: { ...process.env, TERM: "xterm-256color" } as Record<string, string>,
+  });
+  const t: Terminal = {
+    id: newId(),
+    pty,
+    threadRef: spec.threadRef,
+    command: spec.command,
+    cwd: spec.cwd,
+    createdAt: new Date().toISOString(),
+    status: "running",
+    exitCode: null,
+    cols: spec.cols,
+    rows: spec.rows,
+    chunks: [],
+    chars: 0,
+    sockets: new Set(),
+    removeOnExit: false,
+    killTimer: null,
+  };
+  // node-pty hands us decoded strings, so UTF-8 sequences never split here.
+  pty.onData((data) => {
+    record(t, data);
+    broadcastOutput(t, data);
+  });
+  pty.onExit(({ exitCode, signal }) => onExit(t, exitCode, signal));
+  terminals.set(t.id, t);
+  return t;
+}
+
+function runningCount(): number {
+  let n = 0;
+  for (const t of terminals.values()) if (t.status === "running") n += 1;
+  return n;
+}
+
+function findRunningFor(hostId: string, threadId: string): Terminal | undefined {
+  for (const t of terminals.values()) {
+    if (
+      t.status === "running" &&
+      t.threadRef.hostId === hostId &&
+      t.threadRef.threadId === threadId
+    ) {
+      return t;
+    }
+  }
+  return undefined;
+}
+
+function removeTerminal(t: Terminal): void {
+  if (t.status === "exited") {
+    terminals.delete(t.id);
+    for (const s of t.sockets) {
+      try {
+        s.close();
+      } catch {
+        // already gone
+      }
+    }
+    t.sockets.clear();
+    return;
+  }
+  t.removeOnExit = true;
+  try {
+    t.pty.kill("SIGHUP");
+  } catch {
+    // process already reaped; onExit will still land
+  }
+  t.killTimer = setTimeout(() => {
+    t.killTimer = null;
+    if (t.status !== "running") return;
+    try {
+      t.pty.kill("SIGKILL");
+    } catch {
+      // nothing left to kill
+    }
+  }, KILL_GRACE_MS);
+}
+
+/** Only loopback callers may name their own command (see the devCommand note). */
+function isLoopback(req: FastifyRequest): boolean {
+  const ip = req.socket.remoteAddress ?? "";
+  return ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1";
+}
+
+function clampDim(v: unknown, fallback: number, max: number): number {
+  const n = typeof v === "number" ? Math.floor(v) : Number.NaN;
+  if (!Number.isFinite(n) || n < 2) return fallback;
+  return Math.min(n, max);
+}
+
+type Lookup = { thread: ThreadSummary } | { code: number; error: string };
+
+export function registerTerminalRoutes(
+  app: FastifyInstance,
+  lookupThread: (hostId: string, threadId: string) => Lookup,
+): void {
+  app.get("/api/terminals", async () => [...terminals.values()].map(publicView));
+
+  app.post("/api/terminals", async (req, reply) => {
+    const body = (req.body ?? {}) as {
+      hostId?: string;
+      threadId?: string;
+      fresh?: boolean;
+      cols?: number;
+      rows?: number;
+      devCommand?: string;
+    };
+    const cols = clampDim(body.cols, 80, 500);
+    const rows = clampDim(body.rows, 24, 200);
+
+    /*
+     * Dev escape: a loopback caller may spawn an arbitrary command, so the
+     * terminal plumbing can be exercised end to end without starting a real
+     * agent session. Never available off-loopback, and it is the only path
+     * where a client-supplied command is honoured.
+     */
+    if (body.devCommand) {
+      if (!isLoopback(req)) return reply.code(403).send({ error: "devCommand is loopback-only" });
+      if (runningCount() >= MAX_RUNNING) {
+        return reply.code(429).send({ error: `terminal limit reached (${MAX_RUNNING})` });
+      }
+      const t = spawnTerminal({
+        command: body.devCommand,
+        cwd: process.env.HOME ?? homedir(),
+        threadRef: {
+          hostId: body.hostId ?? "dev",
+          threadId: body.threadId ?? `dev-${Date.now()}`,
+          title: `dev: ${body.devCommand}`.slice(0, 60),
+        },
+        cols,
+        rows,
+      });
+      return reply.code(201).send(publicView(t));
+    }
+
+    if (!body.hostId || !body.threadId) {
+      return reply.code(400).send({ error: "hostId and threadId are required" });
+    }
+    const found = lookupThread(body.hostId, body.threadId);
+    if ("error" in found) return reply.code(found.code).send({ error: found.error });
+    const { thread } = found;
+
+    // The command is always recomputed here; a client never gets to name it.
+    const recipe = launchRecipe(thread);
+    if (!recipe) return reply.code(409).send({ error: "thread has no launch recipe" });
+
+    if (!body.fresh) {
+      const existing = findRunningFor(thread.hostId, thread.threadId);
+      if (existing) return reply.send(publicView(existing));
+    }
+    if (runningCount() >= MAX_RUNNING) {
+      return reply.code(429).send({ error: `terminal limit reached (${MAX_RUNNING})` });
+    }
+    const t = spawnTerminal({
+      command: recipe.command,
+      cwd: thread.cwd ?? process.env.HOME ?? homedir(),
+      threadRef: {
+        hostId: thread.hostId,
+        threadId: thread.threadId,
+        title: thread.title ?? thread.sessionId ?? thread.threadId,
+      },
+      cols,
+      rows,
+    });
+    return reply.code(201).send(publicView(t));
+  });
+
+  app.delete("/api/terminals/:id", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const t = terminals.get(id);
+    if (!t) return reply.code(404).send({ error: "no such terminal" });
+    removeTerminal(t);
+    return { ok: true, id, status: t.status };
+  });
+
+  app.get("/api/terminals/:id/ws", { websocket: true }, (socket: WebSocket, req) => {
+    const { id } = req.params as { id: string };
+    const t = terminals.get(id);
+    if (!t) {
+      sendControl(socket, { type: "gone" });
+      socket.close();
+      return;
+    }
+    t.sockets.add(socket);
+    // The buffer is the truth: a fresh attach replays it, then rides live.
+    sendControl(socket, {
+      type: "replay",
+      data: t.chunks.join(""),
+      status: t.status,
+      exitCode: t.exitCode,
+      cols: t.cols,
+      rows: t.rows,
+    });
+    if (t.status === "exited") sendControl(socket, { type: "exit", exitCode: t.exitCode });
+
+    socket.on("message", (raw: Buffer | string, isBinary?: boolean) => {
+      if (t.status !== "running") return;
+      if (isBinary === false || typeof raw === "string") {
+        const text = raw.toString();
+        // Text frames are control frames; anything else is a protocol slip.
+        try {
+          const msg = JSON.parse(text) as { type?: string; cols?: number; rows?: number };
+          if (msg.type === "resize") {
+            const c = clampDim(msg.cols, t.cols, 500);
+            const r = clampDim(msg.rows, t.rows, 200);
+            if (c !== t.cols || r !== t.rows) {
+              t.cols = c;
+              t.rows = r;
+              try {
+                t.pty.resize(c, r);
+              } catch {
+                // pty vanished between the check and the resize
+              }
+            }
+            return;
+          }
+          if (msg.type === "ping") {
+            sendControl(socket, { type: "pong" });
+            return;
+          }
+        } catch {
+          // not JSON — fall through and treat it as keystrokes
+        }
+        t.pty.write(text);
+        return;
+      }
+      t.pty.write(Buffer.isBuffer(raw) ? raw.toString("utf8") : String(raw));
+    });
+
+    const drop = (): void => {
+      t.sockets.delete(socket);
+    };
+    socket.on("close", drop);
+    socket.on("error", drop);
+  });
+}
+
+/** Kill everything — used on server shutdown so no orphan agents survive. */
+export function shutdownTerminals(): void {
+  for (const t of terminals.values()) {
+    if (t.status === "running") {
+      try {
+        t.pty.kill("SIGHUP");
+      } catch {
+        // best effort
+      }
+    }
+  }
+  terminals.clear();
+}

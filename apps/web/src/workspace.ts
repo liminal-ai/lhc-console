@@ -18,6 +18,10 @@ import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { api, type TerminalRow, type ThreadRow } from "./api.ts";
 import { el } from "./format.ts";
+// Cyclic by nature (the modal spawns through this module, this module opens
+// the modal) and safe: both directions are function references, resolved at
+// click time rather than at module evaluation.
+import { openNewSessionModal } from "./newsessionmodal.ts";
 
 const RETRY_START_MS = 1000;
 const RETRY_CAP_MS = 15_000;
@@ -27,6 +31,12 @@ const MAX_PANES = 3;
 const MIN_PANE_PX = 320;
 const TITLE_MAX = 22;
 const STORE_KEY = "lhc-console.workspace";
+/** Running but silent for this long reads as "probably waiting for you". */
+const IDLE_AFTER_MS = 3 * 60_000;
+/** Ageing the idle tint needs a heartbeat; nothing else does. */
+const ACTIVITY_TICK_MS = 20_000;
+/** Output is continuous; tell subscribers about it at human speed. */
+const ACTIVITY_NOTIFY_MS = 2000;
 
 /** One live terminal: server row + its xterm + its socket + its DOM. */
 interface Term {
@@ -50,6 +60,8 @@ interface Screen {
   /** Flex weights, parallel to `panes`. */
   widths: number[];
   row: HTMLElement;
+  /** When this screen was last on view — output after it counts as unseen. */
+  lastViewedAt: number;
 }
 
 const terms = new Map<string, Term>();
@@ -151,9 +163,55 @@ function makeScreen(id = newScreenId()): Screen {
   const row = el("div", "ws-screen");
   row.style.display = "none";
   bodyEl?.append(row);
-  const s: Screen = { id, panes: [], widths: [], row };
+  const s: Screen = { id, panes: [], widths: [], row, lastViewedAt: Date.now() };
   screens.push(s);
   return s;
+}
+
+// --- activity ---------------------------------------------------------------
+
+/*
+ * Which screens have something to say. The server timestamps every byte, and
+ * an attached socket sees them live, so this is derivation rather than
+ * plumbing: output newer than the last time a screen was on view is unseen,
+ * and a running pane that has said nothing for minutes is probably waiting.
+ */
+
+let lastActivityNotify = 0;
+
+/** Newest output across a screen's panes, as epoch ms. */
+function screenOutputAt(s: Screen): number {
+  let newest = 0;
+  for (const id of s.panes) {
+    const at = terms.get(id)?.info.lastOutputAt;
+    const ms = at ? Date.parse(at) : 0;
+    if (ms > newest) newest = ms;
+  }
+  return newest;
+}
+
+function screenUnseen(s: Screen): boolean {
+  if (visible && s.id === activeScreen) return false;
+  return screenOutputAt(s) > s.lastViewedAt;
+}
+
+/** Running, attached, and quiet for a while — no news is its own signal. */
+function screenIdle(s: Screen): boolean {
+  if (!screenRunning(s)) return false;
+  const at = screenOutputAt(s);
+  return at > 0 && Date.now() - at > IDLE_AFTER_MS;
+}
+
+/** Mark output on a terminal the client is watching, and throttle the fan-out. */
+function markOutput(t: Term): void {
+  t.info = { ...t.info, lastOutputAt: new Date().toISOString() };
+  const now = Date.now();
+  const s = screenOf(t.info.id);
+  // Only the bar cares immediately, and only for screens that are off view.
+  if (s && (!visible || s.id !== activeScreen)) paintBar();
+  if (now - lastActivityNotify < ACTIVITY_NOTIFY_MS) return;
+  lastActivityNotify = now;
+  notify();
 }
 
 function screenOf(termId: string): Screen | undefined {
@@ -188,6 +246,7 @@ function showScreen(id: string): void {
   for (const s of screens) s.row.style.display = s.id === id ? "flex" : "none";
   const s = screens.find((x) => x.id === id);
   if (s) {
+    s.lastViewedAt = Date.now();
     for (const tid of s.panes) attachTerm(terms.get(tid)!);
     if (!s.panes.includes(focusedPane ?? "")) focusedPane = s.panes[0] ?? null;
   }
@@ -351,9 +410,17 @@ function attachTerm(t: Term): void {
   ws.onmessage = (ev: MessageEvent) => {
     if (typeof ev.data !== "string") {
       t.term?.write(new Uint8Array(ev.data as ArrayBuffer));
+      markOutput(t);
       return;
     }
-    let msg: { type?: string; data?: string; status?: string; exitCode?: number | null };
+    let msg: {
+      type?: string;
+      data?: string;
+      status?: string;
+      exitCode?: number | null;
+      threadId?: string;
+      title?: string | null;
+    };
     try {
       msg = JSON.parse(ev.data) as typeof msg;
     } catch {
@@ -366,6 +433,22 @@ function attachTerm(t: Term): void {
       if (msg.status === "exited") markExited(t, msg.exitCode ?? null);
       else setStrip(t, "", "off");
       fitTerm(t);
+    } else if (msg.type === "associated") {
+      /*
+       * The session this pane started has written its registry row: it now
+       * has a thread, a real title, and a place in the list. Nothing is
+       * re-fetched — the frame carries everything the label needs.
+       */
+      t.info = {
+        ...t.info,
+        threadId: msg.threadId ?? t.info.threadId,
+        title: msg.title ?? t.info.title,
+        awaitingThread: false,
+      };
+      const titleEl = t.pane.querySelector(".ws-corner-title");
+      if (titleEl) titleEl.textContent = truncate(t.info.title ?? t.info.id, 40);
+      paintBar();
+      notify();
     } else if (msg.type === "exit") {
       markExited(t, msg.exitCode ?? null);
     } else if (msg.type === "gone") {
@@ -430,7 +513,7 @@ function ensureTerm(info: TerminalRow): Term {
   const strip = el("div", "ws-strip off");
   const corner = el("div", "ws-corner");
   corner.append(
-    el("span", "ws-corner-title", truncate(info.title ?? info.threadId, 40)),
+    el("span", "ws-corner-title", truncate(info.title ?? info.threadId ?? info.id, 40)),
     confirmingButton("✕", () => removeTerm(info.id, true)),
   );
   pane.append(host, corner, strip);
@@ -536,8 +619,20 @@ function paintBar(): void {
   screens.forEach((s, i) => {
     const b = el("button", `ws-tab${s.id === activeScreen ? " active" : ""}`) as HTMLButtonElement;
     b.type = "button";
-    b.title = `alt+${i + 1}`;
-    b.append(el("span", `ws-dot ${screenRunning(s) ? "ok" : "dim"}`));
+    // The dot carries three facts at once: alive, unseen output, gone quiet.
+    const unseen = screenUnseen(s);
+    const idle = !unseen && screenIdle(s);
+    b.title = unseen
+      ? `alt+${i + 1} · new output`
+      : idle
+        ? `alt+${i + 1} · quiet for a while`
+        : `alt+${i + 1}`;
+    b.append(
+      el(
+        "span",
+        `ws-dot ${screenRunning(s) ? "ok" : "dim"}${unseen ? " unseen" : ""}${idle ? " idle" : ""}`,
+      ),
+    );
     b.append(el("span", "ws-tab-label", screenLabel(s)));
     b.onclick = () => showScreen(s.id);
     tabsEl!.append(b);
@@ -582,7 +677,9 @@ function toggleSplitPopover(): void {
       const b = el("button", "ws-pop-row") as HTMLButtonElement;
       b.type = "button";
       b.append(el("span", `ws-dot ${t.info.status === "running" ? "ok" : "dim"}`));
-      b.append(el("span", "ws-pop-title", truncate(t.info.title ?? t.info.threadId, 34)));
+      b.append(
+        el("span", "ws-pop-title", truncate(t.info.title ?? t.info.threadId ?? t.info.id, 34)),
+      );
       b.append(el("span", "ws-pop-host dim", t.info.hostId));
       b.onclick = () => {
         closePopover();
@@ -592,7 +689,29 @@ function toggleSplitPopover(): void {
     }
   }
 
-  popover.append(el("div", "ws-pop-head", "new terminal…"));
+  /*
+   * Starting something new here. The picker seeds with the focused pane's
+   * directory rather than the configured root: a split is nearly always
+   * "another one of these, same repo".
+   */
+  popover.append(el("div", "ws-pop-head", "start here…"));
+  for (const [label, prefer] of [
+    ["new session", "session"],
+    ["new shell", "shell"],
+  ] as const) {
+    const b = el("button", "ws-pop-row") as HTMLButtonElement;
+    b.type = "button";
+    b.append(el("span", "ws-pop-title", label));
+    const seed = focusedPaneCwd();
+    b.append(el("span", "ws-pop-host dim", seed ? shortDir(seed) : "…"));
+    b.onclick = () => {
+      closePopover();
+      openNewSessionModal({ seedCwd: seed, prefer, place: "split" });
+    };
+    popover.append(b);
+  }
+
+  popover.append(el("div", "ws-pop-head", "resume thread…"));
   const filter = el("input", "ws-pop-filter") as HTMLInputElement;
   filter.placeholder = "filter threads";
   filter.spellcheck = false;
@@ -646,6 +765,55 @@ function toggleSplitPopover(): void {
   }
 }
 
+/** The directory of the pane the user is in — what a split should inherit. */
+export function focusedPaneCwd(): string | null {
+  const t = focusedPane ? terms.get(focusedPane) : null;
+  if (t?.info.cwd) return t.info.cwd;
+  const s = screens.find((x) => x.id === activeScreen);
+  for (const id of s?.panes ?? []) {
+    const cwd = terms.get(id)?.info.cwd;
+    if (cwd) return cwd;
+  }
+  return null;
+}
+
+/** `/srv/work/lhc-console` → `…/lhc-console`, for a 320px popover row. */
+function shortDir(cwd: string): string {
+  const cut = cwd.lastIndexOf("/");
+  return cut > 0 ? `…/${cwd.slice(cut + 1)}` : cwd;
+}
+
+/**
+ * Start a brand-new session or shell. The body names a host and a directory
+ * and nothing else — the server owns the command. `place` decides whether it
+ * takes a screen of its own or joins the active split.
+ */
+export async function startNewTerminal(
+  body: {
+    newSession?: { hostId: string; cwd?: string; profile?: string | null };
+    shell?: { cwd: string };
+  },
+  place: "screen" | "split" = "screen",
+): Promise<TerminalRow> {
+  const s = screens.find((x) => x.id === activeScreen);
+  const split = place === "split" && !!s && s.panes.length < MAX_PANES;
+  const info = await api.openTerminal({ ...body, cols: 100, rows: 30 });
+  attachTerm(ensureTerm(info));
+  if (split && s) {
+    addPane(s, info.id);
+    showScreen(s.id);
+    focusPane(info.id);
+  } else {
+    newScreenWith(info.id);
+  }
+  paintBar();
+  paintIndicator();
+  persist();
+  notify();
+  enterWorkspace();
+  return info;
+}
+
 async function addThreadToActiveScreen(hostId: string, threadId: string): Promise<void> {
   const s = screens.find((x) => x.id === activeScreen);
   if (!s || s.panes.length >= MAX_PANES) return;
@@ -655,7 +823,7 @@ async function addThreadToActiveScreen(hostId: string, threadId: string): Promis
     return;
   }
   const info = await api.openTerminal({ hostId, threadId, cols: 100, rows: 30 });
-  ensureTerm(info);
+  attachTerm(ensureTerm(info));
   addPane(s, info.id);
   showScreen(s.id);
   focusPane(info.id);
@@ -696,7 +864,7 @@ export async function openThreadTerminal(
     return;
   }
   const info = await api.openTerminal({ hostId, threadId, fresh, force, cols: 100, rows: 30 });
-  ensureTerm(info);
+  attachTerm(ensureTerm(info));
   newScreenWith(info.id);
   paintIndicator();
   notify();
@@ -720,7 +888,7 @@ export async function openDevTerminal(
     cols: 100,
     rows: 30,
   });
-  ensureTerm(info);
+  attachTerm(ensureTerm(info));
   newScreenWith(info.id);
   paintIndicator();
   notify();
@@ -779,6 +947,14 @@ export async function refreshTerminals(): Promise<void> {
   if (!activeScreen || !screens.some((x) => x.id === activeScreen)) {
     activeScreen = screens[0]?.id ?? null;
   }
+  /*
+   * Every terminal gets a socket, not just the visible ones. A screen that is
+   * off view is exactly the one whose activity dot matters, and the dot is
+   * derived from bytes arriving here — attaching only what is on screen would
+   * make the indicator blind to the case it exists for. The server broadcasts
+   * to whoever is listening; eight sockets is nothing.
+   */
+  for (const t of terms.values()) attachTerm(t);
   if (activeScreen) showScreen(activeScreen);
   paintBar();
   paintIndicator();
@@ -875,6 +1051,10 @@ export function mountWorkspace(): void {
   });
   window.addEventListener("keydown", onGlobalKey, true);
   window.addEventListener("resize", () => fitVisible());
+  // The idle tint is a function of elapsed time, so it needs a heartbeat.
+  setInterval(() => {
+    if (terms.size) paintBar();
+  }, ACTIVITY_TICK_MS);
 
   paintBar();
   void refreshTerminals();

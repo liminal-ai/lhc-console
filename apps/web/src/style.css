@@ -1701,3 +1701,181 @@ button.linkish.launch-link.has-term {
 button.linkish.launch-cmd {
   color: var(--dim);
 }
+
+/* --- new sessions, path picker, activity ----------------------------------
+ * Starting work looks like resuming it: the same modal, the same two actions.
+ * The picker is a list under an input and nothing more — no popup layer, no
+ * focus games; the input keeps focus the whole time.
+ */
+
+.head-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+button.chip.new-session-btn {
+  font-size: 11px;
+  padding: 4px 10px;
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+}
+
+button.chip.new-session-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: rgb(106 168 255 / 10%);
+}
+
+.ns-hosts,
+.ns-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 12px 0 4px;
+}
+
+button.chip.ns-chip {
+  font-size: 11px;
+  padding: 4px 10px;
+}
+
+.ns-body {
+  margin: 10px 0 12px;
+}
+
+.ns-label {
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  margin-bottom: 4px;
+}
+
+.ns-hint {
+  margin-top: 8px;
+  font-size: 11px;
+}
+
+.modal-cmd.dim {
+  color: var(--dim);
+}
+
+/* path picker */
+
+.pp-input {
+  width: 100%;
+  padding: 6px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font: inherit;
+}
+
+.pp-input:focus {
+  outline: 0;
+  border-color: var(--accent);
+}
+
+.pp-error {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--bad);
+}
+
+.pp-list {
+  margin-top: 6px;
+  max-height: 240px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+}
+
+.pp-sec {
+  padding: 4px 8px;
+  font-size: 10px;
+  color: var(--dim);
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+}
+
+.pp-note {
+  padding: 5px 8px;
+  font-size: 11px;
+}
+
+button.pp-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 4px 8px;
+  background: none;
+  border: 0;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+button.pp-row:hover {
+  background: var(--panel);
+}
+
+button.pp-row.on {
+  background: rgb(106 168 255 / 14%);
+  color: var(--accent);
+}
+
+.pp-row-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pp-row-sub {
+  flex: 0 0 auto;
+  font-size: 10px;
+}
+
+/* activity: unseen output is bright, a long silence is a dim halo */
+
+.ws-dot.unseen {
+  background: var(--accent);
+  box-shadow: 0 0 0 2px rgb(106 168 255 / 22%);
+}
+
+.ws-dot.idle {
+  background: color-mix(in srgb, var(--ok) 45%, var(--panel));
+  box-shadow: 0 0 0 2px rgb(138 146 160 / 14%);
+}
+
+/* The list-row marker for a terminal that is currently producing output. */
+button.launch-link.has-term.active {
+  color: var(--ok);
+}
+
+button.launch-link.has-term.active::before {
+  content: "";
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  margin-right: 5px;
+  border-radius: 50%;
+  background: var(--ok);
+  vertical-align: middle;
+  animation: term-pulse 2s ease-in-out infinite;
+}
+
+@keyframes term-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.25;
+  }
+}

@@ -163,13 +163,69 @@ Esc always belongs to the TUI. Browser mode shows a fixed "terminals ● N"
 button when any exist. Pane composition persists in localStorage, reconciled
 against GET /api/terminals on load.
 
+### New sessions & plain shells (slice 11)
+
+The console is also the front door for _starting_ work, not just resuming it.
+One entry point per surface, same components everywhere:
+
+- **List page**: a `new session` button in the header (shortcut `n`).
+- **Workspace split popover** grows to four entries with identical semantics:
+  move an existing terminal here / resume a thread (both exist today) /
+  new LHC session / new shell.
+
+The modal flow: pick what to run — the _launchable_ hosts (cc-lhc, pi-lhc,
+hermes; codex-lhc when installed; never t3code) **plus a plain shell** ($SHELL,
+no LHC) — then pick a directory, then the standard two actions: open in
+terminal / copy command. Commands are trivial: `cd <dir> && cc-lhc`,
+`cd <dir> && pi-lhc`, `hermes` / `hermes --profile <name>` (hermes ignores cwd;
+show a profile picker instead of a directory when profiles exist), `cd <dir>
+&& exec $SHELL -l` for plain shells. New-session spawns bypass the one-writer
+guard (nothing to conflict) and plain shells bypass thread association
+entirely. Shell tabs label by directory basename, join screens/splits like any
+pane. POST /api/terminals accepts a new-session form (host+cwd or shell+cwd)
+— still server-computed commands only, never client-supplied strings.
+
+**pathPicker** (reusable component, `apps/web/src/pathpicker.ts`): an input +
+sectioned suggestion list. Config: section providers (label + `(query) =>
+entries`), seed/root, dirs-only filter, validate hook. Keyboard: arrows move,
+Enter selects, Tab completes-and-descends, typing narrows all sections.
+Sections for new-session: (1) **quick selects** — distinct cwds across all
+host registries ranked by most recent thread activity, annotated (basename ·
+N threads · hosts · last active); (2) **filesystem browse** via `GET
+/api/fs/browse?path=<partial>` (server splits partial into parent+prefix,
+readdirs, returns dirs only, hidden dirs filtered, bounded count). No pinning
+— recency does the ranking; the only user-set value is the default root
+(prefs, `/srv/work`, per-host override allowed). From the split popover the
+picker seeds with the _focused pane's cwd_ instead of the root (the common
+split is "shell/agent next to this one, same repo").
+
+**Newborn-thread association**: a terminal spawned as a new LHC session has no
+thread id yet. The terminal manager watches the host's registry (mtime poll is
+fine) for a new row whose cwd matches and whose created_at falls in the spawn
+window, then binds it: tab title becomes the thread title, the list row gains
+its has-term marker, terminal→thread links light up. Until then the tab shows
+`<host>: <dir basename>`.
+
+**Activity indicators**: per-terminal, server-tracked `lastOutputAt` (and
+`lastInputAt`); the workspace bar marks non-visible screens with output since
+last view (dot) and running-but-quiet-for-N-minutes (dim pulse — "probably
+waiting for you"). List rows with a live terminal reuse the same signal. No
+new plumbing — the PTY manager already sees every byte; expose timestamps on
+GET /api/terminals and let the client derive states.
+
 ## API surface (server)
 
 Existing: `/api/hosts`, `/api/threads` (aggregated + quick stats, mtime-cached),
 `/api/threads/:host/:id` (overview), `…/turns`, `…/messages`, `…/view`.
 Terminals: `GET/POST /api/terminals`, `DELETE /api/terminals/:id`,
 `GET /api/terminals/:id/ws` (websocket; JSON text frames are control —
-replay/exit/resize/ping — and binary frames are raw pty bytes both ways).
+replay/exit/resize/ping/**associated** — and binary frames are raw pty bytes
+both ways). New sessions: `GET /api/new-session/options` (launchable hosts,
+hermes profiles, picker roots), `GET /api/new-session/preview` (the command
+that _would_ run — the modal never composes one itself, so what is copied and
+what is spawned cannot drift), `GET /api/fs/browse?path=`, `GET /api/quick-dirs`.
+`POST /api/terminals` also takes `{newSession: {hostId, cwd, profile}}` or
+`{shell: {cwd}}`.
 
 Extend as slices need — keep endpoints coarse (one fetch per screen where possible)
 and fast (avoid N+1 file opens; the aggregate list must stay instant on cached mtimes).

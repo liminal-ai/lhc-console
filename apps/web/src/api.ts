@@ -169,6 +169,20 @@ export interface ViewArrangement {
   turnCount: number;
 }
 
+export interface TerminalRow {
+  id: string;
+  hostId: string;
+  threadId: string;
+  title: string | null;
+  command: string;
+  cwd: string;
+  status: "running" | "exited";
+  exitCode: number | null;
+  createdAt: string;
+  cols: number;
+  rows: number;
+}
+
 /** A non-2xx API response, carrying the status so callers can branch on 404. */
 export class ApiError extends Error {
   status: number;
@@ -182,6 +196,21 @@ export class ApiError extends Error {
     this.detail = detail;
     this.url = url;
   }
+}
+
+async function send<T>(url: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(url, init);
+  if (!res.ok) {
+    let detail = `${res.status} ${res.statusText}`;
+    try {
+      const body = (await res.json()) as { error?: string };
+      if (body?.error) detail = body.error;
+    } catch {
+      // non-JSON error body — the status line is the best we have
+    }
+    throw new ApiError(res.status, detail, url);
+  }
+  return res.json() as Promise<T>;
 }
 
 async function get<T>(url: string, signal?: AbortSignal): Promise<T> {
@@ -216,6 +245,22 @@ export const api = {
     get<TurnKindRow[]>(`/api/threads/${hostId}/${threadId}/turn-kinds`),
   viewArrangement: (hostId: string, threadId: string) =>
     get<ViewArrangement>(`/api/threads/${hostId}/${threadId}/view-arrangement`),
+  terminals: () => get<TerminalRow[]>("/api/terminals"),
+  openTerminal: (body: {
+    hostId?: string;
+    threadId?: string;
+    fresh?: boolean;
+    cols?: number;
+    rows?: number;
+    devCommand?: string;
+  }) =>
+    send<TerminalRow>("/api/terminals", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  killTerminal: (id: string) =>
+    send<{ ok: boolean }>(`/api/terminals/${encodeURIComponent(id)}`, { method: "DELETE" }),
   messages: (hostId: string, threadId: string, turnId?: string) => {
     const suffix = turnId ? `?turn=${encodeURIComponent(turnId)}` : "";
     return get<MessageRow[]>(`/api/threads/${hostId}/${threadId}/messages${suffix}`);

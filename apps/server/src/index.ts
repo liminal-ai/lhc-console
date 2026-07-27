@@ -1,4 +1,5 @@
 import Fastify from "fastify";
+import websocket from "@fastify/websocket";
 import {
   discoverHosts,
   launchRecipe,
@@ -14,6 +15,7 @@ import {
   type ThreadSummary,
   type ThreadQuickStats,
 } from "@lhc-console/core";
+import { registerTerminalRoutes, shutdownTerminals } from "./terminals.ts";
 
 const PORT = Number(process.env.LHC_CONSOLE_PORT ?? 5959);
 
@@ -57,6 +59,9 @@ function lookupThread(hostId: string, threadId: string): Lookup {
   if (!thread || !thread.fileMtime) return { code: 404, error: "thread not found" };
   return { thread };
 }
+
+await app.register(websocket);
+registerTerminalRoutes(app, lookupThread);
 
 app.get("/api/hosts", async () => {
   return discoverHosts().map((h) => ({
@@ -184,6 +189,13 @@ app.get("/api/threads/:hostId/:threadId/view-arrangement", async (req, reply) =>
   const { thread } = found;
   return threadViewArrangement(thread.filePath);
 });
+
+for (const sig of ["SIGINT", "SIGTERM"] as const) {
+  process.once(sig, () => {
+    shutdownTerminals();
+    void app.close().then(() => process.exit(0));
+  });
+}
 
 const addr = await app.listen({ port: PORT, host: "127.0.0.1" });
 app.log.info(`lhc-console server on ${addr}`);

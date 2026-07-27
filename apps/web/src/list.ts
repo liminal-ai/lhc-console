@@ -1,6 +1,13 @@
 import { api, type ThreadRow } from "./api.ts";
 import { el, fmtAgo, fmtStamp, fmtTokens, splitDir } from "./format.ts";
 import { closeLaunchModal, openLaunchModal } from "./launchmodal.ts";
+import {
+  openThreadTerminal,
+  subscribeTerminals,
+  terminalFor,
+  workspaceActive,
+  workspaceContains,
+} from "./workspace.ts";
 
 type SortKey = "host" | "title" | "dir" | "summary" | "turns" | "context" | "created" | "activity";
 
@@ -304,6 +311,7 @@ export async function renderList(app: HTMLElement): Promise<void> {
 
   const onKey = (e: KeyboardEvent): void => {
     if (e.metaKey || e.ctrlKey || e.altKey) return;
+    if (workspaceActive() || workspaceContains(e.target)) return;
     if (e.key === "/" && !isTypingTarget(e.target)) {
       e.preventDefault();
       search.focus();
@@ -320,9 +328,12 @@ export async function renderList(app: HTMLElement): Promise<void> {
     }
   };
   window.addEventListener("keydown", onKey);
+  // Terminal comings and goings change the launch affordance on every row.
+  const unsubTerms = subscribeTerminals(() => paint());
 
   teardownList();
   teardown = () => {
+    unsubTerms();
     clearInterval(tick);
     clearTimeout(debounce);
     window.removeEventListener("focus", onFocus);
@@ -407,14 +418,22 @@ function threadRow(t: ThreadRow): HTMLElement {
   const launchCell = el("td", "col-launch");
   const cmd = t.launch?.command;
   if (cmd) {
-    const btn = el("button", "launch-link", "launch") as HTMLButtonElement;
+    // A live terminal for this thread takes over the affordance: no modal,
+    // straight to the workspace screen it is already on.
+    const live = terminalFor(t.hostId, t.threadId);
+    const btn = el(
+      "button",
+      live ? "launch-link has-term" : "launch-link",
+      live ? "terminal" : "launch",
+    ) as HTMLButtonElement;
     btn.type = "button";
-    btn.title = cmd;
+    btn.title = live ? `running: ${cmd}` : cmd;
     // The row is clickable; the launch affordance must not navigate.
     btn.onclick = (e) => {
       e.preventDefault();
       e.stopPropagation();
-      openLaunchModal(cmd);
+      if (live) void openThreadTerminal(t.hostId, t.threadId);
+      else openLaunchModal(cmd, { hostId: t.hostId, threadId: t.threadId });
     };
     launchCell.append(btn);
   }

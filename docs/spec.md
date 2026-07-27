@@ -119,10 +119,33 @@ the command; it auto-copies to the clipboard on open when the Clipboard API allo
 a hidden textarea + `document.execCommand("copy")`), and always offers a copy
 button (copy → close). Esc, ✕, and backdrop click close it.
 
+### Terminal workspace
+
+Server-owned PTYs (spawned only from server-computed launch recipes; loopback-only
+devCommand escape for tests) with WebSocket attach, server-side scrollback ring
+(~2MB) replayed on reattach, so sessions survive wifi drops, reloads, and browser
+absence. Cap 8 running; exited terminals keep their final screen until dismissed.
+
+UI is two full-screen modes, not a shared screen (user rejected the t3code-style
+always-present main pane): the browser (list/detail) and a terminal workspace at
+`#/term` — one thin bar (← threads, screen tabs, split control), everything else
+is terminal. A screen holds 1–3 panes side by side (draggable dividers); a
+terminal lives on exactly one screen. Launch always creates a new screen (or
+jumps to the thread's existing one); composing pairs is an in-workspace act:
+split → move an existing terminal here, or launch from a mini thread picker.
+ctrl+` flips modes and alt+1..9 switches screens (intercepted before xterm);
+Esc always belongs to the TUI. Browser mode shows a fixed "terminals ● N"
+button when any exist. Pane composition persists in localStorage, reconciled
+against GET /api/terminals on load.
+
 ## API surface (server)
 
 Existing: `/api/hosts`, `/api/threads` (aggregated + quick stats, mtime-cached),
 `/api/threads/:host/:id` (overview), `…/turns`, `…/messages`, `…/view`.
+Terminals: `GET/POST /api/terminals`, `DELETE /api/terminals/:id`,
+`GET /api/terminals/:id/ws` (websocket; JSON text frames are control —
+replay/exit/resize/ping — and binary frames are raw pty bytes both ways).
+
 Extend as slices need — keep endpoints coarse (one fetch per screen where possible)
 and fast (avoid N+1 file opens; the aggregate list must stay instant on cached mtimes).
 

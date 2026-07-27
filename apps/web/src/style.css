@@ -1212,3 +1212,331 @@ button.modal-copy:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
+
+/* --- terminal workspace ---------------------------------------------------
+ * A second top-level mode: one thin bar plus 1–3 panes filling the viewport.
+ * The container is display:none in browser mode, never unmounted, so xterm
+ * instances and their scrollback survive every flip.
+ */
+
+body.ws-on {
+  overflow: hidden;
+}
+
+.ws {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+}
+
+.ws-bar {
+  display: flex;
+  align-items: stretch;
+  gap: 10px;
+  height: 30px;
+  flex: 0 0 30px;
+  padding: 0 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+  font-size: 11px;
+}
+
+.ws-back {
+  background: none;
+  border: 0;
+  padding: 0 6px;
+  font: inherit;
+  color: var(--dim);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.ws-back:hover {
+  color: var(--accent);
+}
+
+.ws-screens {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+}
+
+.ws-tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+  max-width: 220px;
+  background: none;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  font: inherit;
+  color: var(--dim);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.ws-tab:hover {
+  color: var(--text);
+}
+
+.ws-tab.active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+
+.ws-tab-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ws-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex: 0 0 6px;
+  background: var(--dim);
+}
+
+.ws-dot.ok {
+  background: var(--ok);
+}
+
+.ws-dot.dim {
+  background: var(--border);
+}
+
+.ws-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ws-btn {
+  background: none;
+  border: 0;
+  padding: 2px 6px;
+  font: inherit;
+  color: var(--dim);
+  cursor: pointer;
+}
+
+.ws-btn:hover {
+  color: var(--accent);
+}
+
+.ws-btn.confirm,
+.ws-x.confirm {
+  color: var(--bad);
+}
+
+.ws-body {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+}
+
+.ws-screen {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: stretch;
+}
+
+.ws-pane {
+  position: relative;
+  min-width: 0;
+  overflow: hidden;
+  border-top: 1px solid transparent;
+  background: #101216;
+}
+
+.ws-pane.focused {
+  border-top-color: var(--accent);
+}
+
+.ws-pane-host {
+  position: absolute;
+  inset: 0;
+  padding: 4px 2px 4px 6px;
+}
+
+.ws-div {
+  flex: 0 0 4px;
+  cursor: col-resize;
+  background: var(--border);
+}
+
+.ws-div:hover {
+  background: var(--accent);
+}
+
+/* Pane identity stays out of the way until you look for it. */
+.ws-corner {
+  position: absolute;
+  top: 0;
+  right: 0;
+  z-index: 3;
+  display: none;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 8px;
+  font-size: 11px;
+  color: var(--dim);
+  background: rgb(24 27 33 / 92%);
+  border: 1px solid var(--border);
+  border-top: 0;
+  border-right: 0;
+}
+
+.ws-pane:hover .ws-corner {
+  display: flex;
+}
+
+.ws-x {
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  color: var(--dim);
+  cursor: pointer;
+}
+
+.ws-x:hover {
+  color: var(--bad);
+}
+
+.ws-strip {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 3;
+  padding: 3px 8px;
+  font-size: 11px;
+  background: var(--panel-2);
+  border-top: 1px solid var(--border);
+}
+
+.ws-strip.off {
+  display: none;
+}
+
+.ws-strip.warn {
+  color: var(--warn);
+}
+
+.ws-strip.bad {
+  color: var(--bad);
+}
+
+.ws-strip.dim {
+  color: var(--dim);
+}
+
+.ws-pop {
+  position: absolute;
+  top: 31px;
+  right: 8px;
+  z-index: 5;
+  width: 320px;
+  max-height: 60vh;
+  overflow-y: auto;
+  padding: 6px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  font-size: 11px;
+}
+
+.ws-pop.hidden,
+.ws-indicator.hidden {
+  display: none;
+}
+
+.ws-pop-head {
+  padding: 4px 6px;
+  color: var(--dim);
+  text-transform: lowercase;
+}
+
+.ws-pop-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 4px 6px;
+  background: none;
+  border: 0;
+  font: inherit;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.ws-pop-row:hover {
+  background: var(--panel-2);
+  color: var(--accent);
+}
+
+.ws-pop-title {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ws-pop-filter {
+  width: 100%;
+  margin: 2px 0 4px;
+  padding: 4px 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font: inherit;
+}
+
+.ws-pop-filter:focus {
+  outline: 0;
+  border-color: var(--accent);
+}
+
+.ws-pop-empty {
+  padding: 4px 6px;
+}
+
+.ws-indicator {
+  position: fixed;
+  top: 10px;
+  right: 12px;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--dim);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.ws-indicator:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+button.launch-link.has-term,
+button.linkish.launch-link.has-term {
+  color: var(--accent);
+}
+
+button.linkish.launch-cmd {
+  color: var(--dim);
+}

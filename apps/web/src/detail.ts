@@ -10,6 +10,13 @@ import { el, fmtAgo, fmtBytes, fmtCount, fmtStamp, fmtTokens } from "./format.ts
 import { histogramPanel } from "./histogram.ts";
 import { closeLaunchModal, openLaunchModal } from "./launchmodal.ts";
 import { viewTabPanel } from "./viewtab.ts";
+import {
+  openThreadTerminal,
+  subscribeTerminals,
+  terminalFor,
+  workspaceActive,
+  workspaceContains,
+} from "./workspace.ts";
 
 export type Tab = "overview" | "histogram" | "turns" | "view";
 
@@ -83,6 +90,7 @@ function threadPath(st: ThreadState, tab: Tab, turnOrder?: number | null): strin
 let detachKeys: (() => void) | null = null;
 let detachChart: (() => void) | null = null;
 let detachPage: (() => void) | null = null;
+let detachLaunch: (() => void) | null = null;
 
 /** Drop any tab-scoped bindings; the router calls this before each render. */
 export function teardownDetail(): void {
@@ -93,6 +101,8 @@ export function teardownDetail(): void {
   detachChart = null;
   detachPage?.();
   detachPage = null;
+  detachLaunch?.();
+  detachLaunch = null;
 }
 
 function isTypingTarget(t: EventTarget | null): boolean {
@@ -216,6 +226,7 @@ export async function renderThread(
 
   const onPageKey = (e: KeyboardEvent): void => {
     if (e.metaKey || e.ctrlKey || e.altKey || isTypingTarget(e.target)) return;
+    if (workspaceActive() || workspaceContains(e.target)) return;
     if (e.key === "Escape") {
       e.preventDefault();
       location.hash = "/";
@@ -265,11 +276,32 @@ function threadHeader(
   fresh.append(freshLabel, el("span", "dim", " · "), refreshBtn);
   // No resume path for this host (or no lineage row) — show no dead affordance.
   if (launch) {
-    const launchBtn = el("button", "linkish launch-link", "launch") as HTMLButtonElement;
+    const launchBtn = el("button", "linkish launch-link") as HTMLButtonElement;
     launchBtn.type = "button";
-    launchBtn.title = launch.command;
-    launchBtn.onclick = () => openLaunchModal(launch.command);
-    fresh.append(el("span", "dim", " · "), launchBtn);
+    const paintLaunch = (): void => {
+      const live = terminalFor(thread.hostId, thread.threadId);
+      launchBtn.textContent = live ? "terminal" : "launch";
+      launchBtn.classList.toggle("has-term", !!live);
+      launchBtn.title = live ? `running: ${launch.command}` : launch.command;
+    };
+    paintLaunch();
+    launchBtn.onclick = () => {
+      if (terminalFor(thread.hostId, thread.threadId)) {
+        void openThreadTerminal(thread.hostId, thread.threadId);
+      } else {
+        openLaunchModal(launch.command, { hostId: thread.hostId, threadId: thread.threadId });
+      }
+    };
+    // The modal stays reachable even when a terminal is already running.
+    const cmdBtn = el("button", "linkish launch-cmd", "launch cmd") as HTMLButtonElement;
+    cmdBtn.type = "button";
+    cmdBtn.title = launch.command;
+    cmdBtn.onclick = () =>
+      openLaunchModal(launch.command, { hostId: thread.hostId, threadId: thread.threadId });
+    const unsub = subscribeTerminals(paintLaunch);
+    detachLaunch?.();
+    detachLaunch = unsub;
+    fresh.append(el("span", "dim", " · "), launchBtn, el("span", "dim", " · "), cmdBtn);
   }
   stamps.append(fresh);
   head.append(stamps);
@@ -590,6 +622,7 @@ function turnsPanel(st: ThreadState): HTMLElement {
 
   const onKey = (e: KeyboardEvent): void => {
     if (e.metaKey || e.ctrlKey || e.altKey || isTypingTarget(e.target)) return;
+    if (workspaceActive() || workspaceContains(e.target)) return;
     const delta =
       e.key === "ArrowDown" || e.key === "j" ? 1 : e.key === "ArrowUp" || e.key === "k" ? -1 : 0;
     if (delta === 0) return;

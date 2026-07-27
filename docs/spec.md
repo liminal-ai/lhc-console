@@ -157,6 +157,44 @@ and fast (avoid N+1 file opens; the aggregate list must stay instant on cached m
 - Handle absent data gracefully everywhere: missing thread file, no view, no
   derivations, open turns, deleted messages.
 
+### One-writer guard
+
+A session takes one writer. Two hosts attached to the same session id fight over
+the rollout file: it freezes for one of them and that side's turns are lost for
+good (this happened — a second `cc-lhc --resume <sid>` started while the first
+was still alive). So before the console helps anyone attach, it looks for a
+process that already has the session.
+
+`apps/server/src/attach-detect.ts` runs one `ps -eo pid,ppid,lstart,args`
+(`execFile`, no shell) per request batch, cached ~3s, and matches argv per host:
+cc-lhc and hermes on `--resume <sessionRef>`, codex-lhc on `resume <sessionId>`,
+pi-lhc on `--lhc-thread <threadId>` (accepting unique id prefixes of 8 chars or
+more). The identifier comes from the launch recipe, which now carries
+`sessionRef` alongside `command`. The console's own running terminals count as
+attachments too, tagged `source: "terminal"`; anything under one of their PTYs
+is attributed to that terminal rather than reported as a stranger, and the
+server's own process tree is ignored. Launch recipes in `/api/threads` and
+`/api/threads/:host/:id` gain `inUse` (true only for a NON-console attachment)
+and `attached: [{pid, source, args, startedAt}]`. `POST /api/terminals` answers
+`409 {error: "session in use", attached}` when anything is attached and the body
+lacks `force: true` — the idempotent "you already have a terminal for this
+thread" return happens first, so the ordinary path is unchanged. The launch
+modal shows a warn strip with the offending pids and turns its primary button
+into "attach anyway" (which posts `force`); list rows and the detail header
+carry a small dim `attached` marker with the pid in the title.
+
+**This is best-effort pattern matching, and it can miss.** It only matches
+explicit session-id / thread-id arguments, so a host started fresh rather than
+resumed is invisible: a bare `node …/cc-lhc/dist/bin.js` with no `--resume` (and
+its `claude` child) is a real live writer that this guard does not see — a bare
+`cc-lhc` line is deliberately not matched, because it could belong to any
+session and matching it would flag every cc-lhc thread at once. Detection also
+needs a launch recipe, so a thread whose lineage row is missing gets no guard.
+False positives are possible in the other direction: any command line that
+happens to contain the id (a script, an editor, a `grep`) reads as an
+attachment. Treat a hit as a strong warning and a miss as "unknown" — never as
+"nothing is attached".
+
 ### Hidden threads
 
 Console-owned overlay, never written to host registries: `~/.lhc-console/prefs.json`

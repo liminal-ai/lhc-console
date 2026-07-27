@@ -686,6 +686,12 @@ export async function openThreadTerminal(
   hostId: string,
   threadId: string,
   fresh = false,
+  /**
+   * Proceed past the one-writer guard. Only the launch modal sets this, and
+   * only after showing the user what is already attached — a 409 here is the
+   * server refusing to help create a second writer.
+   */
+  force = false,
 ): Promise<void> {
   const existing = fresh ? null : terminalFor(hostId, threadId);
   if (existing) {
@@ -696,7 +702,7 @@ export async function openThreadTerminal(
     enterWorkspace();
     return;
   }
-  const info = await api.openTerminal({ hostId, threadId, fresh, cols: 100, rows: 30 });
+  const info = await api.openTerminal({ hostId, threadId, fresh, force, cols: 100, rows: 30 });
   ensureTerm(info);
   newScreenWith(info.id);
   paintIndicator();

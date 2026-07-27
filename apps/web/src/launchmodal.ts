@@ -1,3 +1,4 @@
+import type { LaunchRecipe } from "./api.ts";
 import { el } from "./format.ts";
 import { openThreadTerminal } from "./workspace.ts";
 
@@ -53,7 +54,21 @@ export interface LaunchTarget {
   threadId: string;
 }
 
-export function openLaunchModal(command: string, target?: LaunchTarget): void {
+/**
+ * The launch modal, in two moods.
+ *
+ * Normally it just hands over the command. When the server's one-writer guard
+ * found something already attached to this session, it says so first and turns
+ * the spawn button into a deliberate "attach anyway" — a second writer freezes
+ * capture for one of them, and lost turns do not come back. Copying the
+ * command stays available either way; the user may well want to attach from a
+ * terminal they can see.
+ */
+export function openLaunchModal(launch: LaunchRecipe | string, target?: LaunchTarget): void {
+  const recipe: LaunchRecipe = typeof launch === "string" ? { command: launch } : launch;
+  const command = recipe.command;
+  const attached = (recipe.attached ?? []).filter((a) => a.source === "process");
+  const inUse = !!recipe.inUse && attached.length > 0;
   closeLaunchModal();
   const restoreFocus = document.activeElement;
 
@@ -71,6 +86,23 @@ export function openLaunchModal(command: string, target?: LaunchTarget): void {
   head.append(x);
   box.append(head);
 
+  if (inUse) {
+    const warn = el("div", "modal-warn");
+    warn.append(
+      el(
+        "div",
+        "modal-warn-line",
+        "a live process is already attached to this session — a second writer can corrupt capture",
+      ),
+    );
+    for (const a of attached) {
+      const line = el("div", "modal-warn-proc dim", `pid ${a.pid}  ${a.args}`);
+      if (a.startedAt) line.title = `started ${new Date(a.startedAt).toLocaleString()}`;
+      warn.append(line);
+    }
+    box.append(warn);
+  }
+
   const pre = el("pre", "modal-cmd", command);
   box.append(pre);
   box.append(el("div", "modal-hint dim", "paste into a terminal on the server"));
@@ -80,12 +112,19 @@ export function openLaunchModal(command: string, target?: LaunchTarget): void {
 
   const actions = el("div", "modal-actions");
   if (target) {
-    const openBtn = el("button", "modal-open", "open in terminal") as HTMLButtonElement;
+    const openBtn = el(
+      "button",
+      inUse ? "modal-open danger" : "modal-open",
+      inUse ? "attach anyway" : "open in terminal",
+    ) as HTMLButtonElement;
     openBtn.type = "button";
-    openBtn.title = "run this on the server, in a workspace screen";
+    openBtn.title = inUse
+      ? "spawn a second writer on this session anyway"
+      : "run this on the server, in a workspace screen";
     openBtn.onclick = () => {
       dismiss();
-      void openThreadTerminal(target.hostId, target.threadId).catch((e: unknown) => {
+      // `force` only when the user acted on a button that says so.
+      void openThreadTerminal(target.hostId, target.threadId, false, inUse).catch((e: unknown) => {
         setStatus(e instanceof Error ? e.message : String(e), "bad");
       });
     };

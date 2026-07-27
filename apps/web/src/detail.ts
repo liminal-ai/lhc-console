@@ -302,7 +302,7 @@ function threadHeader(
       if (terminalFor(thread.hostId, thread.threadId)) {
         void openThreadTerminal(thread.hostId, thread.threadId);
       } else {
-        openLaunchModal(launch.command, { hostId: thread.hostId, threadId: thread.threadId });
+        openLaunchModal(launch, { hostId: thread.hostId, threadId: thread.threadId });
       }
     };
     // The modal stays reachable even when a terminal is already running.
@@ -310,11 +310,18 @@ function threadHeader(
     cmdBtn.type = "button";
     cmdBtn.title = launch.command;
     cmdBtn.onclick = () =>
-      openLaunchModal(launch.command, { hostId: thread.hostId, threadId: thread.threadId });
+      openLaunchModal(launch, { hostId: thread.hostId, threadId: thread.threadId });
     const unsub = subscribeTerminals(paintLaunch);
     detachLaunch?.();
     detachLaunch = unsub;
     fresh.append(el("span", "dim", " · "), launchBtn, el("span", "dim", " · "), cmdBtn);
+    // A live writer outside the console: the same marker the list rows carry.
+    const strangers = (launch.attached ?? []).filter((a) => a.source === "process");
+    if (launch.inUse && strangers.length > 0) {
+      const mark = el("span", "attached-mark dim", "attached");
+      mark.title = strangers.map((a) => `pid ${a.pid}: ${a.args}`).join("\n");
+      fresh.append(el("span", "dim", " · "), mark);
+    }
   }
   stamps.append(fresh);
   head.append(stamps);

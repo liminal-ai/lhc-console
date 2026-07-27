@@ -7,6 +7,13 @@ import { withDb } from "./db.ts";
 /** The command that resumes a thread in its own host. */
 export interface LaunchRecipe {
   command: string;
+  /**
+   * The identifier the host resumes by — cc/codex lineage session id, the
+   * hermes session stem, the thread id for pi-lhc. Null when the host resumes
+   * without one. Attach detection matches this against live process args, so
+   * it is computed here rather than re-derived (and re-read) downstream.
+   */
+  sessionRef: string | null;
 }
 
 /** Shell-quote only when the value has characters a shell would treat specially. */
@@ -80,20 +87,30 @@ function lineageFor(hostId: string): Map<string, string> {
 export function launchRecipe(thread: ThreadSummary): LaunchRecipe | null {
   switch (thread.hostId) {
     case "pi-lhc":
-      return { command: withCwd(thread.cwd, `pi-lhc --lhc-thread ${shArg(thread.threadId)}`) };
+      return {
+        command: withCwd(thread.cwd, `pi-lhc --lhc-thread ${shArg(thread.threadId)}`),
+        sessionRef: thread.threadId,
+      };
     case "cc-lhc": {
       const sid = lineageFor("cc-lhc").get(thread.threadId);
-      return sid ? { command: withCwd(thread.cwd, `cc-lhc --resume ${shArg(sid)}`) } : null;
+      return sid
+        ? { command: withCwd(thread.cwd, `cc-lhc --resume ${shArg(sid)}`), sessionRef: sid }
+        : null;
     }
     case "codex-lhc": {
       const sid = lineageFor("codex-lhc").get(thread.threadId);
-      return sid ? { command: withCwd(thread.cwd, `codex-lhc resume ${shArg(sid)}`) } : null;
+      return sid
+        ? { command: withCwd(thread.cwd, `codex-lhc resume ${shArg(sid)}`), sessionRef: sid }
+        : null;
     }
     case "hermes": {
       if (!thread.sessionId) return null;
       // Hermes restores the session's own recorded cwd, so no `cd` part.
       const profile = thread.profile ? `--profile ${shArg(thread.profile)} ` : "";
-      return { command: `hermes ${profile}--resume ${shArg(thread.sessionId)}` };
+      return {
+        command: `hermes ${profile}--resume ${shArg(thread.sessionId)}`,
+        sessionRef: thread.sessionId,
+      };
     }
     default:
       return null;

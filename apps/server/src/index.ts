@@ -16,7 +16,8 @@ import {
   type ThreadQuickStats,
 } from "@lhc-console/core";
 import { hiddenCount, hideThread, isHidden, loadPrefs, unhideThread } from "./prefs.ts";
-import { registerTerminalRoutes, shutdownTerminals } from "./terminals.ts";
+import { ownTerminals, registerTerminalRoutes, shutdownTerminals } from "./terminals.ts";
+import { detectAttached, type AttachInfo } from "./attach-detect.ts";
 
 const PORT = Number(process.env.LHC_CONSOLE_PORT ?? 5959);
 
@@ -42,6 +43,20 @@ function cachedQuickStats(t: ThreadSummary): ThreadQuickStats | null {
 }
 
 type Lookup = { thread: ThreadSummary } | { code: number; error: string };
+
+/**
+ * Carry the one-writer guard on the launch recipe itself: `inUse` is true only
+ * for attachments that are NOT one of our terminals (those the UI already
+ * handles by jumping to the screen), and `attached` names the pids so a row can
+ * say which process it means.
+ */
+function withAttach(
+  recipe: ReturnType<typeof launchRecipe>,
+  info: AttachInfo | undefined,
+): (ReturnType<typeof launchRecipe> & { inUse: boolean; attached: AttachInfo["attached"] }) | null {
+  if (!recipe) return null;
+  return { ...recipe, inUse: info?.inUse ?? false, attached: info?.attached ?? [] };
+}
 
 /**
  * Resolve `:host/:id`, distinguishing an unknown host (404 "unknown host")
@@ -89,11 +104,24 @@ app.get("/api/threads", async (req, reply) => {
   // Hidden threads are a console-side preference: excluded by default, and
   // carried with a `hidden` flag when the client asks for them.
   if (!includeHidden) threads = threads.filter((t) => !isHidden(t.hostId, t.threadId));
+  const recipes = new Map(threads.map((t) => [`${t.hostId}/${t.threadId}`, launchRecipe(t)]));
+  // One process scan for the whole list: the guard must not cost an N+1.
+  const attachments = detectAttached(
+    threads.map((t) => ({
+      hostId: t.hostId,
+      threadId: t.threadId,
+      recipe: recipes.get(`${t.hostId}/${t.threadId}`) ?? null,
+    })),
+    ownTerminals(),
+  );
   let enriched = threads.map((t) => ({
     ...t,
     hidden: isHidden(t.hostId, t.threadId),
     stats: cachedQuickStats(t),
-    launch: launchRecipe(t),
+    launch: withAttach(
+      recipes.get(`${t.hostId}/${t.threadId}`) ?? null,
+      attachments.get(`${t.hostId}/${t.threadId}`),
+    ),
   }));
   if (q.q) {
     const needle = q.q.toLowerCase();
@@ -121,10 +149,16 @@ app.get("/api/threads/:hostId/:threadId", async (req, reply) => {
   const found = lookupThread(hostId, threadId);
   if ("error" in found) return reply.code(found.code).send({ error: found.error });
   const { thread } = found;
+  const recipe = launchRecipe(thread);
+  const key = `${thread.hostId}/${thread.threadId}`;
+  const attach = detectAttached(
+    [{ hostId: thread.hostId, threadId: thread.threadId, recipe }],
+    ownTerminals(),
+  ).get(key);
   return {
     thread,
     hidden: isHidden(thread.hostId, thread.threadId),
-    launch: launchRecipe(thread),
+    launch: withAttach(recipe, attach),
     overview: threadOverview(thread.filePath),
   };
 });

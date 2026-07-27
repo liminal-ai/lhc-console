@@ -1080,7 +1080,8 @@ a.kv-link:hover {
 
 /* launch affordance + modal */
 .col-launch {
-  width: 110px;
+  /* launch + the one-writer "attached" marker + hide (on hover), no clipping. */
+  width: 175px;
   text-align: right;
   white-space: nowrap;
 }
@@ -1254,6 +1255,7 @@ button.modal-x:hover {
 .modal-actions {
   margin-top: 12px;
   display: flex;
+  gap: 8px;
   justify-content: flex-end;
 }
 
@@ -1274,6 +1276,76 @@ button.modal-copy:hover {
 button.modal-copy:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
+}
+
+/* --- one-writer guard -----------------------------------------------------
+ * Warning, not decoration: a warm strip above the command, and the pid lines
+ * kept small and dim so the sentence carries the weight.
+ */
+
+.modal-warn {
+  margin-top: 12px;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--border));
+  border-left: 3px solid var(--warn);
+  border-radius: 6px;
+  background: rgb(224 176 85 / 8%);
+}
+
+.modal-warn-line {
+  color: var(--warn);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.modal-warn-proc {
+  margin-top: 4px;
+  font-size: 10px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+/*
+ * The spawn button. Quieter than copy by default (copy is the common act);
+ * `.danger` is the one-writer case, where it says "attach anyway".
+ */
+button.modal-open {
+  font: inherit;
+  padding: 6px 18px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+  cursor: pointer;
+}
+
+button.modal-open:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+button.modal-open:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+button.modal-open.danger {
+  border-color: var(--warn);
+  background: rgb(224 176 85 / 12%);
+  color: var(--warn);
+}
+
+button.modal-open.danger:hover {
+  background: rgb(224 176 85 / 22%);
+}
+
+/* The at-a-glance marker on list rows and the detail header. */
+.attached-mark {
+  margin-left: 8px;
+  font-size: 10px;
+  color: var(--warn);
+  opacity: 0.75;
+  cursor: help;
 }
 
 /* --- terminal workspace ---------------------------------------------------

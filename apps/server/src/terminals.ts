@@ -148,13 +148,33 @@ export interface SpawnSpec {
   rows: number;
 }
 
+/**
+ * The server may itself have been (re)started from inside a Claude Code
+ * session, whose env markers (CLAUDECODE, CLAUDE_CODE_CHILD_SESSION, …) then
+ * leak into spawned terminals and make a launched claude treat itself as a
+ * nested child session — silently disabling session persistence. Strip every
+ * claude-session marker; the launched host must see a clean shell env.
+ * Verified empirically 2026-07-27: with these vars claude writes no session
+ * file; scrubbed, it persists normally.
+ */
+function scrubbedEnv(): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (v === undefined) continue;
+    if (k === "CLAUDECODE" || k === "AI_AGENT") continue;
+    if (k.startsWith("CLAUDE_")) continue;
+    env[k] = v;
+  }
+  return env;
+}
+
 function spawnTerminal(spec: SpawnSpec): Terminal {
   const pty = spawn("bash", ["-lc", spec.command], {
     name: "xterm-256color",
     cols: spec.cols,
     rows: spec.rows,
     cwd: spec.cwd,
-    env: { ...process.env, TERM: "xterm-256color" } as Record<string, string>,
+    env: { ...scrubbedEnv(), TERM: "xterm-256color" },
   });
   const t: Terminal = {
     id: newId(),

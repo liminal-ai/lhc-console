@@ -9,6 +9,7 @@ import {
   planNewSession,
   quickDirs,
   launchRecipe,
+  parseNamePatch,
   listMessages,
   listThreads,
   listTurns,
@@ -29,6 +30,8 @@ import {
   isHidden,
   loadPrefs,
   newSessionRoots,
+  setThreadName,
+  threadName,
   unhideThread,
 } from "./prefs.ts";
 import {
@@ -74,6 +77,23 @@ function peekQuickStats(t: ThreadSummary): ThreadQuickStats | null {
 }
 
 type Lookup = { thread: ThreadSummary } | { code: number; error: string };
+
+/**
+ * The console's own name for a thread, as the client sees it. The host
+ * `title` is served untouched alongside it — which of the two is displayed is
+ * the client's call, and the raw registry title stays visible on the detail
+ * page either way.
+ */
+function customName(
+  hostId: string,
+  threadId: string,
+): {
+  title: string | null;
+  description: string | null;
+} | null {
+  const entry = threadName(hostId, threadId);
+  return entry ? { title: entry.title, description: entry.description } : null;
+}
 
 /**
  * Carry the attach state on the launch recipe itself: `inUse` is true only for
@@ -253,6 +273,7 @@ app.get("/api/threads", async (req, reply) => {
   let enriched = threads.map((t) => ({
     ...t,
     hidden: isHidden(t.hostId, t.threadId),
+    custom: customName(t.hostId, t.threadId),
     stats: cachedQuickStats(t),
     launch: withAttach(
       t.hostId,
@@ -266,6 +287,10 @@ app.get("/api/threads", async (req, reply) => {
       (t) =>
         t.threadId.includes(needle) ||
         (t.title ?? "").toLowerCase().includes(needle) ||
+        // A console-owned name is usually the only human-meaningful text on a
+        // row, so it has to be searchable — under both titles, not instead of.
+        (t.custom?.title ?? "").toLowerCase().includes(needle) ||
+        (t.custom?.description ?? "").toLowerCase().includes(needle) ||
         (t.cwd ?? "").toLowerCase().includes(needle) ||
         (t.stats?.summary ?? "").toLowerCase().includes(needle),
     );
@@ -295,8 +320,28 @@ app.get("/api/threads/:hostId/:threadId", async (req, reply) => {
   return {
     thread,
     hidden: isHidden(thread.hostId, thread.threadId),
+    custom: customName(thread.hostId, thread.threadId),
     launch: withAttach(thread.hostId, recipe, attach),
     overview: threadOverview(thread.filePath),
+  };
+});
+
+/**
+ * Rename a thread, console-side. Partial: an absent field is untouched, null
+ * clears it, and clearing both removes the entry so the row falls back to
+ * whatever the host calls it. The id may be a prefix, so — like hide — the
+ * RESOLVED full thread id is what gets written.
+ */
+app.patch("/api/threads/:hostId/:threadId/name", async (req, reply) => {
+  const { hostId, threadId } = req.params as { hostId: string; threadId: string };
+  const found = lookupThread(hostId, threadId);
+  if ("error" in found) return reply.code(found.code).send({ error: found.error });
+  const parsed = parseNamePatch(req.body);
+  if (!parsed.ok) return reply.code(400).send({ error: parsed.error });
+  const { thread } = found;
+  return {
+    threadId: thread.threadId,
+    custom: setThreadName(thread.hostId, thread.threadId, parsed.patch),
   };
 });
 

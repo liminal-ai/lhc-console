@@ -3,6 +3,16 @@ export type { HostDescriptor, ScanRoot, WriterPolicy } from "./hosts.ts";
 export { browseDirs, isExistingDir, splitBrowsePath, BROWSE_LIMIT } from "./browse.ts";
 export type { BrowseEntry, BrowseResult, BrowseSplit } from "./browse.ts";
 export { encodeProjectDir, recoverRolloutSessionId } from "./cc-rollout.ts";
+export {
+  capField,
+  mergeName,
+  nameKey,
+  normalizeNames,
+  parseNamePatch,
+  NAME_DESCRIPTION_MAX,
+  NAME_TITLE_MAX,
+} from "./names.ts";
+export type { ThreadName, ThreadNamePatch } from "./names.ts";
 export { hermesProfiles, launchableHostIds, matchNewborn, planNewSession } from "./newsession.ts";
 export type {
   NewbornCandidate,

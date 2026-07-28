@@ -1879,3 +1879,144 @@ button.launch-link.has-term.active::before {
     opacity: 0.25;
   }
 }
+
+/* --- console-owned names ---------------------------------------------------
+ * A host title is a storage identifier — a cwd basename, a uuid, a timestamp
+ * stem — so the console keeps its own name and shows that instead. The
+ * affordance is a dim ✎ that only exists while the pointer is on the thing it
+ * renames, and the editor takes the cell's own height so nothing shifts.
+ */
+
+td.col-title,
+td.col-summary {
+  position: relative;
+}
+
+button.name-edit {
+  background: none;
+  border: 0;
+  padding: 0 2px;
+  font: inherit;
+  font-size: 11px;
+  line-height: 1;
+  color: transparent;
+  cursor: pointer;
+}
+
+td.col-title button.name-edit,
+td.col-summary button.name-edit {
+  position: absolute;
+  top: 6px;
+  right: 2px;
+  padding: 2px 3px;
+  border-radius: 4px;
+}
+
+td.col-title:hover button.name-edit,
+td.col-summary:hover button.name-edit,
+.head-title:hover button.name-edit,
+.head-desc:hover button.name-edit {
+  color: var(--dim);
+}
+
+/*
+ * Only once it is visible does it get a background: it sits over the end of
+ * the text it renames, and the hovered row's own panel colour hides that. An
+ * always-painted box would put a grey chip on every row in the table.
+ */
+td.col-title:hover button.name-edit,
+td.col-summary:hover button.name-edit {
+  background: var(--panel);
+}
+
+button.name-edit:hover {
+  color: var(--accent);
+}
+
+/* Styled like the search box, sized to whatever it replaces. */
+input.name-input {
+  width: 100%;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font: inherit;
+  padding: 3px 8px;
+}
+
+input.name-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.saving input.name-input {
+  opacity: 0.5;
+}
+
+td.editing {
+  vertical-align: middle;
+  overflow: visible;
+}
+
+/* A save that did not land: the old text is back, and says so briefly. */
+.name-failed {
+  outline: 1px solid var(--bad);
+  outline-offset: -1px;
+  border-radius: 4px;
+}
+
+.name-failed .title-label,
+.name-failed .summary-text,
+.name-failed .head-desc-text {
+  color: var(--bad);
+}
+
+/* detail header: the name and the one line about it */
+.head-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 30px;
+  min-width: 0;
+}
+
+.head-title h1 {
+  cursor: text;
+}
+
+.head-title input.name-input {
+  min-width: 32ch;
+  max-width: 60ch;
+  font-size: 16px;
+}
+
+.head-desc {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 24px;
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--dim);
+  max-width: 110ch;
+}
+
+.head-desc-text {
+  cursor: text;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.head-desc-text.empty {
+  font-style: italic;
+  opacity: 0.7;
+}
+
+.head-desc-text:hover {
+  color: var(--text);
+}
+
+.head-desc input.name-input {
+  font-size: 12px;
+}

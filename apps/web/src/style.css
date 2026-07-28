@@ -172,6 +172,16 @@ td.col-title .title-label {
   font-size: 14px;
 }
 
+/* "title - launch": the affordance sits beside the name, quiet until hover. */
+td.col-title .launch-sep {
+  margin: 0 2px;
+  font-size: 11px;
+}
+
+td.col-title button.launch-link {
+  vertical-align: 1px;
+}
+
 /* Whatever the fixed columns leave over goes to the paths, which need it. */
 .col-dir {
   width: auto;
@@ -1038,10 +1048,13 @@ a.vt-tail.open {
 
 /* The title cell is a real link so middle/cmd-click behave like the web. */
 a.title-link {
-  display: block;
+  /* Inline-block, not block: the launch affordance sits on the same line. */
+  display: inline-block;
+  max-width: calc(100% - 64px);
   color: inherit;
   text-decoration: none;
   min-width: 0;
+  vertical-align: bottom;
 }
 
 tbody.item:hover a.title-link .title-label {

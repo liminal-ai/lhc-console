@@ -596,7 +596,8 @@ function threadItem(t: ThreadRow, actions: RowActions): HTMLElement {
       if (live) void openThreadTerminal(t.hostId, t.threadId);
       else openLaunchModal(launch, { hostId: t.hostId, threadId: t.threadId });
     };
-    launchCell.append(btn);
+    // The launch affordance rides with the title: "title - launch", small.
+    link.after(el("span", "launch-sep dim", " - "), btn);
     if (mark) launchCell.append(mark);
   }
   // Hide/unhide sits at the row's right end, dim until the row is hovered.

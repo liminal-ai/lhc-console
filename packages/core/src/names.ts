@@ -14,8 +14,11 @@
 
 /** A name is a label, not a paragraph. */
 export const NAME_TITLE_MAX = 80;
-/** A description is a sentence or two, not a summary of the thread. */
-export const NAME_DESCRIPTION_MAX = 300;
+/**
+ * A description is a paragraph about the thread, not a transcript of it: the
+ * list gives it a row of its own, so it has room a cell never had.
+ */
+export const NAME_DESCRIPTION_MAX = 1000;
 
 export interface ThreadName {
   title: string | null;

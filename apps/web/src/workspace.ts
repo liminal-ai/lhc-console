@@ -17,7 +17,7 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { api, type TerminalRow, type ThreadRow } from "./api.ts";
-import { el } from "./format.ts";
+import { displayTitle, el } from "./format.ts";
 // Cyclic by nature (the modal spawns through this module, this module opens
 // the modal) and safe: both directions are function references, resolved at
 // click time rather than at module evaluation.
@@ -727,6 +727,7 @@ function toggleSplitPopover(): void {
         (t) =>
           !q ||
           (t.title ?? "").toLowerCase().includes(q) ||
+          (t.custom?.title ?? "").toLowerCase().includes(q) ||
           t.hostId.includes(q) ||
           (t.cwd ?? "").toLowerCase().includes(q),
       )
@@ -738,7 +739,7 @@ function toggleSplitPopover(): void {
     for (const r of rows) {
       const b = el("button", "ws-pop-row") as HTMLButtonElement;
       b.type = "button";
-      b.append(el("span", "ws-pop-title", truncate(r.title ?? r.threadId, 34)));
+      b.append(el("span", "ws-pop-title", truncate(displayTitle(r), 34)));
       b.append(el("span", "ws-pop-host dim", r.hostId));
       b.onclick = () => {
         closePopover();

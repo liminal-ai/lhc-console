@@ -1,6 +1,13 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import {
+  mergeName,
+  nameKey,
+  normalizeNames,
+  type ThreadName,
+  type ThreadNamePatch,
+} from "@lhc-console/core";
 
 /**
  * Console-owned preferences. This is the ONLY file the console writes —
@@ -25,6 +32,12 @@ export interface NewSessionPrefs {
 export interface Prefs {
   hiddenThreads: Record<string, HiddenEntry>;
   newSession: NewSessionPrefs;
+  /**
+   * The console's own title and description per thread, keyed
+   * `hostId/threadId`. Overlays what the host registry calls a thread; the
+   * registry itself is never touched.
+   */
+  names: Record<string, ThreadName>;
 }
 
 /** The root the picker seeds with when nothing else says otherwise. */
@@ -53,6 +66,7 @@ function empty(): Prefs {
   return {
     hiddenThreads: {},
     newSession: { defaultRoot: DEFAULT_NEW_SESSION_ROOT, rootByHost: {} },
+    names: {},
   };
 }
 
@@ -78,6 +92,9 @@ function normalize(raw: unknown): Prefs {
       }
     }
   }
+  // The trim/cap/empty-is-absent rules live in core, so a hand-edited file
+  // reads exactly like one the API wrote.
+  p.names = normalizeNames((raw as { names?: unknown }).names);
   return p;
 }
 
@@ -154,6 +171,40 @@ export function unhideThread(hostId: string, threadId: string): number {
     savePrefs(p);
   }
   return Object.keys(p.hiddenThreads).length;
+}
+
+/** The console's own name for a thread, or null when it has never been named. */
+export function threadName(hostId: string, threadId: string): ThreadName | null {
+  return loadPrefs().names[nameKey(hostId, threadId)] ?? null;
+}
+
+/**
+ * Partial update of one thread's name: an absent field keeps what is stored,
+ * null clears it, and an entry with nothing left in it is removed rather than
+ * kept as a pair of nulls. Returns what is now stored (null when deleted).
+ *
+ * A patch that changes neither field does not rewrite the file — the batch
+ * job that fills these in runs many times over the same rows.
+ */
+export function setThreadName(
+  hostId: string,
+  threadId: string,
+  patch: ThreadNamePatch,
+): ThreadName | null {
+  const p = loadPrefs();
+  const key = nameKey(hostId, threadId);
+  const current = p.names[key];
+  const merged = mergeName(current, patch);
+  if (
+    (merged?.title ?? null) === (current?.title ?? null) &&
+    (merged?.description ?? null) === (current?.description ?? null)
+  ) {
+    return current ?? null;
+  }
+  if (merged) p.names[key] = merged;
+  else delete p.names[key];
+  savePrefs(p);
+  return merged;
 }
 
 /** Where the new-session picker should start, overall and per host. */

@@ -1,6 +1,7 @@
 import { api, type ThreadRow } from "./api.ts";
-import { el, fmtAgo, fmtStamp, fmtTokens, splitDir } from "./format.ts";
+import { displayTitle, el, fmtAgo, fmtStamp, fmtTokens, splitDir } from "./format.ts";
 import { closeLaunchModal, openLaunchModal } from "./launchmodal.ts";
+import { editAffordance, editName, nameEditorOpen } from "./nameedit.ts";
 import { closeNewSessionModal, openNewSessionModal } from "./newsessionmodal.ts";
 import {
   openThreadTerminal,
@@ -59,11 +60,11 @@ function sortValue(t: ThreadRow, key: SortKey): string | number {
     case "host":
       return t.hostId;
     case "title":
-      return (t.title ?? t.threadId).toLowerCase();
+      return displayTitle(t).toLowerCase();
     case "dir":
       return (dirBucket(t)?.label ?? "￿").toLowerCase();
     case "summary":
-      return (t.stats?.summary ?? "￿").toLowerCase();
+      return (t.custom?.description ?? t.stats?.summary ?? "￿").toLowerCase();
     case "turns":
       return t.stats?.turnCount ?? -1;
     case "context":
@@ -245,7 +246,46 @@ export async function renderList(app: HTMLElement): Promise<void> {
     if (root.isConnected) paint();
   }
 
+  /**
+   * Rename a thread, console-side. Throws on failure so the inline editor can
+   * put the old text back; on success the row is patched in place and the list
+   * repaints, so the edit settles without waiting for the next poll.
+   */
+  async function setName(
+    t: ThreadRow,
+    patch: { title?: string | null; description?: string | null },
+  ): Promise<void> {
+    const res = await api.setThreadName(t.hostId, t.threadId, patch);
+    t.custom = res.custom;
+    // A poll can replace the row array while the editor is open, leaving `t` a
+    // stale object; carry the new name onto whichever row is live now, or the
+    // list would keep painting the old one until the next fetch.
+    const live = threads.find((r) => r.hostId === t.hostId && r.threadId === t.threadId);
+    if (live && live !== t) live.custom = res.custom;
+  }
+
+  const rowActions: RowActions = {
+    setHidden,
+    setName,
+    repaint: () => {
+      if (root.isConnected) paint();
+    },
+  };
+
+  /** A repaint was skipped because someone was typing in a row. */
+  let paintPending = false;
+
   function paint(): void {
+    /*
+     * Rows are rebuilt wholesale, which would delete an open editor mid-word —
+     * and the poll runs every few seconds. A rename in progress wins; the
+     * skipped repaint is picked up by the next tick once the editor closes.
+     */
+    if (nameEditorOpen()) {
+      paintPending = true;
+      return;
+    }
+    paintPending = false;
     paintDirOptions();
     const hiddenN = threads.filter((t) => t.hidden).length;
     hiddenChip.textContent = `hidden (${hiddenN})`;
@@ -270,6 +310,10 @@ export async function renderList(app: HTMLElement): Promise<void> {
       return (
         t.threadId.toLowerCase().includes(needle) ||
         (t.title ?? "").toLowerCase().includes(needle) ||
+        // Console-owned text matches too — under the host title, not instead
+        // of it, so a search never stops finding a row it used to find.
+        (t.custom?.title ?? "").toLowerCase().includes(needle) ||
+        (t.custom?.description ?? "").toLowerCase().includes(needle) ||
         (dirBucket(t)?.label ?? "").toLowerCase().includes(needle) ||
         (t.cwd ?? "").toLowerCase().includes(needle) ||
         (t.stats?.summary ?? "").toLowerCase().includes(needle)
@@ -295,7 +339,7 @@ export async function renderList(app: HTMLElement): Promise<void> {
 
     // A poll can change row count; keep the reader where they were.
     const scrollY = window.scrollY;
-    tbody.replaceChildren(...rows.map((t) => threadRow(t, setHidden)));
+    tbody.replaceChildren(...rows.map((t) => threadRow(t, rowActions)));
     if (scrollY > 0 && window.scrollY !== scrollY) window.scrollTo({ top: scrollY });
 
     const ctx = rows.reduce((s, t) => s + (t.stats?.contextTokens ?? 0), 0);
@@ -347,6 +391,7 @@ export async function renderList(app: HTMLElement): Promise<void> {
 
   const tick = setInterval(() => {
     if (document.hidden) return;
+    if (paintPending && !nameEditorOpen()) paint();
     if (Date.now() - fetchedAt >= REFRESH_MS) void refresh();
     else paintFreshness();
   }, TICK_MS);
@@ -360,6 +405,8 @@ export async function renderList(app: HTMLElement): Promise<void> {
   const onKey = (e: KeyboardEvent): void => {
     if (e.metaKey || e.ctrlKey || e.altKey) return;
     if (workspaceActive() || workspaceContains(e.target)) return;
+    // A rename in progress owns the keyboard: `n` and `/` are text.
+    if (nameEditorOpen()) return;
     if (e.key === "n" && !isTypingTarget(e.target)) {
       e.preventDefault();
       openNewSessionModal();
@@ -421,7 +468,17 @@ function healthDot(t: ThreadRow): HTMLElement | null {
   return null;
 }
 
-function threadRow(t: ThreadRow, setHidden: (t: ThreadRow, hidden: boolean) => void): HTMLElement {
+/** What a row can do to the list it belongs to. */
+interface RowActions {
+  setHidden: (t: ThreadRow, hidden: boolean) => void;
+  setName: (
+    t: ThreadRow,
+    patch: { title?: string | null; description?: string | null },
+  ) => Promise<void>;
+  repaint: () => void;
+}
+
+function threadRow(t: ThreadRow, actions: RowActions): HTMLElement {
   const href = `#/thread/${t.hostId}/${t.threadId}`;
   const tr = el("tr", t.hidden ? "thread-row is-hidden" : "thread-row");
   tr.onclick = (e) => {
@@ -439,10 +496,23 @@ function threadRow(t: ThreadRow, setHidden: (t: ThreadRow, hidden: boolean) => v
   const line = el("div", "title-text");
   const dot = healthDot(t);
   if (dot) line.append(dot);
-  line.append(el("span", "title-label", t.title ?? t.threadId));
+  line.append(el("span", "title-label", displayTitle(t)));
   link.append(line);
   link.append(el("div", "thread-id", t.threadId));
   title.append(link);
+  // A console-owned title displaces the registry's, so the registry's moves to
+  // the tooltip — renamed, never lost.
+  if (t.custom?.title && t.title) title.title = `registry title: ${t.title}`;
+  title.append(
+    editAffordance("rename (console only)", () =>
+      editName(title, {
+        field: "title",
+        stored: t.custom?.title ?? null,
+        save: (value) => actions.setName(t, { title: value }),
+        after: actions.repaint,
+      }),
+    ),
+  );
   tr.append(title);
 
   const dir = el("td", "col-dir");
@@ -460,10 +530,24 @@ function threadRow(t: ThreadRow, setHidden: (t: ThreadRow, hidden: boolean) => v
   }
   tr.append(dir);
 
+  // A console-owned description replaces the derived summary, which is the
+  // latest chunk brief — accurate, and about the last few turns rather than
+  // about the thread.
   const summary = el("td", "col-summary");
-  const text = t.stats?.summary ?? (t.stats ? "" : "missing thread file");
-  summary.append(el("span", t.stats ? "summary-text" : "summary-text bad", text));
-  if (t.stats?.summary) summary.title = t.stats.summary;
+  const described = t.custom?.description ?? null;
+  const text = described ?? t.stats?.summary ?? (t.stats ? "" : "missing thread file");
+  summary.append(el("span", t.stats || described ? "summary-text" : "summary-text bad", text));
+  if (text) summary.title = described && t.stats?.summary ? `${text}\n\n${t.stats.summary}` : text;
+  summary.append(
+    editAffordance("describe (console only)", () =>
+      editName(summary, {
+        field: "description",
+        stored: described,
+        save: (value) => actions.setName(t, { description: value }),
+        after: actions.repaint,
+      }),
+    ),
+  );
   tr.append(summary);
 
   tr.append(el("td", "num", t.stats ? String(t.stats.turnCount) : "—"));
@@ -532,7 +616,7 @@ function threadRow(t: ThreadRow, setHidden: (t: ThreadRow, hidden: boolean) => v
   hideBtn.onclick = (e) => {
     e.preventDefault();
     e.stopPropagation();
-    setHidden(t, !t.hidden);
+    actions.setHidden(t, !t.hidden);
   };
   launchCell.append(hideBtn);
   tr.append(launchCell);

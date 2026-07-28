@@ -307,3 +307,29 @@ id. UI: hover "hide" on list rows, a quiet `hidden (N)` chip to reveal dimmed ro
 with unhide, and a hidden badge + unhide on the detail header. The terminals
 devCommand escape requires loopback AND `x-lhc-dev` matching
 `LHC_CONSOLE_DEV_SECRET` (absent secret = disabled).
+
+### Thread names
+
+Host titles are not names — a cwd basename, a t3code uuid, a hermes timestamp
+stem — and the list "summary" is the latest `chunk_summary_brief`, which is
+about the last few turns rather than about the thread. So the console keeps its
+own title and description per thread in the same prefs file
+(`names`, keyed `hostId/threadId`, `{title, description, updatedAt}`), overlaying
+what the hosts provide and never writing a host registry.
+
+`PATCH /api/threads/:host/:id/name` with `{title?, description?}` is a partial
+update: an absent field is untouched, null clears, both cleared deletes the
+entry. Values are trimmed and capped (title 80, description 300) by
+`packages/core/src/names.ts` — pure trim/cap/merge/normalize rules, so a
+hand-edited prefs file reads exactly like one the API wrote. `/api/threads` rows
+and the detail response carry `custom: {title, description} | null` **alongside**
+the untouched host `title`; the client decides display (`custom.title ?? title`,
+`custom.description ?? stats.summary`) and the search matches both.
+
+UI: a dim ✎ on hover over the list's title and summary cells and next to the
+detail title/description swaps the cell for an input — Enter saves (optimistic,
+reverts with error styling on failure), Esc and blur cancel, and the editor
+starts from what is STORED, not the displayed fallback, so Enter on an untouched
+field cannot copy a registry title into the prefs. While an editor is open the
+page's single-key shortcuts stand down. A displaced host title moves to the row
+tooltip and stays visible as "registry title" in the detail Overview.

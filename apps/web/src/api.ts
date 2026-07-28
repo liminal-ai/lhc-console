@@ -41,6 +41,18 @@ export interface LaunchRecipe {
   writerPolicy?: "single" | "shared";
 }
 
+/**
+ * The console's own name for a thread. Host titles are cwd basenames, uuids
+ * and timestamp stems; this is what a person decided to call the thing. Null
+ * when nobody has named it, and either field can be null on its own.
+ */
+export interface CustomName {
+  title: string | null;
+  description: string | null;
+  /** Present on the write response; the list rows carry the two fields only. */
+  updatedAt?: string;
+}
+
 export interface ThreadRow {
   hostId: string;
   threadId: string;
@@ -55,6 +67,8 @@ export interface ThreadRow {
   /** Host session id — the thread file's stem (registry-less hosts). */
   sessionId?: string | null;
   stats: QuickStats | null;
+  /** Console-owned title/description, overlaying `title` and `stats.summary`. */
+  custom?: CustomName | null;
   /** Resume recipe, null only for hosts with no resume path at all (t3code). */
   launch?: LaunchRecipe | null;
   /** Hidden from the default list by a console-side preference. */
@@ -158,6 +172,8 @@ export interface ViewInfo {
 export interface OverviewResponse {
   thread: ThreadRow;
   hidden: boolean;
+  /** Console-owned name; `thread.title` stays the raw registry title. */
+  custom: CustomName | null;
   launch: LaunchRecipe | null;
   overview: {
     threadId: string;
@@ -311,6 +327,23 @@ export const api = {
     send<{ hidden: number; threadId: string }>(`/api/threads/${hostId}/${threadId}/hide`, {
       method: hidden ? "POST" : "DELETE",
     }),
+  /**
+   * Rename a thread, console-side. Partial: leave a field out to keep it,
+   * pass null to clear it. Clearing both drops back to the host's title.
+   */
+  setThreadName: (
+    hostId: string,
+    threadId: string,
+    patch: { title?: string | null; description?: string | null },
+  ) =>
+    send<{ threadId: string; custom: CustomName | null }>(
+      `/api/threads/${hostId}/${threadId}/name`,
+      {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(patch),
+      },
+    ),
   overview: (hostId: string, threadId: string) =>
     get<OverviewResponse>(`/api/threads/${hostId}/${threadId}`),
   turns: (hostId: string, threadId: string) =>

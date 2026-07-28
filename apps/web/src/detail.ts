@@ -6,9 +6,10 @@ import {
   type TurnRow,
   type ViewArrangement,
 } from "./api.ts";
-import { el, fmtAgo, fmtBytes, fmtCount, fmtStamp, fmtTokens } from "./format.ts";
+import { displayTitle, el, fmtAgo, fmtBytes, fmtCount, fmtStamp, fmtTokens } from "./format.ts";
 import { histogramPanel } from "./histogram.ts";
 import { closeLaunchModal, openLaunchModal } from "./launchmodal.ts";
+import { editAffordance, editName, nameEditorOpen } from "./nameedit.ts";
 import { viewTabPanel } from "./viewtab.ts";
 import {
   openThreadTerminal,
@@ -146,9 +147,13 @@ export async function renderThread(
     st.selectedTurnOrder = turnOrder;
   }
 
-  document.title = `${st.ov.thread.title ?? st.threadId} · ${
-    TABS.find((t) => t.id === tab)?.label ?? tab
-  } · lhc console`;
+  /** Re-run whenever the console's own title changes under a rename. */
+  const retitle = (): void => {
+    document.title = `${displayTitle({ ...st.ov.thread, custom: st.ov.custom })} · ${
+      TABS.find((t) => t.id === tab)?.label ?? tab
+    } · lhc console`;
+  };
+  retitle();
 
   const reload = (): void => reloadThread(hostId, threadId);
 
@@ -156,7 +161,7 @@ export async function renderThread(
   const back = el("a", "back", "← all threads") as HTMLAnchorElement;
   back.href = "#/";
   root.append(back);
-  const head = threadHeader(st, reload);
+  const head = threadHeader(st, reload, retitle);
   root.append(head.node);
 
   const bar = el("div", "tabbar");
@@ -193,7 +198,9 @@ export async function renderThread(
   let checking = false;
   /** Cheap overview call, used purely to compare the thread file's mtime. */
   async function checkFresh(): Promise<void> {
-    if (checking || !root.isConnected) return;
+    // A changed mtime rebuilds the page, which would throw away a rename in
+    // progress; the next tick re-checks once the editor is closed.
+    if (checking || !root.isConnected || nameEditorOpen()) return;
     checking = true;
     try {
       const fresh = await api.overview(hostId, threadId);
@@ -227,6 +234,7 @@ export async function renderThread(
   const onPageKey = (e: KeyboardEvent): void => {
     if (e.metaKey || e.ctrlKey || e.altKey || isTypingTarget(e.target)) return;
     if (workspaceActive() || workspaceContains(e.target)) return;
+    if (nameEditorOpen()) return;
     if (e.key === "Escape") {
       e.preventDefault();
       location.hash = "/";
@@ -247,13 +255,44 @@ export async function renderThread(
 function threadHeader(
   st: ThreadState,
   reload: () => void,
+  retitle: () => void,
 ): { node: HTMLElement; paintFresh: () => void } {
   const { thread, launch, overview } = st.ov;
   const s = overview.stats;
   const head = el("div", "detail-head");
 
   const top = el("div", "head-top");
-  top.append(el("h1", undefined, thread.title ?? overview.threadId));
+
+  /*
+   * The console's own name for this thread, editable in place. The registry
+   * title is not replaced by this — it keeps its own labelled field in the
+   * Overview tab, and moves to the tooltip here.
+   */
+  const save = (patch: { title?: string | null; description?: string | null }): Promise<void> =>
+    api.setThreadName(thread.hostId, thread.threadId, patch).then((res) => {
+      st.ov.custom = res.custom;
+    });
+
+  const titleBox = el("div", "head-title");
+  const paintTitle = (): void => {
+    const custom = st.ov.custom?.title ?? null;
+    const h1 = el("h1", undefined, displayTitle({ ...thread, custom: st.ov.custom }));
+    h1.title =
+      custom && thread.title ? `registry title: ${thread.title}` : "click to name this thread";
+    h1.onclick = editTitle;
+    titleBox.replaceChildren(h1, editAffordance("rename (console only)", editTitle));
+    retitle();
+  };
+  function editTitle(): void {
+    editName(titleBox, {
+      field: "title",
+      stored: st.ov.custom?.title ?? null,
+      save: (value) => save({ title: value }),
+      after: paintTitle,
+    });
+  }
+  paintTitle();
+  top.append(titleBox);
   const meta = el("div", "head-meta");
   meta.append(el("span", `badge host-${thread.hostId}`, thread.hostId));
   meta.append(el("span", "dim", overview.threadId));
@@ -277,6 +316,33 @@ function threadHeader(
   }
   top.append(meta);
   head.append(top);
+
+  /*
+   * One line about the thread, console-owned like the title. Absent is a
+   * state worth showing rather than hiding: an empty header line that says
+   * how to fill it is how anyone finds out this is editable at all.
+   */
+  const descBox = el("div", "head-desc");
+  const paintDesc = (): void => {
+    const desc = st.ov.custom?.description ?? null;
+    const text = el(
+      "span",
+      desc ? "head-desc-text" : "head-desc-text empty",
+      desc ?? "no description — click to add",
+    );
+    text.onclick = editDesc;
+    descBox.replaceChildren(text, editAffordance("describe (console only)", editDesc));
+  };
+  function editDesc(): void {
+    editName(descBox, {
+      field: "description",
+      stored: st.ov.custom?.description ?? null,
+      save: (value) => save({ description: value }),
+      after: paintDesc,
+    });
+  }
+  paintDesc();
+  head.append(descBox);
 
   const stamps = el("div", "head-stamps dim");
   stamps.textContent = `created ${fmtStamp(overview.createdAt)}  ·  last activity ${fmtStamp(s.lastEventAt)} (${fmtAgo(s.lastEventAt)})`;
@@ -477,6 +543,11 @@ function overviewPanel(st: ThreadState): HTMLElement {
 
   const identity = group("identity");
   identity.append(kv("thread id", overview.threadId));
+  // The header may be showing a console-owned name; what the host itself calls
+  // this thread stays visible here, unedited and unhidden.
+  const registryTitle = kv("registry title", thread.title ?? "—", thread.title ? "" : "dim");
+  if (thread.title) registryTitle.title = thread.title;
+  identity.append(registryTitle);
   const path = kv("file path", thread.filePath, "path");
   path.title = thread.filePath;
   identity.append(path);

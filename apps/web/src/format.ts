@@ -7,6 +7,19 @@ export function el(tag: string, cls?: string, text?: string): HTMLElement {
   return e;
 }
 
+/**
+ * What the console calls a thread. A console-owned title wins over the host's,
+ * which is a cwd basename, a uuid or a timestamp stem — descriptive of storage,
+ * not of the work. The host title is never overwritten, only out-ranked.
+ */
+export function displayTitle(t: {
+  title: string | null;
+  threadId: string;
+  custom?: { title: string | null } | null;
+}): string {
+  return t.custom?.title ?? t.title ?? t.threadId;
+}
+
 export function fmtTokens(n: number | null | undefined): string {
   if (n == null) return "—";
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;

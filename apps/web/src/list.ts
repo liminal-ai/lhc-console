@@ -23,9 +23,9 @@ interface Column {
 }
 
 const COLUMNS: Column[] = [
+  { key: "title", label: "title", cls: "col-title" },
   { key: "host", label: "host", cls: "col-host" },
   { key: "dir", label: "directory", cls: "col-dir" },
-  { key: "title", label: "title", cls: "col-title" },
   { key: "turns", label: "turns", cls: "num", numeric: true },
   { key: "context", label: "context", cls: "num", numeric: true },
   { key: "created", label: "created", cls: "col-when", numeric: true },
@@ -503,7 +503,34 @@ function threadItem(t: ThreadRow, actions: RowActions): HTMLElement {
   const tr = el("tr", "thread-row row-main");
   tr.onclick = navigate;
 
-  tr.append(el("td", `col-host host host-${t.hostId}`, t.hostId));
+  const title = el("td", "col-title");
+  const link = el("a", "title-link") as HTMLAnchorElement;
+  link.href = href;
+  link.append(el("span", "title-label", displayTitle(t)));
+  title.append(link);
+  // The id and (when renamed) the registry title live in the tooltip — the
+  // row shows one clean name and nothing else.
+  title.title =
+    t.custom?.title && t.title ? `${t.threadId} · registry title: ${t.title}` : t.threadId;
+  title.append(
+    editAffordance("rename (console only)", () =>
+      editName(title, {
+        field: "title",
+        stored: t.custom?.title ?? null,
+        save: (value) => actions.setName(t, { title: value }),
+        after: actions.repaint,
+      }),
+    ),
+  );
+  tr.append(title);
+
+  const host = el("td", `col-host host host-${t.hostId}`);
+  // The health dot used to prefix the title; it is state, not name, so it
+  // rides with the host tag instead.
+  const dot = healthDot(t);
+  if (dot) host.append(dot);
+  host.append(el("span", undefined, t.hostId));
+  tr.append(host);
 
   const dir = el("td", "col-dir");
   const bucket = dirBucket(t);
@@ -519,31 +546,6 @@ function threadItem(t: ThreadRow, actions: RowActions): HTMLElement {
     dir.append(el("span", "dim", "—"));
   }
   tr.append(dir);
-
-  const title = el("td", "col-title");
-  const link = el("a", "title-link") as HTMLAnchorElement;
-  link.href = href;
-  const line = el("div", "title-text");
-  const dot = healthDot(t);
-  if (dot) line.append(dot);
-  line.append(el("span", "title-label", displayTitle(t)));
-  link.append(line);
-  link.append(el("div", "thread-id", t.threadId));
-  title.append(link);
-  // A console-owned title displaces the registry's, so the registry's moves to
-  // the tooltip — renamed, never lost.
-  if (t.custom?.title && t.title) title.title = `registry title: ${t.title}`;
-  title.append(
-    editAffordance("rename (console only)", () =>
-      editName(title, {
-        field: "title",
-        stored: t.custom?.title ?? null,
-        save: (value) => actions.setName(t, { title: value }),
-        after: actions.repaint,
-      }),
-    ),
-  );
-  tr.append(title);
 
   tr.append(el("td", "num", t.stats ? String(t.stats.turnCount) : "—"));
   tr.append(el("td", "num", fmtTokens(t.stats?.contextTokens)));

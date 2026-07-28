@@ -140,8 +140,22 @@ tr.thread-row {
   cursor: pointer;
 }
 
-tr.thread-row:hover {
+/*
+ * A thread is one item of two rows, and each item is its own tbody. That is
+ * what makes the pair behave as one thing: the hover lights both rows, and the
+ * border between items falls under the second row rather than between them.
+ */
+tbody.item:hover {
   background: var(--panel);
+}
+
+tr.row-main > td {
+  border-bottom: 0;
+}
+
+/* With a summary under it, row one closes up against it. */
+tr.row-main.has-desc > td {
+  padding-bottom: 2px;
 }
 
 .col-host {
@@ -152,8 +166,9 @@ tr.thread-row:hover {
   width: 22%;
 }
 
+/* Whatever the fixed columns leave over goes to the paths, which need it. */
 .col-dir {
-  width: 17%;
+  width: auto;
 }
 
 th.num {
@@ -186,12 +201,58 @@ th.col-when + th.col-when {
   color: var(--text);
 }
 
+/* Row two: dim, smaller, wrapped — a paragraph with the table's full width. */
+table.threads td.col-desc {
+  padding-top: 0;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
 .summary-text {
   color: var(--dim);
 }
 
 .summary-text.bad {
   color: var(--bad);
+}
+
+/*
+ * A thread with nothing to say has no second row: zero height, no stripe. The
+ * pointer brings the empty one back — an invitation to write one is the only
+ * way anyone finds out the row can be filled — and an open editor holds it
+ * there after the pointer has gone.
+ */
+table.threads td.col-desc.empty {
+  padding-bottom: 0;
+  line-height: 0;
+}
+
+table.threads td.col-desc.empty > * {
+  display: none;
+}
+
+tbody.item:hover td.col-desc.empty,
+table.threads td.col-desc.empty.editing {
+  padding-bottom: 7px;
+  line-height: 1.45;
+}
+
+tbody.item:hover td.col-desc.empty > *,
+table.threads td.col-desc.empty.editing > * {
+  display: revert;
+}
+
+.desc-add {
+  color: var(--dim);
+  font-style: italic;
+  opacity: 0.7;
+  cursor: text;
+}
+
+.desc-add:hover {
+  color: var(--text);
 }
 
 .list-count {
@@ -975,7 +1036,7 @@ a.title-link {
   min-width: 0;
 }
 
-.thread-row:hover a.title-link .title-label {
+tbody.item:hover a.title-link .title-label {
   text-decoration: underline;
   text-underline-offset: 2px;
 }
@@ -1096,7 +1157,7 @@ button.launch-link {
   cursor: pointer;
 }
 
-tr.thread-row:hover button.launch-link {
+tbody.item:hover button.launch-link {
   color: var(--accent);
 }
 
@@ -1111,11 +1172,11 @@ button.hide-link {
   color: transparent;
 }
 
-tr.thread-row:hover button.hide-link {
+tbody.item:hover button.hide-link {
   color: var(--dim);
 }
 
-tr.thread-row.is-hidden button.hide-link {
+tbody.item.is-hidden button.hide-link {
   color: var(--dim);
 }
 
@@ -1123,11 +1184,11 @@ button.hide-link:hover {
   color: var(--text);
 }
 
-tr.thread-row.is-hidden {
+tbody.item.is-hidden {
   opacity: 0.45;
 }
 
-tr.thread-row.is-hidden:hover {
+tbody.item.is-hidden:hover {
   opacity: 0.75;
 }
 
@@ -1888,7 +1949,7 @@ button.launch-link.has-term.active::before {
  */
 
 td.col-title,
-td.col-summary {
+td.col-desc {
   position: relative;
 }
 
@@ -1904,7 +1965,7 @@ button.name-edit {
 }
 
 td.col-title button.name-edit,
-td.col-summary button.name-edit {
+td.col-desc button.name-edit {
   position: absolute;
   top: 6px;
   right: 2px;
@@ -1912,8 +1973,21 @@ td.col-summary button.name-edit {
   border-radius: 4px;
 }
 
+td.col-desc button.name-edit {
+  top: 0;
+}
+
+/* Nothing to sit over on an empty row: it goes next to the invitation. */
+td.col-desc.empty button.name-edit {
+  position: static;
+}
+
+/*
+ * Row two belongs to the item, so its ✎ answers to the item's hover — the
+ * title's still answers to its own cell.
+ */
 td.col-title:hover button.name-edit,
-td.col-summary:hover button.name-edit,
+tbody.item:hover td.col-desc button.name-edit,
 .head-title:hover button.name-edit,
 .head-desc:hover button.name-edit {
   color: var(--dim);
@@ -1925,7 +1999,7 @@ td.col-summary:hover button.name-edit,
  * always-painted box would put a grey chip on every row in the table.
  */
 td.col-title:hover button.name-edit,
-td.col-summary:hover button.name-edit {
+tbody.item:hover td.col-desc:not(.empty) button.name-edit {
   background: var(--panel);
 }
 

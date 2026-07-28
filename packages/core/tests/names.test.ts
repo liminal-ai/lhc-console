@@ -39,7 +39,7 @@ describe("capField", () => {
   it("caps at the limit and leaves no trailing space", () => {
     expect(capField("x".repeat(90), NAME_TITLE_MAX)).toBe("x".repeat(NAME_TITLE_MAX));
     expect(capField(`${"x".repeat(79)} tail`, NAME_TITLE_MAX)).toBe("x".repeat(79));
-    expect(capField("y".repeat(400), NAME_DESCRIPTION_MAX)?.length).toBe(NAME_DESCRIPTION_MAX);
+    expect(capField("y".repeat(1400), NAME_DESCRIPTION_MAX)?.length).toBe(NAME_DESCRIPTION_MAX);
   });
 
   it("reads anything that is not a string as absent", () => {
@@ -72,7 +72,7 @@ describe("normalizeNames", () => {
   });
 
   it("keeps a half-filled entry and caps what it keeps", () => {
-    const out = normalizeNames({ "cc-lhc/a": { description: "d".repeat(500) } });
+    const out = normalizeNames({ "cc-lhc/a": { description: "d".repeat(1500) } });
     expect(out["cc-lhc/a"].title).toBeNull();
     expect(out["cc-lhc/a"].description?.length).toBe(NAME_DESCRIPTION_MAX);
   });
@@ -122,7 +122,7 @@ describe("mergeName", () => {
   it("caps both fields on write", () => {
     const merged = mergeName(
       undefined,
-      { title: "t".repeat(200), description: "d".repeat(1000) },
+      { title: "t".repeat(200), description: "d".repeat(1400) },
       NOW,
     );
     expect(merged?.title?.length).toBe(NAME_TITLE_MAX);

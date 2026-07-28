@@ -55,11 +55,18 @@ derivationUsed, degraded}`. Chunk entries expand to turns via `chunk_member`.
 
 ### List page (`#/`)
 
-Fast cross-host thread finder. Per row: host, directory (cwd), title,
-summary description when available (best source: content of the latest ready
-`chunk_summary_brief`, else first user prompt excerpt), turn count, current-context
-tokens, created at, last activity. Sortable by any column (click header), filter by
-host and directory, text search. Minimal, elegant, quality design that is not trying
+Fast cross-host thread finder. Each thread is one item of two rows. Row one:
+host, directory (cwd), title, turn count, current-context tokens, created at,
+last activity. Row two: one full-width cell holding the summary description
+(`custom.description ?? stats.summary`; best derived source is the content of the
+latest ready `chunk_summary_brief`, else a first user prompt excerpt), dim and
+smaller, clipped at 1000 characters with a trailing "…", and tight under row one
+so the pair reads as one thing — a hover lights both rows, both navigate on
+click, and the border between items falls under the pair, not inside it. A thread
+with no summary has no second row (no blank stripe); hovering the item brings an
+empty one back with an "add description" invitation. Sortable by any row-one
+column (click header), filter by host and directory, text search — search still
+matches the summary text. Minimal, elegant, quality design that is not trying
 hard — restrained dark monospace aesthetic, no decoration for its own sake.
 
 "Current context tokens" ≈ what a resume would serve: sum of stored band token_counts
@@ -319,15 +326,15 @@ what the hosts provide and never writing a host registry.
 
 `PATCH /api/threads/:host/:id/name` with `{title?, description?}` is a partial
 update: an absent field is untouched, null clears, both cleared deletes the
-entry. Values are trimmed and capped (title 80, description 300) by
+entry. Values are trimmed and capped (title 80, description 1000) by
 `packages/core/src/names.ts` — pure trim/cap/merge/normalize rules, so a
 hand-edited prefs file reads exactly like one the API wrote. `/api/threads` rows
 and the detail response carry `custom: {title, description} | null` **alongside**
 the untouched host `title`; the client decides display (`custom.title ?? title`,
 `custom.description ?? stats.summary`) and the search matches both.
 
-UI: a dim ✎ on hover over the list's title and summary cells and next to the
-detail title/description swaps the cell for an input — Enter saves (optimistic,
+UI: a dim ✎ on hover over the list's title cell and its summary row, and next
+to the detail title/description, swaps the cell for an input — Enter saves (optimistic,
 reverts with error styling on failure), Esc and blur cancel, and the editor
 starts from what is STORED, not the displayed fallback, so Enter on an untouched
 field cannot copy a registry title into the prefs. While an editor is open the

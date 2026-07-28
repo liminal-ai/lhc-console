@@ -11,7 +11,7 @@ import {
   workspaceContains,
 } from "./workspace.ts";
 
-type SortKey = "host" | "title" | "dir" | "summary" | "turns" | "context" | "created" | "activity";
+type SortKey = "host" | "title" | "dir" | "turns" | "context" | "created" | "activity";
 
 interface Column {
   key: SortKey;
@@ -26,7 +26,6 @@ const COLUMNS: Column[] = [
   { key: "host", label: "host", cls: "col-host" },
   { key: "dir", label: "directory", cls: "col-dir" },
   { key: "title", label: "title", cls: "col-title" },
-  { key: "summary", label: "summary", cls: "col-summary" },
   { key: "turns", label: "turns", cls: "num", numeric: true },
   { key: "context", label: "context", cls: "num", numeric: true },
   { key: "created", label: "created", cls: "col-when", numeric: true },
@@ -54,6 +53,17 @@ function lastActivity(t: ThreadRow): string {
   return t.stats?.lastEventAt ?? t.fileMtime ?? t.createdAt;
 }
 
+/** Row two says what a thread is about; past this it is saying it at length. */
+const SUMMARY_MAX = 1000;
+
+/** Cut at a word when one is near the cap, so nothing reads as chopped mid-word. */
+function clip(text: string): string {
+  if (text.length <= SUMMARY_MAX) return text;
+  const cut = text.slice(0, SUMMARY_MAX);
+  const space = cut.lastIndexOf(" ");
+  return `${(space >= SUMMARY_MAX - 60 ? cut.slice(0, space) : cut).trimEnd()}…`;
+}
+
 /** Comparable value per column: numbers sort numerically, text case-folded. */
 function sortValue(t: ThreadRow, key: SortKey): string | number {
   switch (key) {
@@ -63,8 +73,6 @@ function sortValue(t: ThreadRow, key: SortKey): string | number {
       return displayTitle(t).toLowerCase();
     case "dir":
       return (dirBucket(t)?.label ?? "￿").toLowerCase();
-    case "summary":
-      return (t.custom?.description ?? t.stats?.summary ?? "￿").toLowerCase();
     case "turns":
       return t.stats?.turnCount ?? -1;
     case "context":
@@ -187,8 +195,6 @@ export async function renderList(app: HTMLElement): Promise<void> {
   headRow.append(el("th", "col-launch"));
   thead.append(headRow);
   table.append(thead);
-  const tbody = el("tbody");
-  table.append(tbody);
   root.append(table);
 
   const count = el("div", "list-count");
@@ -339,7 +345,8 @@ export async function renderList(app: HTMLElement): Promise<void> {
 
     // A poll can change row count; keep the reader where they were.
     const scrollY = window.scrollY;
-    tbody.replaceChildren(...rows.map((t) => threadRow(t, rowActions)));
+    // One tbody per thread — see threadItem: the item, not the row, is the unit.
+    table.replaceChildren(thead, ...rows.map((t) => threadItem(t, rowActions)));
     if (scrollY > 0 && window.scrollY !== scrollY) window.scrollTo({ top: scrollY });
 
     const ctx = rows.reduce((s, t) => s + (t.stats?.contextTokens ?? 0), 0);
@@ -478,15 +485,23 @@ interface RowActions {
   repaint: () => void;
 }
 
-function threadRow(t: ThreadRow, actions: RowActions): HTMLElement {
+/**
+ * One thread is two rows — the summary is a paragraph, not a cell, so it gets
+ * the width of the table under the row it belongs to. They share a tbody of
+ * their own: that is what makes the border, the hover and the click treat the
+ * pair as one item rather than two things that happen to be adjacent.
+ */
+function threadItem(t: ThreadRow, actions: RowActions): HTMLElement {
+  const item = el("tbody", t.hidden ? "item is-hidden" : "item");
   const href = `#/thread/${t.hostId}/${t.threadId}`;
-  const tr = el("tr", t.hidden ? "thread-row is-hidden" : "thread-row");
-  tr.onclick = (e) => {
+  const navigate = (e: MouseEvent): void => {
     // The title is a real link, so the browser owns modified and middle clicks.
     if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
     if ((e.target as HTMLElement).closest("a")) return;
     location.hash = href.slice(1);
   };
+  const tr = el("tr", "thread-row row-main");
+  tr.onclick = navigate;
 
   tr.append(el("td", `col-host host host-${t.hostId}`, t.hostId));
 
@@ -529,26 +544,6 @@ function threadRow(t: ThreadRow, actions: RowActions): HTMLElement {
     ),
   );
   tr.append(title);
-
-  // A console-owned description replaces the derived summary, which is the
-  // latest chunk brief — accurate, and about the last few turns rather than
-  // about the thread.
-  const summary = el("td", "col-summary");
-  const described = t.custom?.description ?? null;
-  const text = described ?? t.stats?.summary ?? (t.stats ? "" : "missing thread file");
-  summary.append(el("span", t.stats || described ? "summary-text" : "summary-text bad", text));
-  if (text) summary.title = described && t.stats?.summary ? `${text}\n\n${t.stats.summary}` : text;
-  summary.append(
-    editAffordance("describe (console only)", () =>
-      editName(summary, {
-        field: "description",
-        stored: described,
-        save: (value) => actions.setName(t, { description: value }),
-        after: actions.repaint,
-      }),
-    ),
-  );
-  tr.append(summary);
 
   tr.append(el("td", "num", t.stats ? String(t.stats.turnCount) : "—"));
   tr.append(el("td", "num", fmtTokens(t.stats?.contextTokens)));
@@ -620,5 +615,49 @@ function threadRow(t: ThreadRow, actions: RowActions): HTMLElement {
   };
   launchCell.append(hideBtn);
   tr.append(launchCell);
-  return tr;
+
+  /*
+   * Row two. A console-owned description replaces the derived summary, which
+   * is the latest chunk brief — accurate, and about the last few turns rather
+   * than about the thread. With nothing to say there is no row at all; the CSS
+   * brings an empty one back under the pointer so the way to write one is
+   * still there, without leaving a blank stripe down the table.
+   */
+  const described = t.custom?.description ?? null;
+  const text = described ?? t.stats?.summary ?? (t.stats ? "" : "missing thread file");
+  tr.className = text ? "thread-row row-main has-desc" : "thread-row row-main";
+  item.append(tr);
+
+  const descRow = el("tr", "thread-row row-desc");
+  descRow.onclick = navigate;
+  const desc = el("td", text ? "col-desc" : "col-desc empty") as HTMLTableCellElement;
+  desc.colSpan = COLUMNS.length + 1;
+  const editDesc = (): void =>
+    editName(desc, {
+      field: "description",
+      stored: described,
+      save: (value) => actions.setName(t, { description: value }),
+      after: actions.repaint,
+      // The cell is as tall as the paragraph it holds; pinning that height
+      // would strand a one-line input in it, and nothing above can shift.
+      pinHeight: false,
+    });
+  if (text) {
+    desc.append(el("span", t.stats || described ? "summary-text" : "summary-text bad", clip(text)));
+    // The row shows a clipped paragraph, so the tooltip carries the whole of
+    // it — and the derived summary too, when a description has displaced it.
+    desc.title = described && t.stats?.summary ? `${text}\n\n${t.stats.summary}` : text;
+  } else {
+    const add = el("span", "desc-add", "add description");
+    add.onclick = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      editDesc();
+    };
+    desc.append(add);
+  }
+  desc.append(editAffordance("describe (console only)", editDesc));
+  descRow.append(desc);
+  item.append(descRow);
+  return item;
 }

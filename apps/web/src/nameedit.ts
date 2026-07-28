@@ -16,7 +16,7 @@ import { el } from "./format.ts";
  */
 
 /** Mirrors NAME_TITLE_MAX / NAME_DESCRIPTION_MAX in packages/core/src/names.ts. */
-const MAX = { title: 80, description: 300 } as const;
+const MAX = { title: 80, description: 1000 } as const;
 
 const PLACEHOLDER = {
   title: "name this thread",
@@ -38,11 +38,19 @@ export interface NameEditOptions {
   save: (value: string | null) => Promise<unknown>;
   /** Repaint the surrounding UI after a save lands. */
   after?: () => void;
+  /**
+   * Hold the cell's height while the editor is open, so nothing above it can
+   * move. Default on; off where the cell holds a wrapped paragraph and the
+   * pinned height would leave a one-line input floating in empty space —
+   * nothing sits above that cell within its row, so it has nothing to shift.
+   */
+  pinHeight?: boolean;
 }
 
 /**
  * Swap `cell`'s content for an input until the edit settles. The cell's height
- * is pinned for the duration so a row never jumps as it changes shape.
+ * is pinned for the duration so a row never jumps as it changes shape, unless
+ * the caller opts out with `pinHeight: false`.
  */
 export function editName(cell: HTMLElement, opts: NameEditOptions): void {
   if (cell.classList.contains("editing")) {
@@ -63,7 +71,7 @@ export function editName(cell: HTMLElement, opts: NameEditOptions): void {
 
   cell.classList.add("editing");
   cell.classList.remove("name-failed");
-  if (height > 0) cell.style.height = `${height}px`;
+  if (opts.pinHeight !== false && height > 0) cell.style.height = `${height}px`;
   cell.replaceChildren(input);
   openCount++;
 

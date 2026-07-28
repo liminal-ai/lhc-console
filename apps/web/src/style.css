@@ -162,8 +162,14 @@ tr.row-main.has-desc > td {
   width: 106px;
 }
 
+/* The title leads the row: a touch larger, with air before the fields. */
 .col-title {
-  width: 22%;
+  width: 30%;
+  padding-right: 28px;
+}
+
+td.col-title .title-label {
+  font-size: 14px;
 }
 
 /* Whatever the fixed columns leave over goes to the paths, which need it. */
@@ -188,9 +194,11 @@ th.col-when + th.col-when {
   text-overflow: ellipsis;
 }
 
-.thread-id {
-  color: var(--dim);
-  font-size: 11px;
+/* Host cell carries the health dot now (state rides with the host tag). */
+td.col-host .health-dot {
+  display: inline-block;
+  margin-right: 5px;
+  vertical-align: 1px;
 }
 
 .dir-parent {

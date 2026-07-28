@@ -24,8 +24,8 @@ interface Column {
 
 const COLUMNS: Column[] = [
   { key: "host", label: "host", cls: "col-host" },
-  { key: "title", label: "title", cls: "col-title" },
   { key: "dir", label: "directory", cls: "col-dir" },
+  { key: "title", label: "title", cls: "col-title" },
   { key: "summary", label: "summary", cls: "col-summary" },
   { key: "turns", label: "turns", cls: "num", numeric: true },
   { key: "context", label: "context", cls: "num", numeric: true },
@@ -490,6 +490,21 @@ function threadRow(t: ThreadRow, actions: RowActions): HTMLElement {
 
   tr.append(el("td", `col-host host host-${t.hostId}`, t.hostId));
 
+  const dir = el("td", "col-dir");
+  const bucket = dirBucket(t);
+  if (t.cwd) {
+    dir.title = t.cwd;
+    const { parent, base } = splitDir(t.cwd);
+    if (parent) dir.append(el("span", "dir-parent", parent));
+    dir.append(el("span", "dir-base", base));
+  } else if (bucket) {
+    dir.title = bucket.title;
+    dir.append(el("span", "dir-profile", bucket.label));
+  } else {
+    dir.append(el("span", "dim", "—"));
+  }
+  tr.append(dir);
+
   const title = el("td", "col-title");
   const link = el("a", "title-link") as HTMLAnchorElement;
   link.href = href;
@@ -514,21 +529,6 @@ function threadRow(t: ThreadRow, actions: RowActions): HTMLElement {
     ),
   );
   tr.append(title);
-
-  const dir = el("td", "col-dir");
-  const bucket = dirBucket(t);
-  if (t.cwd) {
-    dir.title = t.cwd;
-    const { parent, base } = splitDir(t.cwd);
-    if (parent) dir.append(el("span", "dir-parent", parent));
-    dir.append(el("span", "dir-base", base));
-  } else if (bucket) {
-    dir.title = bucket.title;
-    dir.append(el("span", "dir-profile", bucket.label));
-  } else {
-    dir.append(el("span", "dim", "—"));
-  }
-  tr.append(dir);
 
   // A console-owned description replaces the derived summary, which is the
   // latest chunk brief — accurate, and about the last few turns rather than

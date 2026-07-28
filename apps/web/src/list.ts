@@ -29,7 +29,7 @@ const COLUMNS: Column[] = [
   { key: "turns", label: "turns", cls: "num", numeric: true },
   { key: "context", label: "context", cls: "num", numeric: true },
   { key: "created", label: "created", cls: "col-when", numeric: true },
-  { key: "activity", label: "last activity", cls: "col-when", numeric: true },
+  { key: "activity", label: "active", cls: "col-when", numeric: true },
 ];
 
 /**

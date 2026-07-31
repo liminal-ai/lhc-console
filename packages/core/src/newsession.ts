@@ -15,7 +15,7 @@
 import { readdirSync } from "node:fs";
 import { join } from "node:path";
 import { describeHost } from "./hosts.ts";
-import { shArg } from "./launch.ts";
+import { CC_SKIP_PERMISSIONS, CODEX_SKIP_PERMISSIONS, shArg } from "./launch.ts";
 
 /**
  * Hosts a new session can be started on — never t3code-lhc, which is
@@ -150,11 +150,19 @@ export function planNewSession(req: NewSessionRequest, env: NewSessionEnv): NewS
   const cwd = tidyDir(req.cwd);
   if (!cwd) return { ok: false, error: "a directory is required" };
   if (!cwd.startsWith("/")) return { ok: false, error: "the directory must be an absolute path" };
+  // Same unattended-pane reasoning as launch.ts: claude and codex skip their
+  // per-action permission prompts; pi-lhc has no equivalent flag.
+  const skipFlag =
+    hostId === "cc-lhc"
+      ? ` ${CC_SKIP_PERMISSIONS}`
+      : hostId === "codex-lhc"
+        ? ` ${CODEX_SKIP_PERMISSIONS}`
+        : "";
   return {
     ok: true,
     kind: "newSession",
     hostId,
-    command: `cd ${shArg(cwd)} && ${hostId}`,
+    command: `cd ${shArg(cwd)} && ${hostId}${skipFlag}`,
     cwd,
     title: `${hostId}: ${baseName(cwd)}`,
     matchCwd: cwd,

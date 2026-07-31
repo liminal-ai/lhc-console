@@ -36,26 +36,26 @@ describe("planNewSession — commands", () => {
     const plan = ok(
       planNewSession({ kind: "newSession", hostId: "cc-lhc", cwd: "/srv/work" }, env),
     );
-    expect(plan.command).toBe("cd /srv/work && cc-lhc");
+    expect(plan.command).toBe("cd /srv/work && cc-lhc --dangerously-skip-permissions");
     expect(plan.cwd).toBe("/srv/work");
     expect(plan.title).toBe("cc-lhc: work");
     expect(plan.matchCwd).toBe("/srv/work");
   });
 
-  it("builds pi-lhc and codex-lhc the same way", () => {
+  it("builds pi-lhc bare and codex-lhc with its skip-permissions flag", () => {
     expect(
       ok(planNewSession({ kind: "newSession", hostId: "pi-lhc", cwd: "/srv/work/x" }, env)).command,
     ).toBe("cd /srv/work/x && pi-lhc");
     expect(
       ok(planNewSession({ kind: "newSession", hostId: "codex-lhc", cwd: "/srv/w" }, env)).command,
-    ).toBe("cd /srv/w && codex-lhc");
+    ).toBe("cd /srv/w && codex-lhc --dangerously-bypass-approvals-and-sandbox");
   });
 
   it("drops the trailing slash Tab-completion leaves behind", () => {
     const plan = ok(
       planNewSession({ kind: "newSession", hostId: "cc-lhc", cwd: "/srv/work/lhc-console/" }, env),
     );
-    expect(plan.command).toBe("cd /srv/work/lhc-console && cc-lhc");
+    expect(plan.command).toBe("cd /srv/work/lhc-console && cc-lhc --dangerously-skip-permissions");
     expect(plan.matchCwd).toBe("/srv/work/lhc-console");
     expect(plan.title).toBe("cc-lhc: lhc-console");
     expect(ok(planNewSession({ kind: "shell", cwd: "/srv/work/" }, env)).cwd).toBe("/srv/work");
@@ -67,7 +67,7 @@ describe("planNewSession — commands", () => {
     const plan = ok(
       planNewSession({ kind: "newSession", hostId: "cc-lhc", cwd: "/srv/my work" }, env),
     );
-    expect(plan.command).toBe("cd '/srv/my work' && cc-lhc");
+    expect(plan.command).toBe("cd '/srv/my work' && cc-lhc --dangerously-skip-permissions");
   });
 
   it("ignores cwd for hermes and spawns in $HOME", () => {

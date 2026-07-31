@@ -102,6 +102,14 @@ function unavailable(reason: string): LaunchRecipe {
   return { command: null, sessionRef: null, reason };
 }
 
+/*
+ * Console launches run unattended in workspace panes, so the underlying
+ * harnesses skip their per-action permission prompts. cc-lhc passes unknown
+ * flags through to claude; codex-lhc passes them through to codex.
+ */
+export const CC_SKIP_PERMISSIONS = "--dangerously-skip-permissions";
+export const CODEX_SKIP_PERMISSIONS = "--dangerously-bypass-approvals-and-sandbox";
+
 /**
  * How this thread resumes on its host. Null only for hosts with no resume path
  * at all (t3code is web-managed) — every other thread gets a recipe, which may
@@ -117,7 +125,10 @@ export function launchRecipe(thread: ThreadSummary): LaunchRecipe | null {
     case "cc-lhc": {
       const sid = lineageFor("cc-lhc").get(thread.threadId);
       if (sid)
-        return { command: withCwd(thread.cwd, `cc-lhc --resume ${shArg(sid)}`), sessionRef: sid };
+        return {
+          command: withCwd(thread.cwd, `cc-lhc ${CC_SKIP_PERMISSIONS} --resume ${shArg(sid)}`),
+          sessionRef: sid,
+        };
       /*
        * No lineage row. That DB is wipeable and has been wiped, so treat its
        * silence as missing bookkeeping rather than a missing session: look the
@@ -132,13 +143,16 @@ export function launchRecipe(thread: ThreadSummary): LaunchRecipe | null {
       const recovered = recoverRolloutSessionId(thread.filePath, thread.cwd, thread.fileMtime);
       if (recovered) {
         return {
-          command: withCwd(thread.cwd, `cc-lhc --resume ${shArg(recovered)}`),
+          command: withCwd(
+            thread.cwd,
+            `cc-lhc ${CC_SKIP_PERMISSIONS} --resume ${shArg(recovered)}`,
+          ),
           sessionRef: recovered,
           recovered: true,
         };
       }
       return {
-        command: withCwd(thread.cwd, `cc-lhc --continue`),
+        command: withCwd(thread.cwd, `cc-lhc ${CC_SKIP_PERMISSIONS} --continue`),
         sessionRef: null,
         fallback: "continue",
       };
@@ -146,7 +160,13 @@ export function launchRecipe(thread: ThreadSummary): LaunchRecipe | null {
     case "codex-lhc": {
       const sid = lineageFor("codex-lhc").get(thread.threadId);
       return sid
-        ? { command: withCwd(thread.cwd, `codex-lhc resume ${shArg(sid)}`), sessionRef: sid }
+        ? {
+            command: withCwd(
+              thread.cwd,
+              `codex-lhc resume ${CODEX_SKIP_PERMISSIONS} ${shArg(sid)}`,
+            ),
+            sessionRef: sid,
+          }
         : unavailable(
             "no codex session lineage row for this thread, so the session id to resume is unknown",
           );

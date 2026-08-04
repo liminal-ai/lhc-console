@@ -2116,3 +2116,9 @@ td.editing {
 .head-desc input.name-input {
   font-size: 12px;
 }
+
+/* Idle terminals: the shell persists, dimmer than a live agent. */
+button.launch-link.has-term.is-idle {
+  color: var(--dim);
+  font-style: italic;
+}

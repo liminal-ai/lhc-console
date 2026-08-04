@@ -102,7 +102,9 @@ export function workspaceContains(target: EventTarget | null): boolean {
 /** The running terminal for a thread, if one exists. */
 export function terminalFor(hostId: string, threadId: string): TerminalRow | null {
   for (const t of terms.values()) {
-    if (t.info.status === "running" && t.info.hostId === hostId && t.info.threadId === threadId) {
+    // Idle terminals count: the session persists at a shell and can resume.
+    const live = t.info.status === "running" || t.info.state === "idle";
+    if (live && t.info.hostId === hostId && t.info.threadId === threadId) {
       return t.info;
     }
   }
@@ -267,7 +269,16 @@ function paintFocus(): void {
 function focusPane(id: string): void {
   focusedPane = id;
   paintFocus();
-  terms.get(id)?.term?.focus();
+  const t = terms.get(id);
+  t?.term?.focus();
+  // Focusing a pane claims input for this tab (single-owner rule server-side).
+  if (t?.ws && t.ws.readyState === 1) {
+    try {
+      t.ws.send(JSON.stringify({ type: "claimInput" }));
+    } catch {
+      // socket mid-reconnect
+    }
+  }
 }
 
 function fitVisible(): void {
@@ -419,7 +430,13 @@ function attachTerm(t: Term): void {
       status?: string;
       exitCode?: number | null;
       threadId?: string;
+      hostId?: string;
       title?: string | null;
+      state?: string;
+      humanAttached?: boolean;
+      reason?: string;
+      epoch?: number;
+      revision?: number;
     };
     try {
       msg = JSON.parse(ev.data) as typeof msg;
@@ -431,8 +448,26 @@ function attachTerm(t: Term): void {
       t.term?.reset();
       if (msg.data) t.term?.write(msg.data);
       if (msg.status === "exited") markExited(t, msg.exitCode ?? null);
+      else if (msg.humanAttached) setStrip(t, "attached elsewhere — read-only", "warn");
       else setStrip(t, "", "off");
+      if (msg.state) t.info = { ...t.info, state: msg.state as TerminalRow["state"] };
       fitTerm(t);
+    } else if (msg.type === "state") {
+      t.info = { ...t.info, state: msg.state as TerminalRow["state"] };
+      if (msg.state === "dead") setStrip(t, "shell died — restart from the tab menu", "warn");
+      else if (!t.info.humanAttached) setStrip(t, "", "off");
+      paintBar();
+      notify();
+    } else if (msg.type === "attachChanged") {
+      t.info = { ...t.info, humanAttached: msg.humanAttached === true };
+      if (msg.humanAttached) setStrip(t, "attached elsewhere — read-only", "warn");
+      else setStrip(t, "", "off");
+    } else if (msg.type === "inputSuspended") {
+      setStrip(t, "attached elsewhere — read-only", "warn");
+    } else if (msg.type === "inputDenied") {
+      setStrip(t, "another tab owns input — click here to take over", "warn");
+    } else if (msg.type === "inputOwner") {
+      if (!t.info.humanAttached) setStrip(t, "", "off");
     } else if (msg.type === "associated") {
       /*
        * The session this pane started has written its registry row: it now
@@ -441,6 +476,7 @@ function attachTerm(t: Term): void {
        */
       t.info = {
         ...t.info,
+        hostId: msg.hostId ?? t.info.hostId,
         threadId: msg.threadId ?? t.info.threadId,
         title: msg.title ?? t.info.title,
         awaitingThread: false,
@@ -862,6 +898,18 @@ export async function openThreadTerminal(
     else newScreenWith(existing.id);
     focusedPane = existing.id;
     enterWorkspace();
+    // An idle terminal auto-resumes: the click means "get me back into this
+    // agent", and the shell is still there after the CLI exits again.
+    if (existing.state === "idle") {
+      try {
+        const info = await api.resumeTerminal(existing.id, force);
+        const term = terms.get(existing.id);
+        if (term) term.info = info;
+      } catch {
+        // refused (busy/attached elsewhere); the pane itself shows why
+      }
+      notify();
+    }
     return;
   }
   const info = await api.openTerminal({ hostId, threadId, fresh, force, cols: 100, rows: 30 });

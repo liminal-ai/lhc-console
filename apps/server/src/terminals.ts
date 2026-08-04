@@ -1,21 +1,36 @@
 /**
- * Server-owned PTY sessions.
+ * The tmux terminal pool.
  *
- * The console is read-only wrt every SQLite file it touches; terminals are the
- * one place it starts a process. The spawned host writes its own state — that
- * is the point of the feature, and it never goes through this server.
+ * Terminals are tmux sessions on the dedicated `-L lhc-console` socket — they
+ * survive this server's restarts and are equally reachable from raw ssh. Each
+ * session wraps a durable shell (see tmux.ts WRAPPER); the console *observes*
+ * sessions rather than owning them, and the thread a terminal belongs to is
+ * derived from evidence (process tree, registry newborn watch) and re-keyed
+ * when the user repurposes a shell by hand.
  *
- * A terminal outlives the browser: output accumulates in a capped ring buffer,
- * sockets attach and detach freely (several at once), and an exited terminal
- * stays in the map with its final screen until someone dismisses it.
+ * Contract: docs/spec.md "tmux terminal pool" (v3, converged with codex).
+ * Pure decision logic lives in @lhc-console/core (tmuxpool.ts).
  */
 
-import { statSync } from "node:fs";
+import {
+  closeSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
+import { join } from "node:path";
 import { spawn, type IPty } from "@lydell/node-pty";
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import type { WebSocket } from "@fastify/websocket";
 import {
+  admissionBlocked,
+  advanceRekey,
+  classifyPane,
   discoverHosts,
   hermesProfiles,
   isExistingDir,
@@ -27,103 +42,234 @@ import {
   writerPolicyFor,
   type NewSessionEnv,
   type NewTerminalKind,
+  type PaneState,
+  type RekeyPending,
   type ThreadSummary,
 } from "@lhc-console/core";
 import { detectAttachedOne, invalidateProcessScan, type OwnTerminal } from "./attach-detect.ts";
+import { threadName } from "./prefs.ts";
+import * as tmx from "./tmux.ts";
 
-/** Total scrollback kept per terminal. Oldest output is dropped first. */
+/** Total scrollback kept per terminal in the warm ring. tmux holds 50k lines more. */
 const BUFFER_CAP = 2_000_000;
-/** Concurrently running terminals. Beyond this, POST answers 429. */
-const MAX_RUNNING = 8;
-/** Grace between SIGHUP and SIGKILL on delete. */
-const KILL_GRACE_MS = 3000;
+/** Admission limit for console-initiated launches: running+busy panes count. */
+const MAX_ACTIVE = 8;
+/** Observation cadence while any session exists. */
+const OBSERVE_MS = 3000;
 /** How often an unassociated new session looks for its registry row. */
 const ASSOCIATE_POLL_MS = 3000;
 /** After this long with no matching row, stop looking. */
 const ASSOCIATE_WINDOW_MS = 5 * 60_000;
+/** Bridge reattach backoff after an unexpected bridge death. */
+const BRIDGE_RETRY_MS = 1500;
 
 export interface ThreadRef {
   hostId: string;
-  /** Null for a session that has not written its registry row yet, and for shells. */
   threadId: string | null;
   title: string | null;
 }
 
-/** A new session waiting for the host to write its registry row. */
 interface PendingAssociation {
   hostId: string;
   cwd: string;
   spawnedAt: string;
 }
 
+type TerminalState = PaneState | "exited";
+
 interface Terminal {
   id: string;
-  pty: IPty;
+  uuid: string;
+  /** Live tmux handle; refreshed each observation tick. Null once exited. */
+  sessionId: string | null;
+  name: string;
   threadRef: ThreadRef;
-  /**
-   * How this terminal came to exist: resuming a thread, starting a fresh LHC
-   * session, or a plain shell. Only "newSession" ever waits for association.
-   */
-  kind: "thread" | NewTerminalKind;
-  command: string;
+  kind: "thread" | NewTerminalKind | "dev";
+  command: string | null;
   cwd: string;
   createdAt: string;
-  status: "running" | "exited";
-  exitCode: number | null;
+  state: TerminalState;
   cols: number;
   rows: number;
-  /** Ring buffer of pty output, as strings — `chars` is their total length. */
   chunks: string[];
   chars: number;
+  /** Monotonic output sequence — the seed/live barrier (throughSeq). */
+  seq: number;
   sockets: Set<WebSocket>;
-  /** DELETE arrived while still running: drop it once the exit is delivered. */
-  removeOnExit: boolean;
-  killTimer: NodeJS.Timeout | null;
-  /** Last byte out of the pty / in from a client. Drives the activity dots. */
+  // oxlint-disable-next-line typescript/no-redundant-type-constituents -- @fastify/websocket's type resolves loosely here
+  inputOwner: WebSocket | null;
+  humanAttached: boolean;
   lastOutputAt: string | null;
   lastInputAt: string | null;
-  /** Set while a newborn session is still looking for its thread row. */
+  /** The readiness token observed when input was last forwarded. */
+  recordedToken: string;
   pending: PendingAssociation | null;
+  rekeyPending: RekeyPending | null;
+  bridge: IPty | null;
+  bridgeRetry: NodeJS.Timeout | null;
+  removeOnExit: boolean;
 }
 
 const terminals = new Map<string, Terminal>();
-let seq = 0;
+let ready = false;
+let epoch = 0;
+let revision = 0;
+let seqCounter = 0;
 
 function newId(): string {
-  seq += 1;
-  return `t${seq}_${Math.random().toString(36).slice(2, 8)}`;
+  seqCounter += 1;
+  return `t${seqCounter}_${Math.random().toString(36).slice(2, 8)}`;
 }
+
+// --- catalog + cross-process lock --------------------------------------------
+
+function stateDir(): string {
+  return process.env.LHC_CONSOLE_HOME ?? join(homedir(), ".lhc-console");
+}
+
+/**
+ * Cross-process lease: two console processes (watcher handover, accidental
+ * dual start) must not both mutate the pool. O_EXCL pidfile with staleness
+ * check — crash-releasing because a dead pid frees the lock.
+ */
+function acquirePoolLock(): void {
+  const path = join(stateDir(), "pool.lock");
+  mkdirSync(stateDir(), { recursive: true });
+  for (let i = 0; i < 3; i++) {
+    try {
+      const fd = openSync(path, "wx");
+      writeFileSync(path, String(process.pid));
+      closeSync(fd);
+      process.on("exit", () => {
+        try {
+          if (readFileSync(path, "utf8").trim() === String(process.pid)) writeFileSync(path, "");
+        } catch {
+          // lock file gone; nothing to release
+        }
+      });
+      return;
+    } catch {
+      let holder = Number.NaN;
+      try {
+        holder = Number(readFileSync(path, "utf8").trim());
+      } catch {
+        // unreadable — treat as stale
+      }
+      let alive = false;
+      if (Number.isFinite(holder) && holder > 0) {
+        try {
+          process.kill(holder, 0);
+          alive = holder !== process.pid;
+        } catch {
+          alive = false;
+        }
+      }
+      if (alive) throw new Error(`pool locked by pid ${holder}`);
+      try {
+        writeFileSync(path, "");
+        unlinkSync(path);
+      } catch {
+        // raced; retry
+      }
+    }
+  }
+  throw new Error("could not acquire pool lock");
+}
+
+interface CatalogFile {
+  epoch: number;
+  terminals: Array<{
+    id: string;
+    uuid: string;
+    threadRef: ThreadRef;
+    kind: Terminal["kind"];
+    command: string | null;
+    cwd: string;
+    createdAt: string;
+  }>;
+}
+
+function catalogPath(): string {
+  return join(stateDir(), "pool.json");
+}
+
+function loadCatalog(): CatalogFile {
+  try {
+    const raw = JSON.parse(readFileSync(catalogPath(), "utf8")) as CatalogFile;
+    if (raw && typeof raw.epoch === "number" && Array.isArray(raw.terminals)) return raw;
+  } catch {
+    // first boot or corrupt — start fresh
+  }
+  return { epoch: 0, terminals: [] };
+}
+
+function persistCatalog(): void {
+  const data: CatalogFile = {
+    epoch,
+    terminals: [...terminals.values()]
+      .filter((t) => t.state !== "exited")
+      .map((t) => ({
+        id: t.id,
+        uuid: t.uuid,
+        threadRef: t.threadRef,
+        kind: t.kind,
+        command: t.command,
+        cwd: t.cwd,
+        createdAt: t.createdAt,
+      })),
+  };
+  const tmp = catalogPath() + ".tmp";
+  writeFileSync(tmp, JSON.stringify(data, null, 1));
+  renameSync(tmp, catalogPath());
+}
+
+// --- serialization of pool mutations ------------------------------------------
+
+let mutationChain: Promise<unknown> = Promise.resolve();
+
+function serialized<T>(fn: () => Promise<T>): Promise<T> {
+  const next = mutationChain.then(fn, fn);
+  mutationChain = next.catch(() => undefined);
+  return next;
+}
+
+// --- views --------------------------------------------------------------------
 
 function publicView(t: Terminal): Record<string, unknown> {
   return {
     id: t.id,
+    uuid: t.uuid,
     hostId: t.threadRef.hostId,
     threadId: t.threadRef.threadId,
     title: t.threadRef.title,
     kind: t.kind,
     command: t.command,
     cwd: t.cwd,
-    status: t.status,
-    exitCode: t.exitCode,
+    // busy is running to the UI; the distinction is internal (no auto-mutations).
+    state: t.state === "busy" ? "running" : t.state,
+    status: t.state === "exited" || t.state === "dead" ? "exited" : "running",
+    exitCode: null,
     createdAt: t.createdAt,
     cols: t.cols,
     rows: t.rows,
     lastOutputAt: t.lastOutputAt,
     lastInputAt: t.lastInputAt,
-    /** Still hunting for the thread row this session is writing. */
     awaitingThread: t.pending !== null,
+    name: t.name,
+    humanAttached: t.humanAttached,
+    attachCommand: t.sessionId ? `tmux -L ${tmx.SOCKET} attach -t ${t.name}` : null,
+    epoch,
   };
 }
 
-/** Append to the ring buffer, dropping whole chunks off the front when over cap. */
 function record(t: Terminal, data: string): void {
   t.lastOutputAt = new Date().toISOString();
+  t.seq += data.length;
   t.chunks.push(data);
   t.chars += data.length;
   while (t.chars > BUFFER_CAP && t.chunks.length > 1) {
     t.chars -= t.chunks.shift()!.length;
   }
-  // A single chunk larger than the cap: keep its tail, which is the live screen.
   if (t.chars > BUFFER_CAP && t.chunks.length === 1) {
     const only = t.chunks[0].slice(-BUFFER_CAP);
     t.chunks[0] = only;
@@ -136,19 +282,24 @@ function sendControl(socket: WebSocket, frame: Record<string, unknown>): void {
   try {
     socket.send(JSON.stringify(frame));
   } catch {
-    // socket died mid-send; the close handler will clean it up
+    // socket died mid-send
   }
 }
 
-/**
- * Output goes out as *binary* frames and control messages as JSON *text*, so
- * the client never has to guess which is which — pty bytes can contain
- * anything, including something that parses as JSON.
- */
+/** Binary frames are raw pty bytes — never prefixed (seed barrier is a JSON frame). */
 function broadcastOutput(t: Terminal, data: string): void {
   const bytes = Buffer.from(data, "utf8");
   for (const s of t.sockets) {
     if (s.readyState !== 1) continue;
+    if (s.bufferedAmount > 4 * BUFFER_CAP) {
+      // Slow client: evict rather than buffer without bound.
+      try {
+        s.close();
+      } catch {
+        // already gone
+      }
+      continue;
+    }
     try {
       s.send(bytes);
     } catch {
@@ -161,110 +312,338 @@ function broadcastControl(t: Terminal, frame: Record<string, unknown>): void {
   for (const s of t.sockets) sendControl(s, frame);
 }
 
-function onExit(t: Terminal, exitCode: number, signal?: number): void {
-  t.status = "exited";
-  t.exitCode = exitCode;
-  if (t.killTimer) {
-    clearTimeout(t.killTimer);
-    t.killTimer = null;
-  }
-  broadcastControl(t, { type: "exit", exitCode, signal: signal ?? null });
-  if (t.removeOnExit) {
-    terminals.delete(t.id);
-    for (const s of t.sockets) {
-      try {
-        s.close();
-      } catch {
-        // already gone
-      }
-    }
-    t.sockets.clear();
-  }
+function stamp(): { epoch: number; revision: number } {
+  revision += 1;
+  return { epoch, revision };
 }
 
-export interface SpawnSpec {
-  command: string;
-  cwd: string;
-  threadRef: ThreadRef;
-  cols: number;
-  rows: number;
-  kind?: "thread" | NewTerminalKind;
-  /** Newborn LHC session: watch this host's registry for the row it writes. */
-  pending?: PendingAssociation | null;
-}
+// --- bridge -------------------------------------------------------------------
 
-/**
- * The server may itself have been (re)started from inside a Claude Code
- * session, whose env markers (CLAUDECODE, CLAUDE_CODE_CHILD_SESSION, …) then
- * leak into spawned terminals and make a launched claude treat itself as a
- * nested child session — silently disabling session persistence. Strip every
- * claude-session marker; the launched host must see a clean shell env.
- * Verified empirically 2026-07-27: with these vars claude writes no session
- * file; scrubbed, it persists normally.
- */
-function scrubbedEnv(): Record<string, string> {
-  const env: Record<string, string> = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (v === undefined) continue;
-    if (k === "CLAUDECODE" || k === "AI_AGENT") continue;
-    if (k.startsWith("CLAUDE_")) continue;
-    env[k] = v;
-  }
-  return env;
-}
-
-function spawnTerminal(spec: SpawnSpec): Terminal {
-  const pty = spawn("bash", ["-lc", spec.command], {
+function attachBridge(t: Terminal): void {
+  if (!t.sessionId || t.bridge) return;
+  const pty = spawn("tmux", ["-L", tmx.SOCKET, "attach", "-f", "ignore-size", "-t", t.sessionId], {
     name: "xterm-256color",
-    cols: spec.cols,
-    rows: spec.rows,
-    cwd: spec.cwd,
-    env: { ...scrubbedEnv(), TERM: "xterm-256color" },
+    cols: t.cols,
+    rows: t.rows,
+    cwd: process.env.HOME ?? homedir(),
+    env: { ...tmx.scrubbedEnv({}), TERM: "xterm-256color" },
   });
-  const t: Terminal = {
-    id: newId(),
-    pty,
-    threadRef: spec.threadRef,
-    kind: spec.kind ?? "thread",
-    command: spec.command,
-    cwd: spec.cwd,
-    createdAt: new Date().toISOString(),
-    status: "running",
-    exitCode: null,
-    cols: spec.cols,
-    rows: spec.rows,
-    chunks: [],
-    chars: 0,
-    sockets: new Set(),
-    removeOnExit: false,
-    killTimer: null,
-    lastOutputAt: null,
-    lastInputAt: null,
-    pending: spec.pending ?? null,
-  };
-  // node-pty hands us decoded strings, so UTF-8 sequences never split here.
+  t.bridge = pty;
   pty.onData((data) => {
     record(t, data);
     broadcastOutput(t, data);
   });
-  pty.onExit(({ exitCode, signal }) => onExit(t, exitCode, signal));
-  terminals.set(t.id, t);
-  if (t.pending) startAssociationPoll();
-  return t;
+  pty.onExit(() => {
+    t.bridge = null;
+    // Bridge death never touches the session; reattach while it exists.
+    if (t.sessionId && t.state !== "exited" && !t.bridgeRetry) {
+      t.bridgeRetry = setTimeout(() => {
+        t.bridgeRetry = null;
+        attachBridge(t);
+      }, BRIDGE_RETRY_MS);
+      t.bridgeRetry.unref();
+    }
+  });
 }
 
-// --- newborn-thread association ---------------------------------------------
+function detachBridge(t: Terminal): void {
+  if (t.bridgeRetry) {
+    clearTimeout(t.bridgeRetry);
+    t.bridgeRetry = null;
+  }
+  if (t.bridge) {
+    try {
+      t.bridge.kill();
+    } catch {
+      // already gone
+    }
+    t.bridge = null;
+  }
+}
 
-/*
- * A session started fresh has no thread id: the host writes its registry row a
- * second or two after boot. Rather than make the client poll (and guess), the
- * server watches the host's registry — mtime-gated, so an idle registry costs
- * one stat — and pushes a control frame the moment the row appears. Until then
- * the tab wears `<host>: <dir basename>`, which is at least true.
- */
+// --- state observation ---------------------------------------------------------
+
+let observeTimer: NodeJS.Timeout | null = null;
+
+function startObserving(): void {
+  if (observeTimer) return;
+  observeTimer = setInterval(() => void observe(), OBSERVE_MS);
+  observeTimer.unref();
+}
+
+function stopObserving(): void {
+  if (!observeTimer) return;
+  clearInterval(observeTimer);
+  observeTimer = null;
+}
+
+function anySessions(): boolean {
+  for (const t of terminals.values()) if (t.sessionId) return true;
+  return false;
+}
+
+async function observe(): Promise<void> {
+  if (!anySessions()) {
+    stopObserving();
+    return;
+  }
+  let rows: tmx.TmuxPaneRow[];
+  try {
+    rows = await tmx.listSessions();
+  } catch {
+    return;
+  }
+  const byUuid = new Map(rows.filter((r) => r.uuid && r.owner).map((r) => [r.uuid!, r]));
+  for (const t of terminals.values()) {
+    if (t.state === "exited") continue;
+    const row = byUuid.get(t.uuid);
+    if (!row) {
+      // Session gone: user exited the shell, or an explicit kill landed.
+      markExited(t);
+      continue;
+    }
+    t.sessionId = row.sessionId;
+    t.name = row.sessionName;
+    const fg = tmx.procForeground(row.panePid);
+    const state = classifyPane({
+      dead: row.paneDead,
+      panePid: row.panePid,
+      foregroundPid: fg.foregroundPid,
+      foregroundComm: fg.foregroundComm,
+      hasNonShellDescendants: tmx.hasNonShellDescendants(row.panePid),
+      readyToken: row.readyToken,
+      recordedToken: t.recordedToken,
+      adapterSupported: true, // the wrapper always installs the bash adapter
+    });
+    const humanNow = row.attachedClients > (t.bridge ? 1 : 0);
+    if (humanNow !== t.humanAttached) {
+      t.humanAttached = humanNow;
+      void applySizingMode(t);
+      broadcastControl(t, { type: "attachChanged", humanAttached: humanNow, ...stamp() });
+    }
+    if (state !== t.state) {
+      const prev = t.state;
+      t.state = state;
+      broadcastControl(t, { type: "state", state: publicStateOf(t), ...stamp() });
+      // shell → CLI transition: figure out what it is now running.
+      if (state === "running" && (prev === "idle" || prev === "busy")) {
+        t.rekeyPending = { candidate: rekeyObserve(t, row) ?? neverCandidate, scans: 0 };
+      }
+    }
+    if (state === "running" && t.rekeyPending) {
+      const observed = rekeyObserve(t, row);
+      const { pending, commit } = advanceRekey(
+        t.rekeyPending.scans === 0 ? null : t.rekeyPending,
+        observed,
+      );
+      t.rekeyPending = pending;
+      if (commit && commit !== neverCandidate) {
+        await commitRekey(t, commit.hostId, commit.threadId);
+      }
+    }
+  }
+}
+
+const neverCandidate = { hostId: "", threadId: "", source: "argv" as const };
+
+function publicStateOf(t: Terminal): string {
+  return t.state === "busy" ? "running" : t.state;
+}
+
+/** What is this pane running? Argv match against every thread's sessionRef. */
+function rekeyObserve(
+  t: Terminal,
+  row: tmx.TmuxPaneRow,
+): { hostId: string; threadId: string; source: "argv" | "registry" } | null {
+  const pids = tmx.paneDescendants(row.panePid);
+  const argvs: string[] = [];
+  for (const pid of pids) {
+    try {
+      argvs.push(readFileSync(`/proc/${pid}/cmdline`, "utf8").replaceAll("\0", " "));
+    } catch {
+      // gone
+    }
+  }
+  if (argvs.length === 0) return null;
+  for (const host of discoverHosts()) {
+    let threads: ThreadSummary[];
+    try {
+      threads = listThreads(host);
+    } catch {
+      continue;
+    }
+    for (const thread of threads) {
+      const recipe = launchRecipe(thread);
+      const ref = recipe?.sessionRef;
+      if (!ref) continue;
+      if (argvs.some((a) => a.includes(ref))) {
+        return { hostId: thread.hostId, threadId: thread.threadId, source: "argv" };
+      }
+    }
+  }
+  // Fallback: a brand-new session in this pane's cwd (registry newborn watch).
+  const path = row.currentPath || t.cwd;
+  for (const host of discoverHosts()) {
+    let threads: ThreadSummary[];
+    try {
+      threads = listThreads(host);
+    } catch {
+      continue;
+    }
+    const hit = matchNewborn(
+      threads.map((r) => ({
+        threadId: r.threadId,
+        cwd: r.cwd,
+        createdAt: r.createdAt,
+        title: r.title,
+      })),
+      {
+        cwd: path,
+        spawnedAt: new Date(Date.now() - 2 * OBSERVE_MS).toISOString(),
+        taken: takenThreadIds(),
+      },
+    );
+    if (hit) return { hostId: host.id, threadId: hit.threadId, source: "registry" };
+  }
+  return null;
+}
+
+function takenThreadIds(): Set<string> {
+  return new Set(
+    [...terminals.values()].map((t) => t.threadRef.threadId).filter((id): id is string => !!id),
+  );
+}
+
+async function commitRekey(t: Terminal, hostId: string, threadId: string): Promise<void> {
+  await serialized(async () => {
+    let title: string | null = null;
+    try {
+      const host = discoverHosts().find((h) => h.id === hostId);
+      if (host) title = listThreads(host).find((r) => r.threadId === threadId)?.title ?? null;
+    } catch {
+      // title stays null
+    }
+    const prev = { ...t.threadRef };
+    t.threadRef = { hostId, threadId, title };
+    if (t.sessionId) {
+      await tmx.setThreadOptions(t.sessionId, hostId, threadId);
+      await tmx.renameSession(t.sessionId, title ?? threadId, t.uuid);
+    }
+    persistCatalog();
+    broadcastControl(t, {
+      type: "associated",
+      hostId,
+      threadId,
+      title,
+      previous: prev,
+      state: publicStateOf(t),
+      ...stamp(),
+    });
+  });
+}
+
+function markExited(t: Terminal): void {
+  t.sessionId = null;
+  t.state = "exited";
+  detachBridge(t);
+  broadcastControl(t, { type: "exit", exitCode: null, signal: null });
+  persistCatalog();
+  if (t.removeOnExit) dropTerminal(t);
+}
+
+function dropTerminal(t: Terminal): void {
+  terminals.delete(t.id);
+  for (const s of t.sockets) {
+    try {
+      s.close();
+    } catch {
+      // already gone
+    }
+  }
+  t.sockets.clear();
+  persistCatalog();
+}
+
+async function applySizingMode(t: Terminal): Promise<void> {
+  if (!t.sessionId) return;
+  if (t.humanAttached) {
+    await tmx.setWindowSizeMode(t.sessionId, "latest");
+  } else {
+    await tmx.setWindowSizeMode(t.sessionId, "manual");
+    // Switching to manual keeps the human's last dimensions; restore ours now.
+    await tmx.resizeWindow(t.sessionId, t.cols, t.rows);
+    try {
+      t.bridge?.resize(t.cols, t.rows);
+    } catch {
+      // bridge mid-restart
+    }
+  }
+}
+
+// --- creation ------------------------------------------------------------------
+
+interface CreateSpec {
+  label: string;
+  command: string | null;
+  cwd: string;
+  threadRef: ThreadRef;
+  kind: Terminal["kind"];
+  cols: number;
+  rows: number;
+  pending?: PendingAssociation | null;
+}
+
+async function createTerminal(spec: CreateSpec): Promise<Terminal> {
+  return serialized(async () => {
+    const created = await tmx.createSession({
+      label: spec.label,
+      cwd: spec.cwd,
+      command: spec.command,
+      kind: spec.kind,
+      hostId: spec.threadRef.hostId,
+      threadId: spec.threadRef.threadId,
+    });
+    const t: Terminal = {
+      id: newId(),
+      uuid: created.uuid,
+      sessionId: created.sessionId,
+      name: created.name,
+      threadRef: spec.threadRef,
+      kind: spec.kind,
+      command: spec.command,
+      cwd: spec.cwd,
+      createdAt: new Date().toISOString(),
+      state: "running",
+      cols: spec.cols,
+      rows: spec.rows,
+      chunks: [],
+      chars: 0,
+      seq: 0,
+      sockets: new Set(),
+      inputOwner: null,
+      humanAttached: false,
+      lastOutputAt: null,
+      lastInputAt: null,
+      recordedToken: "",
+      pending: spec.pending ?? null,
+      rekeyPending: null,
+      bridge: null,
+      bridgeRetry: null,
+      removeOnExit: false,
+    };
+    terminals.set(t.id, t);
+    await applySizingMode(t);
+    attachBridge(t);
+    persistCatalog();
+    startObserving();
+    if (t.pending) startAssociationPoll();
+    return t;
+  });
+}
+
+// --- newborn association (console-initiated new sessions) ----------------------
 
 let associateTimer: NodeJS.Timeout | null = null;
-/** Registry identity (mtime:size) at the last look, per host. */
 const registryKeys = new Map<string, string>();
 
 function pendingTerminals(): Terminal[] {
@@ -273,8 +652,7 @@ function pendingTerminals(): Terminal[] {
 
 function startAssociationPoll(): void {
   if (associateTimer) return;
-  associateTimer = setInterval(pollAssociations, ASSOCIATE_POLL_MS);
-  // Never hold the process open for this.
+  associateTimer = setInterval(() => void pollAssociations(), ASSOCIATE_POLL_MS);
   associateTimer.unref();
 }
 
@@ -284,29 +662,20 @@ function stopAssociationPoll(): void {
   associateTimer = null;
 }
 
-/**
- * Has this host's registry changed since the last look?
- *
- * Returns the key to remember rather than remembering it here: the gate may
- * only advance once the read that follows has actually succeeded. Recording
- * it up front would turn a registry caught mid-write — the very case the read
- * is expected to fail on — into a permanently skipped poll, and the newborn
- * row would go unseen for the rest of the five-minute window.
- */
 function registryChange(hostId: string): { changed: boolean; key: string | null } {
   const host = discoverHosts().find((h) => h.id === hostId);
-  if (!host?.registryPath) return { changed: true, key: null }; // scan host: no cheap gate
+  if (!host?.registryPath) return { changed: true, key: null };
   let key: string;
   try {
     const st = statSync(host.registryPath);
     key = `${st.mtimeMs}:${st.size}`;
   } catch {
-    return { changed: false, key: null }; // no registry to read
+    return { changed: false, key: null };
   }
   return { changed: registryKeys.get(hostId) !== key, key };
 }
 
-function pollAssociations(): void {
+async function pollAssociations(): Promise<void> {
   const waiting = pendingTerminals();
   if (waiting.length === 0) {
     stopAssociationPoll();
@@ -316,17 +685,14 @@ function pollAssociations(): void {
   const live: Terminal[] = [];
   for (const t of waiting) {
     const expired = now - Date.parse(t.pending!.spawnedAt) > ASSOCIATE_WINDOW_MS;
-    // A session that died without writing a row is never going to write one.
-    if (expired || t.status !== "running") t.pending = null;
+    if (expired || t.state === "exited" || t.state === "dead") t.pending = null;
     else live.push(t);
   }
   if (live.length === 0) {
     stopAssociationPoll();
     return;
   }
-  const taken = new Set(
-    [...terminals.values()].map((t) => t.threadRef.threadId).filter((id): id is string => !!id),
-  );
+  const taken = takenThreadIds();
   const byHost = new Map<string, Terminal[]>();
   for (const t of live) {
     const list = byHost.get(t.pending!.hostId);
@@ -342,9 +708,8 @@ function pollAssociations(): void {
     try {
       rows = listThreads(host);
     } catch {
-      continue; // registry mid-write; the gate has NOT moved, so we look again
+      continue; // registry mid-write; gate has not moved
     }
-    // Read succeeded: this state of the registry is now accounted for.
     if (key) registryKeys.set(hostId, key);
     const candidates = rows.map((r) => ({
       threadId: r.threadId,
@@ -361,85 +726,159 @@ function pollAssociations(): void {
       if (!hit) continue;
       taken.add(hit.threadId);
       t.pending = null;
-      t.threadRef = {
-        hostId,
-        threadId: hit.threadId,
-        title: hit.title ?? t.threadRef.title,
-      };
-      broadcastControl(t, {
-        type: "associated",
-        hostId,
-        threadId: hit.threadId,
-        title: t.threadRef.title,
-      });
+      await commitRekey(t, hostId, hit.threadId);
     }
   }
   if (pendingTerminals().length === 0) stopAssociationPoll();
 }
 
-function runningCount(): number {
-  let n = 0;
-  for (const t of terminals.values()) if (t.status === "running") n += 1;
-  return n;
+// --- boot ----------------------------------------------------------------------
+
+async function boot(): Promise<void> {
+  acquirePoolLock();
+  const catalog = loadCatalog();
+  epoch = catalog.epoch + 1;
+  await tmx.ensureServer();
+  const live = await tmx.listSessions();
+  const liveByUuid = new Map(live.filter((r) => r.uuid && r.owner).map((r) => [r.uuid!, r]));
+  for (const entry of catalog.terminals) {
+    const row = liveByUuid.get(entry.uuid);
+    if (!row) continue; // session died while we were away: tombstone by omission
+    const t: Terminal = {
+      id: entry.id,
+      uuid: entry.uuid,
+      sessionId: row.sessionId,
+      name: row.sessionName,
+      threadRef: entry.threadRef,
+      kind: entry.kind,
+      command: entry.command,
+      cwd: entry.cwd,
+      createdAt: entry.createdAt,
+      state: row.paneDead ? "dead" : "running",
+      cols: 100,
+      rows: 30,
+      chunks: [],
+      chars: 0,
+      seq: 0,
+      sockets: new Set(),
+      inputOwner: null,
+      humanAttached: false,
+      lastOutputAt: null,
+      lastInputAt: null,
+      recordedToken: "",
+      pending: null,
+      rekeyPending: null,
+      bridge: null,
+      bridgeRetry: null,
+      removeOnExit: false,
+    };
+    terminals.set(t.id, t);
+    liveByUuid.delete(entry.uuid);
+    // Seed the warm buffer from tmux history so reconnecting browsers see the past.
+    const cap = await tmx.capturePane(row.sessionId, 2000);
+    if (cap.text) record(t, cap.text);
+    attachBridge(t);
+  }
+  // Marked sessions the catalog forgot: adopt from their user options.
+  for (const [uuid, row] of liveByUuid) {
+    const t: Terminal = {
+      id: newId(),
+      uuid,
+      sessionId: row.sessionId,
+      name: row.sessionName,
+      threadRef: { hostId: row.hostId, threadId: row.threadId, title: null },
+      kind: (row.kind as Terminal["kind"]) || "thread",
+      command: null,
+      cwd: row.currentPath,
+      createdAt: new Date().toISOString(),
+      state: row.paneDead ? "dead" : "running",
+      cols: 100,
+      rows: 30,
+      chunks: [],
+      chars: 0,
+      seq: 0,
+      sockets: new Set(),
+      inputOwner: null,
+      humanAttached: false,
+      lastOutputAt: null,
+      lastInputAt: null,
+      recordedToken: "",
+      pending: null,
+      rekeyPending: null,
+      bridge: null,
+      bridgeRetry: null,
+      removeOnExit: false,
+    };
+    terminals.set(t.id, t);
+    const cap = await tmx.capturePane(row.sessionId, 2000);
+    if (cap.text) record(t, cap.text);
+    attachBridge(t);
+  }
+  persistCatalog();
+  if (anySessions()) startObserving();
+  ready = true;
 }
 
-function findRunningFor(hostId: string, threadId: string): Terminal | undefined {
+let bootPromise: Promise<void> | null = null;
+
+function ensureBoot(): Promise<void> {
+  if (!bootPromise) {
+    bootPromise = boot().catch((e) => {
+      ready = true; // serve empty rather than wedge; the error is logged
+      console.error("terminal pool boot failed:", e);
+    });
+  }
+  return bootPromise;
+}
+
+// --- guard integration ---------------------------------------------------------
+
+/** Pool pane pids for the one-writer guard: pane-tree descendants are ours. */
+export function ownTerminals(): OwnTerminal[] {
+  const out: OwnTerminal[] = [];
   for (const t of terminals.values()) {
-    if (
-      t.status === "running" &&
-      t.threadRef.hostId === hostId &&
-      t.threadRef.threadId === threadId
-    ) {
-      return t;
+    if (t.state === "exited" || !t.threadRef.threadId) continue;
+    // The pane pid stands in for the whole tree; attach-detect walks ancestors.
+    out.push({
+      pid: paneRootPid(t),
+      hostId: t.threadRef.hostId,
+      threadId: t.threadRef.threadId,
+    });
+  }
+  return out.filter((o) => o.pid > 0);
+}
+
+const panePids = new Map<string, number>();
+
+function paneRootPid(t: Terminal): number {
+  return panePids.get(t.uuid) ?? 0;
+}
+
+/** Refresh pane pids opportunistically from observation rows. */
+async function refreshPanePids(): Promise<void> {
+  try {
+    for (const row of await tmx.listSessions()) {
+      if (row.uuid) panePids.set(row.uuid, row.panePid);
     }
+  } catch {
+    // next tick
+  }
+}
+
+// --- helpers -------------------------------------------------------------------
+
+function findFor(hostId: string, threadId: string): Terminal | undefined {
+  for (const t of terminals.values()) {
+    if (t.state === "exited") continue;
+    if (t.threadRef.hostId === hostId && t.threadRef.threadId === threadId) return t;
   }
   return undefined;
 }
 
-/**
- * Running PTYs and the thread each was launched for, for the one-writer guard:
- * a terminal of ours counts as an attachment, and anything under its pid is
- * that terminal rather than a stranger.
- */
-export function ownTerminals(): OwnTerminal[] {
-  const out: OwnTerminal[] = [];
-  for (const t of terminals.values()) {
-    if (t.status !== "running") continue;
-    // A newborn session with no thread id yet holds nothing detection can match.
-    if (!t.threadRef.threadId) continue;
-    out.push({ pid: t.pty.pid, hostId: t.threadRef.hostId, threadId: t.threadRef.threadId });
-  }
-  return out;
-}
-
-function removeTerminal(t: Terminal): void {
-  if (t.status === "exited") {
-    terminals.delete(t.id);
-    for (const s of t.sockets) {
-      try {
-        s.close();
-      } catch {
-        // already gone
-      }
-    }
-    t.sockets.clear();
-    return;
-  }
-  t.removeOnExit = true;
-  try {
-    t.pty.kill("SIGHUP");
-  } catch {
-    // process already reaped; onExit will still land
-  }
-  t.killTimer = setTimeout(() => {
-    t.killTimer = null;
-    if (t.status !== "running") return;
-    try {
-      t.pty.kill("SIGKILL");
-    } catch {
-      // nothing left to kill
-    }
-  }, KILL_GRACE_MS);
+function activeStates(): PaneState[] {
+  return [...terminals.values()]
+    .filter((t) => t.state !== "exited")
+    .map((t) => (t.state === "exited" ? "dead" : t.state) as PaneState);
 }
 
 function isLoopback(req: FastifyRequest): boolean {
@@ -447,14 +886,6 @@ function isLoopback(req: FastifyRequest): boolean {
   return ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1";
 }
 
-/**
- * Gate on the devCommand escape.
- *
- * Loopback alone is NOT a gate: every browser request arrives through the Vite
- * dev proxy, which connects from 127.0.0.1, so any tailnet browser looked like
- * a local caller and could spawn an arbitrary command. Require a shared secret
- * as well, and when no secret is configured disable the escape outright.
- */
 function devCommandGate(req: FastifyRequest): { code: number; error: string } | null {
   const secret = process.env.LHC_CONSOLE_DEV_SECRET;
   if (!secret) return { code: 403, error: "devCommand is disabled (no LHC_CONSOLE_DEV_SECRET)" };
@@ -473,11 +904,6 @@ function clampDim(v: unknown, fallback: number, max: number): number {
 
 type Lookup = { thread: ThreadSummary } | { code: number; error: string };
 
-/**
- * What this machine offers a new session. Cheap enough to build per request
- * (host discovery is a handful of `existsSync` calls) and always current, so a
- * host installed while the server runs needs no restart.
- */
 export function newSessionEnv(): NewSessionEnv {
   return {
     launchable: launchableHostIds(discoverHosts().map((h) => h.id)),
@@ -487,13 +913,74 @@ export function newSessionEnv(): NewSessionEnv {
   };
 }
 
+/**
+ * Idle relaunch: recompute the recipe and respawn the pane. Guards per spec:
+ * inside the serialized mutation, pane alive, still idle, no human client,
+ * and a FRESH one-writer scan — an idle terminal is not a writer and its
+ * thread may have been resumed externally since it went idle.
+ */
+async function resumeIdle(
+  t: Terminal,
+  force: boolean,
+): Promise<{ code: number; body: Record<string, unknown> }> {
+  return serialized(async () => {
+    if (t.state !== "idle" && !force) {
+      return { code: 409, body: { error: "terminal is not idle", state: publicStateOf(t) } };
+    }
+    if (t.humanAttached) {
+      return { code: 409, body: { error: "attached elsewhere — detach the tmux client first" } };
+    }
+    if (!t.sessionId) return { code: 409, body: { error: "session is gone" } };
+    if (!t.threadRef.threadId) {
+      return { code: 409, body: { error: "terminal has no thread to resume" } };
+    }
+    const host = discoverHosts().find((h) => h.id === t.threadRef.hostId);
+    const thread = host
+      ? listThreads(host).find((r) => r.threadId === t.threadRef.threadId)
+      : undefined;
+    const recipe = thread ? launchRecipe(thread) : null;
+    if (!recipe?.command) {
+      return { code: 409, body: { error: recipe?.reason ?? "no resume recipe" } };
+    }
+    if (writerPolicyFor(t.threadRef.hostId) === "single") {
+      invalidateProcessScan();
+      const info = detectAttachedOne(
+        { hostId: t.threadRef.hostId, threadId: t.threadRef.threadId, recipe },
+        ownTerminals().filter(
+          (o) => o.threadId !== t.threadRef.threadId || o.pid !== paneRootPid(t),
+        ),
+      );
+      if (info.attached.length > 0 && !force) {
+        return { code: 409, body: { error: "session in use", attached: info.attached } };
+      }
+    }
+    t.command = recipe.command;
+    t.recordedToken = "";
+    await tmx.respawnPane(t.sessionId, t.uuid, recipe.command);
+    t.state = "running";
+    broadcastControl(t, { type: "state", state: "running", ...stamp() });
+    invalidateProcessScan();
+    return { code: 200, body: publicView(t) };
+  });
+}
+
+// --- routes --------------------------------------------------------------------
+
 export function registerTerminalRoutes(
   app: FastifyInstance,
   lookupThread: (hostId: string, threadId: string) => Lookup,
 ): void {
-  app.get("/api/terminals", async () => [...terminals.values()].map(publicView));
+  void ensureBoot();
+
+  app.get("/api/terminals", async (_req, reply) => {
+    await ensureBoot();
+    if (!ready) return reply.code(503).header("retry-after", "1").send({ error: "reconciling" });
+    await refreshPanePids();
+    return [...terminals.values()].map(publicView);
+  });
 
   app.post("/api/terminals", async (req, reply) => {
+    await ensureBoot();
     const body = (req.body ?? {}) as {
       hostId?: string;
       threadId?: string;
@@ -502,46 +989,36 @@ export function registerTerminalRoutes(
       cols?: number;
       rows?: number;
       devCommand?: string;
-      /** Start a fresh LHC session here, rather than resume a thread. */
       newSession?: { hostId?: string; cwd?: string; profile?: string | null };
-      /** Start a plain login shell here. */
       shell?: { cwd?: string };
     };
     const cols = clampDim(body.cols, 80, 500);
     const rows = clampDim(body.rows, 24, 200);
 
-    /*
-     * Dev escape: a loopback caller holding the shared secret may spawn an
-     * arbitrary command, so the terminal plumbing can be exercised end to end
-     * without starting a real agent session. It is the only path where a
-     * client-supplied command is honoured, and it is off unless configured.
-     */
+    const admission = admissionBlocked(activeStates(), MAX_ACTIVE);
+
     if (body.devCommand) {
       const denied = devCommandGate(req);
       if (denied) return reply.code(denied.code).send({ error: denied.error });
-      if (runningCount() >= MAX_RUNNING) {
-        return reply.code(429).send({ error: `terminal limit reached (${MAX_RUNNING})` });
+      if (admission.blocked) {
+        return reply.code(429).send({ error: `terminal limit reached (${MAX_ACTIVE})` });
       }
-      const t = spawnTerminal({
+      const t = await createTerminal({
+        label: `dev ${body.devCommand}`.slice(0, 40),
         command: body.devCommand,
         cwd: process.env.HOME ?? homedir(),
         threadRef: {
           hostId: body.hostId ?? "dev",
-          threadId: body.threadId ?? `dev-${Date.now()}`,
+          threadId: body.threadId ?? `dev-${Math.random().toString(36).slice(2, 8)}`,
           title: `dev: ${body.devCommand}`.slice(0, 60),
         },
+        kind: "dev",
         cols,
         rows,
       });
       return reply.code(201).send(publicView(t));
     }
 
-    /*
-     * New session / plain shell. The client names a host and a directory; the
-     * command is built here from those two facts alone, so there is still no
-     * path by which a client-supplied string reaches a shell. Nothing exists
-     * to collide with yet, so the one-writer guard does not apply.
-     */
     if (body.newSession || body.shell) {
       const req_ = body.newSession
         ? {
@@ -556,11 +1033,12 @@ export function registerTerminalRoutes(
       if (!isExistingDir(plan.cwd)) {
         return reply.code(400).send({ error: `not a directory: ${plan.cwd}` });
       }
-      if (runningCount() >= MAX_RUNNING) {
-        return reply.code(429).send({ error: `terminal limit reached (${MAX_RUNNING})` });
+      if (admission.blocked) {
+        return reply.code(429).send({ error: `terminal limit reached (${MAX_ACTIVE})` });
       }
       const spawnedAt = new Date().toISOString();
-      const t = spawnTerminal({
+      const t = await createTerminal({
+        label: plan.title,
         command: plan.command,
         cwd: plan.cwd,
         kind: plan.kind,
@@ -580,28 +1058,29 @@ export function registerTerminalRoutes(
     if ("error" in found) return reply.code(found.code).send({ error: found.error });
     const { thread } = found;
 
-    // The command is always recomputed here; a client never gets to name it.
     const recipe = launchRecipe(thread);
     if (!recipe?.command) {
       return reply
         .code(409)
         .send({ error: recipe?.reason ?? "thread has no launch recipe", reason: recipe?.reason });
     }
-    const command = recipe.command;
 
     if (!body.fresh) {
-      const existing = findRunningFor(thread.hostId, thread.threadId);
-      // Idempotent return: this IS the attached writer, so no guard applies.
-      if (existing) return reply.send(publicView(existing));
+      const existing = findFor(thread.hostId, thread.threadId);
+      if (existing) {
+        // Idempotent ONLY for running/busy — those are live writers. An idle
+        // terminal must re-scan for external writers before respawning.
+        if (existing.state === "running" || existing.state === "busy") {
+          return reply.send(publicView(existing));
+        }
+        if (existing.state === "idle") {
+          const r = await resumeIdle(existing, body.force === true);
+          return reply.code(r.code).send(r.body);
+        }
+        // dead: fall through and spawn a fresh session; the tombstone remains
+      }
     }
 
-    /*
-     * One-writer guard, and only where it is real. On a "single" writer-policy
-     * host (cc-lhc, codex-lhc) spawning past the idempotent return means adding
-     * a second writer to a session that tolerates one, so refuse unless the
-     * caller insists. On "shared" hosts (hermes, pi-lhc) a second attachment is
-     * ordinary: the UI mentions it and the spawn goes through.
-     */
     if (!body.force && writerPolicyFor(thread.hostId) === "single") {
       const info = detectAttachedOne(
         { hostId: thread.hostId, threadId: thread.threadId, recipe },
@@ -612,32 +1091,76 @@ export function registerTerminalRoutes(
       }
     }
 
-    if (runningCount() >= MAX_RUNNING) {
-      return reply.code(429).send({ error: `terminal limit reached (${MAX_RUNNING})` });
+    if (admission.blocked) {
+      return reply.code(429).send({ error: `terminal limit reached (${MAX_ACTIVE})` });
     }
-    const t = spawnTerminal({
-      command,
+    // The tmux display name prefers the console's own title for the thread.
+    const label =
+      threadName(thread.hostId, thread.threadId)?.title ?? thread.title ?? thread.threadId;
+    const t = await createTerminal({
+      label,
+      command: recipe.command,
       cwd: thread.cwd ?? process.env.HOME ?? homedir(),
       threadRef: {
         hostId: thread.hostId,
         threadId: thread.threadId,
         title: thread.title ?? thread.sessionId ?? thread.threadId,
       },
+      kind: "thread",
       cols,
       rows,
     });
-    // The new pty must be visible to the next guard check, not hidden behind
-    // the 3s scan cache — otherwise a double click spawns two writers.
     invalidateProcessScan();
     return reply.code(201).send(publicView(t));
   });
 
-  app.delete("/api/terminals/:id", async (req, reply) => {
+  app.post("/api/terminals/:id/resume", async (req, reply) => {
+    await ensureBoot();
+    const { id } = req.params as { id: string };
+    const body = (req.body ?? {}) as { force?: boolean };
+    const t = terminals.get(id);
+    if (!t) return reply.code(404).send({ error: "no such terminal" });
+    const r = await resumeIdle(t, body.force === true);
+    return reply.code(r.code).send(r.body);
+  });
+
+  app.post("/api/terminals/:id/restart-shell", async (req, reply) => {
+    await ensureBoot();
     const { id } = req.params as { id: string };
     const t = terminals.get(id);
     if (!t) return reply.code(404).send({ error: "no such terminal" });
-    removeTerminal(t);
-    return { ok: true, id, status: t.status };
+    return serialized(async () => {
+      if (t.state !== "dead") return reply.code(409).send({ error: "pane is not dead" });
+      if (t.humanAttached) {
+        return reply.code(409).send({ error: "attached elsewhere — detach the tmux client first" });
+      }
+      if (!t.sessionId) return reply.code(409).send({ error: "session is gone" });
+      await tmx.respawnPane(t.sessionId, t.uuid, null);
+      t.state = "idle";
+      t.command = null;
+      t.recordedToken = "";
+      broadcastControl(t, { type: "state", state: "idle", ...stamp() });
+      return reply.send(publicView(t));
+    });
+  });
+
+  app.delete("/api/terminals/:id", async (req, reply) => {
+    await ensureBoot();
+    const { id } = req.params as { id: string };
+    const t = terminals.get(id);
+    if (!t) return reply.code(404).send({ error: "no such terminal" });
+    await serialized(async () => {
+      if (t.sessionId) {
+        // Resolve + verify the marker before killing exactly that session.
+        const verified = await tmx.resolveVerified(t.uuid);
+        if (verified) await tmx.killSession(verified);
+        t.sessionId = null;
+      }
+      detachBridge(t);
+      t.state = "exited";
+      dropTerminal(t);
+    });
+    return { ok: true, id, status: "exited" };
   });
 
   app.get("/api/terminals/:id/ws", { websocket: true }, (socket: WebSocket, req) => {
@@ -649,36 +1172,73 @@ export function registerTerminalRoutes(
       return;
     }
     t.sockets.add(socket);
-    // The buffer is the truth: a fresh attach replays it, then rides live.
+    // First socket claims input by default; later sockets claim explicitly.
+    if (!t.inputOwner || t.inputOwner.readyState !== 1) t.inputOwner = socket;
     sendControl(socket, {
       type: "replay",
       data: t.chunks.join(""),
-      status: t.status,
-      exitCode: t.exitCode,
+      throughSeq: t.seq,
+      status: t.state === "exited" || t.state === "dead" ? "exited" : "running",
+      state: publicStateOf(t),
+      humanAttached: t.humanAttached,
+      inputOwner: t.inputOwner === socket,
+      exitCode: null,
       cols: t.cols,
       rows: t.rows,
+      epoch,
     });
-    if (t.status === "exited") sendControl(socket, { type: "exit", exitCode: t.exitCode });
+    if (t.state === "exited") sendControl(socket, { type: "exit", exitCode: null });
 
     socket.on("message", (raw: Buffer | string, isBinary?: boolean) => {
-      if (t.status !== "running") return;
+      if (t.state === "exited") return;
+      const writeInput = (text: string): void => {
+        if (t.humanAttached) {
+          sendControl(socket, { type: "inputSuspended", reason: "attached elsewhere" });
+          return;
+        }
+        if (t.inputOwner !== socket) {
+          sendControl(socket, { type: "inputDenied" });
+          return;
+        }
+        t.lastInputAt = new Date().toISOString();
+        // Record the readiness token we most recently saw: idle requires a NEW
+        // prompt after this moment.
+        void tmx
+          .listSessions()
+          .then((rows) => {
+            const row = rows.find((r) => r.uuid === t.uuid);
+            if (row) t.recordedToken = row.readyToken;
+          })
+          .catch(() => undefined);
+        try {
+          t.bridge?.write(text);
+        } catch {
+          // bridge mid-restart; user will retry
+        }
+      };
       if (isBinary === false || typeof raw === "string") {
         const text = raw.toString();
-        // Text frames are control frames; anything else is a protocol slip.
         try {
           const msg = JSON.parse(text) as { type?: string; cols?: number; rows?: number };
           if (msg.type === "resize") {
+            if (t.inputOwner !== socket || t.humanAttached) return;
             const c = clampDim(msg.cols, t.cols, 500);
             const r = clampDim(msg.rows, t.rows, 200);
             if (c !== t.cols || r !== t.rows) {
               t.cols = c;
               t.rows = r;
+              if (t.sessionId) void tmx.resizeWindow(t.sessionId, c, r);
               try {
-                t.pty.resize(c, r);
+                t.bridge?.resize(c, r);
               } catch {
-                // pty vanished between the check and the resize
+                // bridge mid-restart
               }
             }
+            return;
+          }
+          if (msg.type === "claimInput") {
+            t.inputOwner = socket;
+            sendControl(socket, { type: "inputOwner" });
             return;
           }
           if (msg.type === "ping") {
@@ -686,34 +1246,30 @@ export function registerTerminalRoutes(
             return;
           }
         } catch {
-          // not JSON — fall through and treat it as keystrokes
+          // not JSON — keystrokes
         }
-        t.lastInputAt = new Date().toISOString();
-        t.pty.write(text);
+        writeInput(text);
         return;
       }
-      t.lastInputAt = new Date().toISOString();
-      t.pty.write(Buffer.isBuffer(raw) ? raw.toString("utf8") : String(raw));
+      writeInput(Buffer.isBuffer(raw) ? raw.toString("utf8") : String(raw));
     });
 
     const drop = (): void => {
       t.sockets.delete(socket);
+      if (t.inputOwner === socket) {
+        t.inputOwner = [...t.sockets][0] ?? null;
+        if (t.inputOwner) sendControl(t.inputOwner, { type: "inputOwner" });
+      }
     };
     socket.on("close", drop);
     socket.on("error", drop);
   });
 }
 
-/** Kill everything — used on server shutdown so no orphan agents survive. */
+/**
+ * Server shutdown detaches bridge clients ONLY. Sessions are the durable
+ * artifact — the whole point of the pool — and must never die with us.
+ */
 export function shutdownTerminals(): void {
-  for (const t of terminals.values()) {
-    if (t.status === "running") {
-      try {
-        t.pty.kill("SIGHUP");
-      } catch {
-        // best effort
-      }
-    }
-  }
-  terminals.clear();
+  for (const t of terminals.values()) detachBridge(t);
 }

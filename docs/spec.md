@@ -66,8 +66,19 @@ click, and the border between items falls under the pair, not inside it. A threa
 with no summary has no second row (no blank stripe); hovering the item brings an
 empty one back with an "add description" invitation. Sortable by any row-one
 column (click header), filter by host and directory, text search — search still
-matches the summary text. Minimal, elegant, quality design that is not trying
-hard — restrained dark monospace aesthetic, no decoration for its own sake.
+matches the summary text. Titles display capped at 35 chars ("…" suffix, full
+name in the tooltip) so a long name can never crowd out the inline launch link.
+Minimal, elegant, quality design that is not trying hard — restrained dark
+monospace aesthetic, no decoration for its own sake.
+
+**Empty threads are not listed.** A thread with zero captured messages whose
+file has been quiescent for 10+ minutes is a shell, not a session — hermes
+background-review/curator forks create the thread file at agent init with
+persistence disabled, so nothing can ever land in it; aborted sessions on any
+host leave the same debris. `/api/threads` drops them by default
+(`?includeEmpty=1` bypasses; detail URLs still resolve). No UI toggle, by
+design. The age guard keeps a just-launched session visible before its first
+captured message.
 
 "Current context tokens" ≈ what a resume would serve: sum of stored band token_counts
 (if a view exists) + token estimate of messages after compact_point (tail). No view →

@@ -98,6 +98,9 @@ const NO_DIR = " none";
 /** Terminal output older than this predates the page and is not "activity". */
 const PAGE_LOADED_AT = Date.now();
 
+/** Displayed title cap; the full name moves to the tooltip when cut. */
+const TITLE_CHARS = 35;
+
 /** Threads grow while the console is open; re-poll on this cadence. */
 const REFRESH_MS = 30_000;
 const TICK_MS = 5_000;
@@ -506,12 +509,19 @@ function threadItem(t: ThreadRow, actions: RowActions): HTMLElement {
   const title = el("td", "col-title");
   const link = el("a", "title-link") as HTMLAnchorElement;
   link.href = href;
-  link.append(el("span", "title-label", displayTitle(t)));
+  // Hard cap so a long name can never push the launch link out of the cell.
+  const fullTitle = displayTitle(t);
+  const shown = fullTitle.length > TITLE_CHARS ? `${fullTitle.slice(0, TITLE_CHARS)}…` : fullTitle;
+  link.append(el("span", "title-label", shown));
   title.append(link);
   // The id and (when renamed) the registry title live in the tooltip — the
   // row shows one clean name and nothing else.
-  title.title =
-    t.custom?.title && t.title ? `${t.threadId} · registry title: ${t.title}` : t.threadId;
+  const tipParts = [
+    shown === fullTitle ? null : fullTitle,
+    t.threadId,
+    t.custom?.title && t.title ? `registry title: ${t.title}` : null,
+  ].filter(Boolean);
+  title.title = tipParts.join(" · ");
   title.append(
     editAffordance("rename (console only)", () =>
       editName(title, {

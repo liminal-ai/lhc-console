@@ -120,8 +120,22 @@ function matchesThread(
       // The wrapper (`node …/cc-lhc/dist/bin.js --resume <sid>`) and the
       // `claude --resume <sid>` child both carry the id; both are reported.
       return !!ref && hasToken(args, `--resume ${ref}`);
-    case "codex-lhc":
-      return !!ref && (hasToken(args, `resume ${ref}`) || hasToken(args, `--resume ${ref}`));
+    case "codex-lhc": {
+      // Options may sit between the subcommand and the id (the launch command
+      // itself puts the sandbox flag there): match `resume [flags…] <ref>` by
+      // tokens, plus the plain `--resume <ref>` form.
+      if (!ref) return false;
+      if (hasToken(args, `--resume ${ref}`)) return true;
+      const tokens = args.split(/\s+/);
+      const at = tokens.indexOf("resume");
+      if (at < 0) return false;
+      for (let i = at + 1; i < tokens.length; i += 1) {
+        const tok = tokens[i]!;
+        if (tok.startsWith("-")) continue;
+        return tok === ref;
+      }
+      return false;
+    }
     case "pi-lhc": {
       const m = /--lhc-thread[= ](\S+)/.exec(args);
       if (!m) return false;
@@ -209,6 +223,9 @@ export function detectAttached(
     }
     for (const p of procs) {
       if (p.pid === process.pid) continue;
+      // The pool's tmux plumbing (server/clients on our socket) is never a
+      // writer; its argv can echo command text without holding any session.
+      if (p.args.includes("-L lhc-console")) continue;
       if (!matchesThread(p.args, s.hostId, s.threadId, s.recipe!.sessionRef)) continue;
       const owner = ownerTerminal(p);
       // Our own shell-outs are not writers; our terminals are, and are listed

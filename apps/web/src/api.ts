@@ -261,6 +261,15 @@ export interface TerminalRow {
   lastInputAt?: string | null;
   /** Still watching the host registry for this session's thread row. */
   awaitingThread?: boolean;
+  /** Pool state: running | idle | dead | exited (busy renders as running). */
+  state?: "running" | "idle" | "dead" | "exited";
+  /** tmux display name; manual attach is `tmux -L lhc-console attach -t <name>`. */
+  name?: string;
+  attachCommand?: string | null;
+  /** A non-bridge tmux client (raw ssh attach) holds the session. */
+  humanAttached?: boolean;
+  uuid?: string;
+  epoch?: number;
 }
 
 /** A non-2xx API response, carrying the status so callers can branch on 404. */
@@ -353,6 +362,15 @@ export const api = {
   viewArrangement: (hostId: string, threadId: string) =>
     get<ViewArrangement>(`/api/threads/${hostId}/${threadId}/view-arrangement`),
   terminals: () => get<TerminalRow[]>("/api/terminals"),
+  /** Relaunch an idle terminal's thread in place (fresh recipe, one-writer scan). */
+  resumeTerminal: (id: string, force = false) =>
+    send<TerminalRow>(`/api/terminals/${id}/resume`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ force }),
+    }),
+  restartShell: (id: string) =>
+    send<TerminalRow>(`/api/terminals/${id}/restart-shell`, { method: "POST" }),
   newSessionOptions: () => get<NewSessionOptions>("/api/new-session/options"),
   quickDirs: () => get<QuickDir[]>("/api/quick-dirs"),
   /** Directory completion. Always resolves — errors arrive as `error`. */

@@ -573,17 +573,26 @@ function threadItem(t: ThreadRow, actions: RowActions): HTMLElement {
     // A live terminal for this thread takes over the affordance: no modal,
     // straight to the workspace screen it is already on.
     const live = terminalFor(t.hostId, t.threadId);
+    // Three states, not two: launch (cold) / terminal (running) / resume
+    // (idle — the durable shell persists; a click relaunches the agent in it).
+    const idle = live?.state === "idle";
     // A terminal that has produced output since this page loaded is doing
     // something; the marker says so quietly rather than with a new column.
-    const active = !!live?.lastOutputAt && Date.parse(live.lastOutputAt) > PAGE_LOADED_AT;
+    const active = !idle && !!live?.lastOutputAt && Date.parse(live.lastOutputAt) > PAGE_LOADED_AT;
     const btn = el(
       "button",
-      live ? `launch-link has-term${active ? " active" : ""}` : "launch-link",
-      live ? "terminal" : "launch",
+      live
+        ? idle
+          ? "launch-link has-term is-idle"
+          : `launch-link has-term${active ? " active" : ""}`
+        : "launch-link",
+      live ? (idle ? "resume" : "terminal") : "launch",
     ) as HTMLButtonElement;
     btn.type = "button";
     btn.title = live
-      ? `${active ? "active — " : ""}running: ${cmd}`
+      ? idle
+        ? "idle at a shell — click to relaunch the agent in its terminal"
+        : `${active ? "active — " : ""}running: ${cmd}`
       : (cmd ?? launch.reason ?? "no resume path");
     /*
      * Something outside the console holds this session. Mark it so a glance

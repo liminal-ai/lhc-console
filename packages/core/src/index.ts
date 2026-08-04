@@ -57,3 +57,4 @@ export type {
   ViewEntryTurn,
   ViewTailTurn,
 } from "./thread.ts";
+export * from "./tmuxpool.ts";

@@ -477,6 +477,12 @@ async function observeOnce(): Promise<void> {
     const humanNow = row.attachedClients > (t.bridge ? 1 : 0);
     if (humanNow !== t.humanAttached) {
       t.humanAttached = humanNow;
+      if (humanNow) {
+        // A human can type through their own tmux client — consume the
+        // current token so only a prompt painted DURING/after their visit can
+        // prove idleness again. Half-typed lines they leave behind stay busy.
+        t.recordedToken = row.readyToken;
+      }
       void serialized(() => applySizingMode(t));
       broadcastControl(t, { type: "attachChanged", humanAttached: humanNow, ...stamp() });
     }
@@ -1222,11 +1228,17 @@ async function resumeIdleLocked(
         return { code: 409, body: { error: "session in use", attached: info.attached } };
       }
     }
+    try {
+      await tmx.clearReady(t.sessionId);
+      await tmx.respawnPane(t.sessionId, t.uuid, recipe.command);
+    } catch {
+      // Nothing was (necessarily) respawned; keep the prior state and let the
+      // caller retry. Observation will re-derive the truth either way.
+      return { code: 503, body: { error: "respawn failed — retry" } };
+    }
     t.command = recipe.command;
     t.recordedToken = "";
     t.lastSeenToken = "";
-    await tmx.clearReady(t.sessionId);
-    await tmx.respawnPane(t.sessionId, t.uuid, recipe.command);
     try {
       const fresh = (await tmx.listSessions()).find((x) => x.uuid === t.uuid);
       if (fresh) panePids.set(t.uuid, fresh.panePid);
@@ -1439,8 +1451,12 @@ export function registerTerminalRoutes(
           };
         }
         t.sessionId = row.sessionId;
-        await tmx.clearReady(t.sessionId);
-        await tmx.respawnPane(t.sessionId, t.uuid, null);
+        try {
+          await tmx.clearReady(t.sessionId);
+          await tmx.respawnPane(t.sessionId, t.uuid, null);
+        } catch {
+          return { code: 503, body: { error: "respawn failed — retry" } };
+        }
         // Busy until the fresh shell paints a prompt and stamps a NEW marker;
         // observation flips it to idle. The old pane pid is dead — refresh.
         t.state = "busy";
@@ -1511,6 +1527,7 @@ export function registerTerminalRoutes(
       status: t.state === "exited" ? "exited" : "running",
       state: publicStateOf(t),
       humanAttached: t.humanAttached,
+      conflict: t.conflict,
       inputOwner: t.inputOwner === socket,
       exitCode: null,
       cols: t.cols,

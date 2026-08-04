@@ -262,8 +262,11 @@ same-thread terminals; idle ones re-scan immediately before respawn.
 
 **State detection — readiness markers + composite, never just
 pane_current_command.** Internal states: `running`, `idle`, `busy/unknown`,
-`dead`, plus `cold` (no session). The wrapper installs a shell adapter for
-supported shells (bash `PROMPT_COMMAND`, zsh `precmd`) that stamps a
+`dead`, plus `cold` (no session). Managed pool shells are bash by design
+(v1): the readiness adapter is the safety mechanism for idle relaunch and it
+exists only for bash, so the wrapper always execs bash regardless of $SHELL
+(zsh support would arrive as a precmd adapter, not by loosening this). The
+wrapper installs the bash `PROMPT_COMMAND` adapter, which stamps a
 readiness **generation token** (`@lhc_ready` = per-prompt counter + shell
 pid — never a clock; comparing shell wall time with Node monotonic time is
 meaningless) on the session at each prompt. When the server forwards input

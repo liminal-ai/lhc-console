@@ -261,7 +261,7 @@ auto-re-keyed, never auto-resumed, rendered as running. UI shows three states
 console session carries `@lhc_uuid` (durable identity; tmux `session_id`
 values are reused across tmux-server restarts and are only a live handle),
 plus `@lhc_owner`, `@lhc_kind`, `@lhc_host`, `@lhc_thread`, schema version.
-The session *name* is display only: slug of current occupant + short uuid
+The session _name_ is display only: slug of current occupant + short uuid
 suffix, renamed on re-key; ops resolve uuid → live session_id and re-verify
 the marker before acting. Delete kills exactly that verified session.
 Unmarked sessions on our socket are listed as foreign, never touched.
@@ -325,7 +325,7 @@ Kitty-protocol handling is verified with a real cc-lhc TUI, not assumed.
 
 **One-writer guard.** Own-terminal attribution moves from the node-pty pid
 (now merely the attach client) to each pool session\'s `pane_pid`; pane-tree
-descendants are ours. A descendant matching a *different* thread than the
+descendants are ours. A descendant matching a _different_ thread than the
 pool row triggers re-key, not suppression. Also fix the codex argv matcher
 to tolerate options between `resume` and the session id (bug: the launch
 command puts --dangerously-bypass-approvals-and-sandbox there and detection

@@ -462,6 +462,13 @@ async function observeOnce(): Promise<void> {
     // Cache the freshest token: input forwarding copies it SYNCHRONOUSLY, so
     // idle can never be concluded from a token newer than the last keystroke.
     t.lastSeenToken = row.readyToken;
+    const humanNow = row.attachedClients > (t.bridge ? 1 : 0);
+    if (humanNow && !t.humanAttached) {
+      // Consume the current token BEFORE classification: a human can type
+      // through their own tmux client, so only a prompt painted during/after
+      // their visit can prove idleness again.
+      t.recordedToken = row.readyToken;
+    }
     const fg = tmx.procForeground(row.panePid);
     const opaque = fg.foregroundComm === "ssh" || fg.foregroundComm === "tmux";
     const state = classifyPane({
@@ -474,15 +481,8 @@ async function observeOnce(): Promise<void> {
       recordedToken: t.recordedToken,
       adapterSupported: row.adapter === "bash",
     });
-    const humanNow = row.attachedClients > (t.bridge ? 1 : 0);
     if (humanNow !== t.humanAttached) {
       t.humanAttached = humanNow;
-      if (humanNow) {
-        // A human can type through their own tmux client — consume the
-        // current token so only a prompt painted DURING/after their visit can
-        // prove idleness again. Half-typed lines they leave behind stay busy.
-        t.recordedToken = row.readyToken;
-      }
       void serialized(() => applySizingMode(t));
       broadcastControl(t, { type: "attachChanged", humanAttached: humanNow, ...stamp() });
     }

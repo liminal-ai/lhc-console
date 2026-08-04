@@ -271,7 +271,11 @@ to the pane it records the token it observed; `idle` requires: pane alive,
 current token present and _different from the recorded one_ (a new prompt
 was painted since the last input), foreground process group is the managed
 root shell, no non-shell descendants. This catches the /proc-invisible cases (long-running
-builtins, half-typed lines) — a stale marker means busy. Unsupported shells
+builtins, half-typed lines) — a stale marker means busy. After a server
+restart the recorded token initializes to the CURRENT marker, so restored
+shells read busy until they paint a fresh prompt (one keypress): a restart
+must never manufacture idleness over a possibly-dirty prompt. Unsupported
+shells
 never auto-classify idle: their idle-click offers resume behind one explicit
 confirmation instead. A pane whose foreground is `ssh` or a nested tmux
 client is `busy/unknown` (opaque): never auto-re-keyed, never auto-resumed,

@@ -64,8 +64,9 @@ if [ -n "$cmdfile" ] && [ -f "$cmdfile" ]; then
   cmd=$(cat "$cmdfile")
   rm -f "$cmdfile"
 fi
-sh=$LHC_SHELL
-[ -x "$sh" ] || sh=/bin/bash
+# Managed pool shells are bash by design (v1): the readiness adapter is the
+# safety mechanism for idle relaunch, and it exists only for bash.
+sh=/bin/bash
 sock=\${LHC_TMUX_SOCKET:-lhc-console}
 # Record which readiness adapter this pane actually has: observation derives
 # adapterSupported from this instead of assuming. Non-bash shells get "none"
@@ -117,7 +118,7 @@ set -g status off
 set -s set-clipboard external
 set -g history-limit 50000
 set -g remain-on-exit on
-set -sa terminal-features 'xterm-256color:RGB:extkeys:focus'
+set -s terminal-features[100] 'xterm-256color:RGB:extkeys:focus'
 # Attach/detach hooks close the human-attachment observation window: the pool
 # re-observes within milliseconds instead of the 3s poll tick.
 set-hook -g client-attached 'run-shell "touch ${evt}"'
@@ -134,11 +135,14 @@ export async function ensureServer(): Promise<void> {
   writeFileSync(confPath(), confContent());
   writeFileSync(join(stateDir(), "attach-event"), "");
   // A durable server that survived our restart still runs its OLD config —
-  // -f only applies at server start. Source the fresh one into it.
+  // -f only applies at server start. Source the fresh one into it; only a
+  // confirmed no-server is ignorable (a syntax error must fail the boot, or
+  // the old hooks silently stay active).
   try {
     await tmux(["source-file", confPath()]);
-  } catch {
-    // no server running: fine, -f covers the next start
+  } catch (e) {
+    const msg = String(e);
+    if (!msg.includes("no server running") && !msg.includes("error connecting")) throw e;
   }
   bootstrapped = true;
 }
@@ -195,8 +199,6 @@ export async function createSession(input: CreateSessionInput): Promise<CreatedS
     input.cwd,
     "-e",
     `LHC_CMD_FILE=${cmdFile}`,
-    "-e",
-    `LHC_SHELL=${process.env.SHELL?.startsWith("/") ? process.env.SHELL : "/bin/bash"}`,
     "-e",
     `LHC_TMUX_SOCKET=${SOCKET}`,
     "-P",
@@ -311,7 +313,7 @@ export async function respawnPane(
 
 /** Wipe the readiness marker (before respawn, so stale tokens cannot idle). */
 export async function clearReady(sessionId: string): Promise<void> {
-  await tmuxList(["set", "-p", "-t", sessionId, "@lhc_ready", ""]);
+  await tmux(["set", "-p", "-t", sessionId, "@lhc_ready", ""]);
 }
 
 // --- observation --------------------------------------------------------------

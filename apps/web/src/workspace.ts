@@ -447,57 +447,59 @@ function attachTerm(t: Term): void {
     } catch {
       return;
     }
-    // Epoch/revision ordering: adopt any newer epoch as a fresh baseline;
-    // within an epoch, drop anything at or below the last accepted revision.
-    if (typeof msg.epoch === "number" && typeof msg.revision === "number") {
+    /*
+     * Replay is ALWAYS accepted from the installed socket and resets the
+     * staleness baseline — a reconnect replay carries the unchanged current
+     * revision, and rejecting it would discard exactly the output the
+     * reconnect exists to recover. Staleness applies to later frames only.
+     */
+    if (msg.type === "replay") {
+      if (typeof msg.epoch === "number") {
+        t.lastStamp = { epoch: msg.epoch, revision: (msg as { revision?: number }).revision ?? 0 };
+      }
+    } else if (typeof msg.epoch === "number" && typeof msg.revision === "number") {
       const last = t.lastStamp;
       const stale =
         last !== null &&
         (msg.epoch < last.epoch || (msg.epoch === last.epoch && msg.revision <= last.revision));
       if (stale) return;
       t.lastStamp = { epoch: msg.epoch, revision: msg.revision };
-    } else if (typeof msg.epoch === "number" && msg.type === "replay") {
-      t.lastStamp = { epoch: msg.epoch, revision: (msg as { revision?: number }).revision ?? 0 };
     }
     if (msg.type === "replay") {
       // Server buffer is the truth: every attach starts from a clean screen.
       t.term?.reset();
       if (msg.data) t.term?.write(msg.data);
+      t.info = {
+        ...t.info,
+        ...(msg.state ? { state: msg.state as TerminalRow["state"] } : {}),
+        humanAttached: msg.humanAttached === true,
+        conflict: (msg as { conflict?: boolean }).conflict === true,
+      };
       if (msg.status === "exited") markExited(t, msg.exitCode ?? null);
-      else if (msg.state === "dead") deadStrip(t);
-      else if (msg.humanAttached) setStrip(t, "attached elsewhere — read-only", "warn");
-      else setStrip(t, "", "off");
-      if (msg.state) t.info = { ...t.info, state: msg.state as TerminalRow["state"] };
+      else paintStrip(t);
       fitTerm(t);
     } else if (msg.type === "state") {
       t.info = { ...t.info, state: msg.state as TerminalRow["state"] };
-      if (msg.state === "dead") {
-        deadStrip(t);
-      } else {
+      if (msg.state !== "dead") {
         // Any live state re-enables input (a dead pane may have disabled it).
         t.info = { ...t.info, status: "running" };
         if (t.term) t.term.options.disableStdin = false;
-        if (!t.info.humanAttached) setStrip(t, "", "off");
       }
+      paintStrip(t);
       paintBar();
       notify();
     } else if (msg.type === "attachChanged") {
       t.info = { ...t.info, humanAttached: msg.humanAttached === true };
-      if (msg.humanAttached) setStrip(t, "attached elsewhere — read-only", "warn");
-      else if (t.info.state === "dead")
-        deadStrip(t); // keep the restart affordance
-      else setStrip(t, "", "off");
+      paintStrip(t);
     } else if (msg.type === "conflictChanged") {
       t.info = { ...t.info, conflict: (msg as { conflict?: boolean }).conflict === true };
-      if (t.info.conflict) setStrip(t, "another terminal claims this thread", "warn");
-      else if (t.info.state === "dead") deadStrip(t);
-      else if (!t.info.humanAttached) setStrip(t, "", "off");
+      paintStrip(t);
     } else if (msg.type === "inputSuspended") {
       setStrip(t, "attached elsewhere — read-only", "warn");
     } else if (msg.type === "inputDenied") {
       setStrip(t, "another tab owns input — click here to take over", "warn");
     } else if (msg.type === "inputOwner") {
-      if (!t.info.humanAttached) setStrip(t, "", "off");
+      paintStrip(t);
     } else if (msg.type === "associated") {
       /*
        * The session this pane started has written its registry row: it now
@@ -532,6 +534,18 @@ function attachTerm(t: Term): void {
     setStrip(t, "disconnected — reconnecting…", "warn");
     scheduleRetry(t);
   };
+}
+
+/**
+ * One place decides what the strip shows, in priority order: conflict >
+ * human-attached > dead > clear. Individual frames repaint through this so a
+ * lower-priority change can never erase a higher-priority warning.
+ */
+function paintStrip(t: Term): void {
+  if (t.info.conflict) setStrip(t, "another terminal claims this thread", "warn");
+  else if (t.info.humanAttached) setStrip(t, "attached elsewhere — read-only", "warn");
+  else if (t.info.state === "dead") deadStrip(t);
+  else setStrip(t, "", "off");
 }
 
 /** Dead pane: recoverable — the strip itself is the restart affordance. */

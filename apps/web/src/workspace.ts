@@ -51,6 +51,8 @@ interface Term {
   retryTimer: number | null;
   pingTimer: number | null;
   gone: boolean;
+  /** Last accepted (epoch, revision) — stale frames are dropped. */
+  lastStamp: { epoch: number; revision: number } | null;
 }
 
 interface Screen {
@@ -411,6 +413,7 @@ function attachTerm(t: Term): void {
   t.ws = ws;
 
   ws.onopen = () => {
+    if (t.ws !== ws) return;
     t.retryMs = RETRY_START_MS;
     if (t.info.status === "running") setStrip(t, "", "off");
     if (t.pingTimer !== null) clearInterval(t.pingTimer);
@@ -419,6 +422,7 @@ function attachTerm(t: Term): void {
   };
 
   ws.onmessage = (ev: MessageEvent) => {
+    if (t.ws !== ws) return; // a replacement socket owns this terminal now
     if (typeof ev.data !== "string") {
       t.term?.write(new Uint8Array(ev.data as ArrayBuffer));
       markOutput(t);
@@ -443,19 +447,38 @@ function attachTerm(t: Term): void {
     } catch {
       return;
     }
+    // Epoch/revision ordering: adopt any newer epoch as a fresh baseline;
+    // within an epoch, drop anything at or below the last accepted revision.
+    if (typeof msg.epoch === "number" && typeof msg.revision === "number") {
+      const last = t.lastStamp;
+      const stale =
+        last !== null &&
+        (msg.epoch < last.epoch || (msg.epoch === last.epoch && msg.revision <= last.revision));
+      if (stale) return;
+      t.lastStamp = { epoch: msg.epoch, revision: msg.revision };
+    } else if (typeof msg.epoch === "number" && msg.type === "replay") {
+      t.lastStamp = { epoch: msg.epoch, revision: (msg as { revision?: number }).revision ?? 0 };
+    }
     if (msg.type === "replay") {
       // Server buffer is the truth: every attach starts from a clean screen.
       t.term?.reset();
       if (msg.data) t.term?.write(msg.data);
       if (msg.status === "exited") markExited(t, msg.exitCode ?? null);
+      else if (msg.state === "dead") deadStrip(t);
       else if (msg.humanAttached) setStrip(t, "attached elsewhere — read-only", "warn");
       else setStrip(t, "", "off");
       if (msg.state) t.info = { ...t.info, state: msg.state as TerminalRow["state"] };
       fitTerm(t);
     } else if (msg.type === "state") {
       t.info = { ...t.info, state: msg.state as TerminalRow["state"] };
-      if (msg.state === "dead") setStrip(t, "shell died — restart from the tab menu", "warn");
-      else if (!t.info.humanAttached) setStrip(t, "", "off");
+      if (msg.state === "dead") {
+        deadStrip(t);
+      } else {
+        // Any live state re-enables input (a dead pane may have disabled it).
+        t.info = { ...t.info, status: "running" };
+        if (t.term) t.term.options.disableStdin = false;
+        if (!t.info.humanAttached) setStrip(t, "", "off");
+      }
       paintBar();
       notify();
     } else if (msg.type === "attachChanged") {
@@ -493,6 +516,7 @@ function attachTerm(t: Term): void {
   };
 
   ws.onclose = () => {
+    if (t.ws !== ws) return;
     if (t.pingTimer !== null) {
       clearInterval(t.pingTimer);
       t.pingTimer = null;
@@ -500,6 +524,31 @@ function attachTerm(t: Term): void {
     if (t.gone || t.info.status === "exited") return;
     setStrip(t, "disconnected — reconnecting…", "warn");
     scheduleRetry(t);
+  };
+}
+
+/** Dead pane: recoverable — the strip itself is the restart affordance. */
+function deadStrip(t: Term): void {
+  if (t.term) t.term.options.disableStdin = true;
+  setStrip(t, "shell died — click here to restart it", "warn");
+  t.strip.style.cursor = "pointer";
+  t.strip.onclick = () => {
+    t.strip.onclick = null;
+    t.strip.style.cursor = "";
+    setStrip(t, "restarting…", "warn");
+    api
+      .restartShell(t.info.id)
+      .then((info) => {
+        t.info = info;
+        if (t.term) t.term.options.disableStdin = false;
+        setStrip(t, "", "off");
+        paintBar();
+        notify();
+      })
+      .catch((e: unknown) => {
+        setStrip(t, e instanceof Error ? e.message : String(e), "warn");
+        deadStrip(t);
+      });
   };
 }
 
@@ -566,6 +615,7 @@ function ensureTerm(info: TerminalRow): Term {
     retryTimer: null,
     pingTimer: null,
     gone: false,
+    lastStamp: null,
   };
   terms.set(info.id, t);
   if (info.status === "exited") exitStrip(t);

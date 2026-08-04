@@ -231,6 +231,112 @@ waiting for you"). List rows with a live terminal reuse the same signal. No
 new plumbing — the PTY manager already sees every byte; expose timestamps on
 GET /api/terminals and let the client derive states.
 
+### tmux terminal pool (slice: durable terminals) — v2 after codex design review
+
+Terminals move from server-owned PTYs to tmux sessions on a dedicated socket
+(`tmux -L lhc-console`, tmux 3.4): sessions survive API-server restarts and
+browser absence, and are reachable from raw ssh. One session per terminal,
+flat, wrapping a durable shell. No idle timeouts; the running cap (8) counts
+live CLIs, idle shells are free.
+
+**Creation & relaunch — no send-keys anywhere.** Sessions are created with a
+wrapper as the pane command: `bash -lc \'eval "$LHC_CMD"; exec "$SHELL" -l\'`
+with the freshly computed recipe passed via the `LHC_CMD` environment variable
+(no nested quoting). CLI exit drops into a login shell automatically. Idle
+relaunch = `respawn-pane -k` with the same wrapper and a fresh recipe, gated
+by: per-session mutation lock (all pool mutations serialize through one
+queue), pane not dead, composite state says idle, no external (non-bridge)
+client attached — if a human is attached, refuse auto-resume and surface
+"attach in progress". Recipes are computed at (re)launch time, never stored.
+
+**State detection — composite, never just pane_current_command.** Internal
+states: `running`, `idle`, `busy/unknown`, `dead`, plus `cold` (no session).
+Idle requires: pane alive, the managed root shell is the pane tty\'s
+foreground process group leader, and no non-shell descendants. A pane whose
+foreground is `ssh` or a nested tmux client is `busy/unknown` (opaque): never
+auto-re-keyed, never auto-resumed, rendered as running. UI shows three states
+(launch/running/idle) + exited; busy renders as running.
+
+**Identity & ownership — tmux user options, not names or $ids.** Every
+console session carries `@lhc_uuid` (durable identity; tmux `session_id`
+values are reused across tmux-server restarts and are only a live handle),
+plus `@lhc_owner`, `@lhc_kind`, `@lhc_host`, `@lhc_thread`, schema version.
+The session *name* is display only: slug of current occupant + short uuid
+suffix, renamed on re-key; ops resolve uuid → live session_id and re-verify
+the marker before acting. Delete kills exactly that verified session.
+Unmarked sessions on our socket are listed as foreign, never touched.
+
+**Death & recovery.** `remain-on-exit on`: a dead pane is a recoverable
+`dead` state showing its final screen (capture-pane works even after a server
+restart — no transcript files needed; the conversation itself is already
+durably captured in the LHC thread). Offer "restart shell" (respawn into a
+login shell) and dismiss (kill). Server shutdown detaches bridge clients
+only — it must never kill sessions (the old SIGINT PTY-kill contract dies).
+
+**Reconciliation (boot).** Pool table in ~/.lhc-console keyed by @lhc_uuid.
+Matrix: marked+live-CLI → running (re-verify thread via process tree);
+marked+shell-at-prompt → idle; marked+unknown-fg → busy; marked+dead-pane →
+dead; catalog-without-session → exited tombstone; marked-session-without-
+catalog → adopt from its user options; unmarked → foreign; two sessions
+claiming one thread → conflict state, never silently pick. `GET
+/api/terminals` returns 503/retry until reconciliation completes (the web
+client treats missing rows as gone).
+
+**Re-keying (repurposed shells).** Poll pane states (one `list-panes -a -F`
+per ~3s tick while non-running sessions exist). On shell→CLI transition:
+process-tree match (pane_pid descendants vs the attach-detect argv matrix)
+resolves resumes; else the newborn registry watch keyed by
+`pane_current_path` + transition time resolves new threads. A re-key commits
+only after two consecutive agreeing scans (or argv match + registry event).
+Association frames carry host, threadId, previous identity, state, and a
+monotonic revision; clients ignore stale revisions. Cross-host repurposing
+updates hostId too. Hermes: profile+time only (softer, accepted).
+
+**Bridge.** One node-pty per terminal running `tmux -L lhc-console attach -f
+ignore-size -t <session>`; existing WS protocol stays (binary bytes/JSON
+control). Input/resize have a single owner: the most recent socket to claim
+it (focus-based); other viewers are read-only until they claim. Per-socket
+bounded output queues; slow clients evicted. Bridge restart never touches the
+session.
+
+**Sizing.** Bridge client always attaches ignore-size. No human client:
+`window-size manual`, browser resize messages drive `resize-window -x -y`.
+Human client attaches (client-attached hook / list-clients poll): switch to
+`window-size latest`, ignore browser resizes, mark the browser viewer
+secondary. Last human detaches: back to manual+browser.
+
+**Scrollback seeding (server restart).** If `#{alternate_on}`: no seed —
+attach redraw paints the TUI. Else: seed xterm with history above the
+visible screen only (capture-pane -e, trimmed), then attach paints the
+screen; snapshot/live sequence numbers prevent double-paint and mid-gap
+loss. While the server lives, the ring buffer keeps doing fast replay.
+`history-limit 50000` holds deep history in tmux copy-mode.
+
+**tmux options** (idempotent `set -g` after ensuring the socket server):
+`default-terminal tmux-256color` (verify terminfo exists on host),
+`escape-time 15` (not 0: WS/pty writes can split ESC sequences across
+event-loop turns), `extended-keys on`, `focus-events on`,
+`allow-passthrough on`, `status off`, `set-clipboard external`,
+`history-limit 50000`, `terminal-features \'xterm-256color:RGB:extkeys:focus\'`
+for the bridge\'s outer term. Scrub Claude session markers from tmux\'s global
+environment and `update-environment` so a long-lived tmux server cannot
+re-poison spawned CLIs (the node-pty spawn scrub alone no longer suffices).
+Kitty-protocol handling is verified with a real cc-lhc TUI, not assumed.
+
+**One-writer guard.** Own-terminal attribution moves from the node-pty pid
+(now merely the attach client) to each pool session\'s `pane_pid`; pane-tree
+descendants are ours. A descendant matching a *different* thread than the
+pool row triggers re-key, not suppression. Also fix the codex argv matcher
+to tolerate options between `resume` and the session id (bug: the launch
+command puts --dangerously-bypass-approvals-and-sandbox there and detection
+misses it).
+
+**Declined for v1** (revisit on evidence): shell-side command channel with
+prompt acknowledgment (respawn-pane covers launch; no keystroke synthesis
+remains), PROMPT_COMMAND readiness markers (shell-specific; the /proc
+composite with ambiguous→busy is shell-agnostic), transcript-to-disk
+persistence (LHC capture already owns durable history).
+
 ## API surface (server)
 
 Existing: `/api/hosts`, `/api/threads` (aggregated + quick stats, mtime-cached),

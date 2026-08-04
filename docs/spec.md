@@ -264,11 +264,13 @@ same-thread terminals; idle ones re-scan immediately before respawn.
 pane_current_command.** Internal states: `running`, `idle`, `busy/unknown`,
 `dead`, plus `cold` (no session). The wrapper installs a shell adapter for
 supported shells (bash `PROMPT_COMMAND`, zsh `precmd`) that stamps a
-readiness marker (`@lhc_ready` = monotonic timestamp) on the session at each
-prompt; the server clears its view of readiness whenever it forwards input
-to the pane. `idle` requires: pane alive, readiness newer than last
-forwarded input, foreground process group is the managed root shell, no
-non-shell descendants. This catches the /proc-invisible cases (long-running
+readiness **generation token** (`@lhc_ready` = per-prompt counter + shell
+pid — never a clock; comparing shell wall time with Node monotonic time is
+meaningless) on the session at each prompt. When the server forwards input
+to the pane it records the token it observed; `idle` requires: pane alive,
+current token present and _different from the recorded one_ (a new prompt
+was painted since the last input), foreground process group is the managed
+root shell, no non-shell descendants. This catches the /proc-invisible cases (long-running
 builtins, half-typed lines) — a stale marker means busy. Unsupported shells
 never auto-classify idle: their idle-click offers resume behind one explicit
 confirmation instead. A pane whose foreground is `ssh` or a nested tmux
@@ -319,8 +321,9 @@ else the newborn registry watch keyed by `pane_current_path` + transition
 time resolves new threads. A re-key commits only after two consecutive
 agreeing scans (or argv match + registry event). Association frames carry
 host, threadId, previous identity, state, and `(managerEpoch, revision)` —
-epoch is minted per server boot and persisted, so revisions survive
-restarts; clients ignore frames older than their last-seen pair.
+epoch is a monotonically increasing integer, incremented and persisted
+under `pool.lock` at each server boot; clients compare revisions only
+within an epoch and adopt any newer epoch as a fresh baseline.
 Cross-host repurposing updates hostId too. Hermes: profile+time only
 (softer, accepted).
 
@@ -338,7 +341,10 @@ session.
 `window-size manual`, browser resize messages drive `resize-window -x -y`.
 Human client attaches (client-attached hook / list-clients poll): switch to
 `window-size latest`; browser resizes ignored; viewer marked secondary.
-Last human detaches: back to manual+browser.
+Last human detaches: back to manual, and the server immediately issues
+`resize-window` from the owner socket's cached cols/rows — switching to
+manual alone would preserve the human client's last dimensions until the
+next browser resize event.
 
 **Scrollback seeding (server restart).** If `#{alternate_on}`: no seed —
 attach redraw paints the TUI. Else: seed history above the visible screen

@@ -118,6 +118,9 @@ set -g status off
 set -s set-clipboard external
 set -g history-limit 50000
 set -g remain-on-exit on
+# Wheel/trackpad: without this, tmux's alt-screen makes xterm.js translate
+# scroll into arrow keys. With it, the wheel scrolls tmux history naturally.
+set -g mouse on
 set -s terminal-features[100] 'xterm-256color:RGB:extkeys:focus'
 # Attach/detach hooks close the human-attachment observation window: the pool
 # re-observes within milliseconds instead of the 3s poll tick.

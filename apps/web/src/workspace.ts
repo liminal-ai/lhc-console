@@ -484,7 +484,14 @@ function attachTerm(t: Term): void {
     } else if (msg.type === "attachChanged") {
       t.info = { ...t.info, humanAttached: msg.humanAttached === true };
       if (msg.humanAttached) setStrip(t, "attached elsewhere — read-only", "warn");
+      else if (t.info.state === "dead")
+        deadStrip(t); // keep the restart affordance
       else setStrip(t, "", "off");
+    } else if (msg.type === "conflictChanged") {
+      t.info = { ...t.info, conflict: (msg as { conflict?: boolean }).conflict === true };
+      if (t.info.conflict) setStrip(t, "another terminal claims this thread", "warn");
+      else if (t.info.state === "dead") deadStrip(t);
+      else if (!t.info.humanAttached) setStrip(t, "", "off");
     } else if (msg.type === "inputSuspended") {
       setStrip(t, "attached elsewhere — read-only", "warn");
     } else if (msg.type === "inputDenied") {

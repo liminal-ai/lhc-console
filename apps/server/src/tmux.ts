@@ -67,8 +67,14 @@ fi
 sh=$LHC_SHELL
 [ -x "$sh" ] || sh=/bin/bash
 sock=\${LHC_TMUX_SOCKET:-lhc-console}
-# Readiness adapter: a NEW generation token at every prompt. bash only; other
-# shells simply never stamp, which classifies as busy (confirm-gated resume).
+# Record which readiness adapter this pane actually has: observation derives
+# adapterSupported from this instead of assuming. Non-bash shells get "none"
+# and never auto-classify idle (confirm-gated resume).
+case "$(basename "$sh")" in
+  bash) command tmux -L "$sock" set -p @lhc_adapter bash 2>/dev/null ;;
+  *) command tmux -L "$sock" set -p @lhc_adapter none 2>/dev/null ;;
+esac
+# Readiness adapter: a NEW generation token at every prompt (bash).
 export PROMPT_COMMAND='LHC_GEN=$((LHC_GEN+1)); command tmux -L '"$sock"' set -p @lhc_ready "\${LHC_GEN}.$$" 2>/dev/null'
 if [ -n "$cmd" ]; then
   eval "$cmd"
@@ -127,6 +133,13 @@ export async function ensureServer(): Promise<void> {
   writeFileSync(join(stateDir(), "wrapper.sh"), WRAPPER, { mode: 0o755 });
   writeFileSync(confPath(), confContent());
   writeFileSync(join(stateDir(), "attach-event"), "");
+  // A durable server that survived our restart still runs its OLD config —
+  // -f only applies at server start. Source the fresh one into it.
+  try {
+    await tmux(["source-file", confPath()]);
+  } catch {
+    // no server running: fine, -f covers the next start
+  }
   bootstrapped = true;
 }
 
@@ -211,7 +224,19 @@ export async function createSession(input: CreateSessionInput): Promise<CreatedS
     ["@lhc_host", input.hostId],
     ["@lhc_thread", input.threadId ?? ""],
   ];
-  for (const [k, v] of opts) await tmux(["set", "-t", sessionId, k, v]);
+  try {
+    for (const [k, v] of opts) await tmux(["set", "-t", sessionId, k, v]);
+  } catch (e) {
+    // A half-marked session would read as foreign forever. Kill exactly the
+    // session we just made, drop its command file, and report the failure.
+    await killSession(sessionId).catch(() => undefined);
+    try {
+      unlinkSync(cmdFile);
+    } catch {
+      // consumed already
+    }
+    throw e;
+  }
   return { uuid, sessionId, name };
 }
 
@@ -235,8 +260,22 @@ export async function renameSession(sessionId: string, label: string, uuid: stri
   await tmuxList(["rename-session", "-t", sessionId, displayName(label, uuid)]);
 }
 
+/**
+ * Strict kill: resolves only on confirmed kill or confirmed absence. Any
+ * other failure throws — DELETE must not report success over a live session.
+ */
 export async function killSession(sessionId: string): Promise<void> {
-  await tmuxList(["kill-session", "-t", sessionId]);
+  try {
+    await tmux(["kill-session", "-t", sessionId]);
+  } catch (e) {
+    const msg = String(e);
+    const absent =
+      msg.includes("no server running") ||
+      msg.includes("error connecting") ||
+      msg.includes("can't find session") ||
+      msg.includes("session not found");
+    if (!absent) throw e;
+  }
 }
 
 /** One-shot command file: the wrapper reads and deletes it. */
@@ -270,6 +309,11 @@ export async function respawnPane(
   }
 }
 
+/** Wipe the readiness marker (before respawn, so stale tokens cannot idle). */
+export async function clearReady(sessionId: string): Promise<void> {
+  await tmuxList(["set", "-p", "-t", sessionId, "@lhc_ready", ""]);
+}
+
 // --- observation --------------------------------------------------------------
 
 export interface TmuxPaneRow {
@@ -287,6 +331,8 @@ export interface TmuxPaneRow {
   currentPath: string;
   readyToken: string;
   attachedClients: number;
+  /** Which readiness adapter the wrapper installed: "bash" | "none" | "". */
+  adapter: string;
 }
 
 /*
@@ -310,6 +356,7 @@ const FMT = [
   "#{pane_current_path}",
   "#{@lhc_ready}",
   "#{session_attached}",
+  "#{@lhc_adapter}",
 ].join(SEP);
 
 /**
@@ -330,7 +377,7 @@ export async function listSessions(): Promise<TmuxPaneRow[]> {
   for (const line of out.split("\n")) {
     if (!line.trim()) continue;
     const f = line.split(SEP);
-    if (f.length < 14) continue;
+    if (f.length < 15) continue;
     rows.push({
       sessionId: f[0]!,
       sessionName: f[1]!,
@@ -346,6 +393,7 @@ export async function listSessions(): Promise<TmuxPaneRow[]> {
       currentPath: f[11] ?? "",
       readyToken: f[12] ?? "",
       attachedClients: Number(f[13]) || 0,
+      adapter: f[14] ?? "",
     });
   }
   return rows;

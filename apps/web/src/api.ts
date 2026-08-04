@@ -268,6 +268,8 @@ export interface TerminalRow {
   attachCommand?: string | null;
   /** A non-bridge tmux client (raw ssh attach) holds the session. */
   humanAttached?: boolean;
+  /** Another terminal claims the same thread; mutations refuse until resolved. */
+  conflict?: boolean;
   uuid?: string;
   epoch?: number;
 }

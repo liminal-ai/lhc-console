@@ -47,7 +47,12 @@ import {
   type RekeyPending,
   type ThreadSummary,
 } from "@lhc-console/core";
-import { detectAttachedOne, invalidateProcessScan, type OwnTerminal } from "./attach-detect.ts";
+import {
+  detectAttachedOne,
+  invalidateProcessScan,
+  matchesThread,
+  type OwnTerminal,
+} from "./attach-detect.ts";
 import { threadName } from "./prefs.ts";
 import * as tmx from "./tmux.ts";
 
@@ -177,7 +182,12 @@ async function acquirePoolLock(): Promise<void> {
           alive = false;
         }
       }
-      if (alive) throw new Error(`pool locked by pid ${holder}`);
+      if (alive) {
+        // A watcher handover: the old process may exit within a breath. Retry
+        // with backoff instead of failing the boot on the first sighting.
+        await new Promise((r) => setTimeout(r, 250 + attempt * 100));
+        continue;
+      }
       const grave = `${dir}.stale.${Math.random().toString(36).slice(2, 8)}`;
       try {
         renameSync(dir, grave);
@@ -412,7 +422,10 @@ async function observe(): Promise<void> {
   if (observing) return;
   observing = true;
   try {
-    await observeOnce();
+    // Snapshot AND application share the mutation lease: a session created
+    // after the snapshot but before application would otherwise read as
+    // missing and be falsely tombstoned.
+    await serialized(() => observeOnce());
   } finally {
     observing = false;
   }
@@ -434,6 +447,7 @@ async function observeOnce(): Promise<void> {
   }
   const byUuid = new Map(rows.filter((r) => r.uuid && r.owner).map((r) => [r.uuid!, r]));
   for (const [uuid, row] of byUuid) panePids.set(uuid, row.panePid);
+  let refIndex: RefIndexEntry[] | null = null;
   for (const t of terminals.values()) {
     if (t.state === "exited") continue;
     const row = byUuid.get(t.uuid);
@@ -458,7 +472,7 @@ async function observeOnce(): Promise<void> {
       hasNonShellDescendants: tmx.hasNonShellDescendants(row.panePid),
       readyToken: row.readyToken,
       recordedToken: t.recordedToken,
-      adapterSupported: true, // the wrapper always installs the bash adapter
+      adapterSupported: row.adapter === "bash",
     });
     const humanNow = row.attachedClients > (t.bridge ? 1 : 0);
     if (humanNow !== t.humanAttached) {
@@ -481,7 +495,8 @@ async function observeOnce(): Promise<void> {
     if (state === "running" && !opaque) {
       const due = transitioned || t.rekeyPending !== null || tick % IDENTITY_EVERY === 0;
       if (due) {
-        const observed = rekeyObserve(t, row);
+        refIndex ??= buildRefIndex();
+        const observed = rekeyObserve(t, row, refIndex);
         const current =
           observed !== null &&
           observed.hostId === t.threadRef.hostId &&
@@ -491,7 +506,7 @@ async function observeOnce(): Promise<void> {
         } else {
           const { pending, commit } = advanceRekey(t.rekeyPending, observed);
           t.rekeyPending = pending;
-          if (commit) await commitRekey(t, commit.hostId, commit.threadId);
+          if (commit) await commitRekeyLocked(t, commit.hostId, commit.threadId);
         }
       }
     } else {
@@ -504,10 +519,41 @@ function publicStateOf(t: Terminal): string {
   return t.state === "busy" ? "running" : t.state;
 }
 
-/** What is this pane running? Argv match against every thread's sessionRef. */
+interface RefIndexEntry {
+  hostId: string;
+  threadId: string;
+  ref: string | null;
+}
+
+/**
+ * One recipe index per observation tick, shared by every due terminal —
+ * recomputing all launch recipes per terminal multiplied the scan by the
+ * terminal count for identical answers.
+ */
+function buildRefIndex(): RefIndexEntry[] {
+  const out: RefIndexEntry[] = [];
+  for (const host of discoverHosts()) {
+    let threads: ThreadSummary[];
+    try {
+      threads = listThreads(host);
+    } catch {
+      continue;
+    }
+    for (const thread of threads) {
+      const recipe = launchRecipe(thread);
+      if (recipe?.sessionRef) {
+        out.push({ hostId: thread.hostId, threadId: thread.threadId, ref: recipe.sessionRef });
+      }
+    }
+  }
+  return out;
+}
+
+/** What is this pane running? Token-aware argv match against thread refs. */
 function rekeyObserve(
   t: Terminal,
   row: tmx.TmuxPaneRow,
+  refIndex: RefIndexEntry[],
 ): { hostId: string; threadId: string; source: "argv" | "registry" } | null {
   const pids = tmx.paneDescendants(row.panePid);
   const argvs: string[] = [];
@@ -519,20 +565,11 @@ function rekeyObserve(
     }
   }
   if (argvs.length === 0) return null;
-  for (const host of discoverHosts()) {
-    let threads: ThreadSummary[];
-    try {
-      threads = listThreads(host);
-    } catch {
-      continue;
-    }
-    for (const thread of threads) {
-      const recipe = launchRecipe(thread);
-      const ref = recipe?.sessionRef;
-      if (!ref) continue;
-      if (argvs.some((a) => a.includes(ref))) {
-        return { hostId: thread.hostId, threadId: thread.threadId, source: "argv" };
-      }
+  for (const entry of refIndex) {
+    // The host-specific matcher, not bare substring: an editor or script that
+    // merely CONTAINS a session id must not trigger a re-key.
+    if (argvs.some((a) => matchesThread(a, entry.hostId, entry.threadId, entry.ref))) {
+      return { hostId: entry.hostId, threadId: entry.threadId, source: "argv" };
     }
   }
   // Fallback: a brand-new session in this pane's cwd (registry newborn watch).
@@ -568,8 +605,9 @@ function takenThreadIds(): Set<string> {
   );
 }
 
-async function commitRekey(t: Terminal, hostId: string, threadId: string): Promise<void> {
-  await serialized(async () => {
+/** MUST be called inside serialized(). */
+async function commitRekeyLocked(t: Terminal, hostId: string, threadId: string): Promise<void> {
+  {
     let title: string | null = null;
     try {
       const host = discoverHosts().find((h) => h.id === hostId);
@@ -593,7 +631,8 @@ async function commitRekey(t: Terminal, hostId: string, threadId: string): Promi
       state: publicStateOf(t),
       ...stamp(),
     });
-  });
+  }
+  recomputeConflicts();
 }
 
 function markExited(t: Terminal): void {
@@ -603,6 +642,31 @@ function markExited(t: Terminal): void {
   broadcastControl(t, { type: "exit", exitCode: null, signal: null, ...stamp() });
   persistCatalog();
   if (t.removeOnExit) dropTerminal(t);
+  recomputeConflicts();
+}
+
+/**
+ * Conflicts are recomputed after every membership/identity change, not just
+ * at boot: dynamic re-keys can collide, and deleting one claimant must clear
+ * the survivor's flag. Changes broadcast stamped so clients stay truthful.
+ */
+function recomputeConflicts(): void {
+  const claims = new Map<string, Terminal[]>();
+  for (const t of terminals.values()) {
+    if (t.state === "exited" || !t.threadRef.threadId) continue;
+    const key = `${t.threadRef.hostId}/${t.threadRef.threadId}`;
+    const list = claims.get(key);
+    if (list) list.push(t);
+    else claims.set(key, [t]);
+  }
+  for (const t of terminals.values()) {
+    const key = t.threadRef.threadId ? `${t.threadRef.hostId}/${t.threadRef.threadId}` : "";
+    const now = t.state !== "exited" && (claims.get(key)?.length ?? 0) > 1;
+    if (now !== t.conflict) {
+      t.conflict = now;
+      broadcastControl(t, { type: "conflictChanged", conflict: now, ...stamp() });
+    }
+  }
 }
 
 function dropTerminal(t: Terminal): void {
@@ -694,6 +758,7 @@ async function createTerminalLocked(spec: CreateSpec): Promise<Terminal> {
     persistCatalog();
     startObserving();
     if (t.pending) startAssociationPoll();
+    recomputeConflicts();
     return t;
   }
 }
@@ -709,7 +774,7 @@ function pendingTerminals(): Terminal[] {
 
 function startAssociationPoll(): void {
   if (associateTimer) return;
-  associateTimer = setInterval(() => void pollAssociations(), ASSOCIATE_POLL_MS);
+  associateTimer = setInterval(() => void serialized(() => pollAssociations()), ASSOCIATE_POLL_MS);
   associateTimer.unref();
 }
 
@@ -783,7 +848,7 @@ async function pollAssociations(): Promise<void> {
       if (!hit) continue;
       taken.add(hit.threadId);
       t.pending = null;
-      await commitRekey(t, hostId, hit.threadId);
+      await commitRekeyLocked(t, hostId, hit.threadId);
     }
   }
   if (pendingTerminals().length === 0) stopAssociationPoll();
@@ -827,6 +892,7 @@ function newTerminalRecord(base: {
 }
 
 function classifyRow(row: tmx.TmuxPaneRow, recordedToken: string): PaneState {
+  // adapterSupported comes from the wrapper's own marker, never assumed.
   const fg = tmx.procForeground(row.panePid);
   return classifyPane({
     dead: row.paneDead,
@@ -836,7 +902,7 @@ function classifyRow(row: tmx.TmuxPaneRow, recordedToken: string): PaneState {
     hasNonShellDescendants: tmx.hasNonShellDescendants(row.panePid),
     readyToken: row.readyToken,
     recordedToken,
-    adapterSupported: true,
+    adapterSupported: row.adapter === "bash",
   });
 }
 
@@ -872,7 +938,7 @@ async function boot(): Promise<void> {
       uuid: r.uuid,
       sessionId: r.sessionId,
       owner: r.owner,
-      state: classifyRow(r, ""),
+      state: classifyRow(r, r.readyToken),
       threadFromOptions: r.threadId ? { hostId: r.hostId, threadId: r.threadId } : null,
     })),
   );
@@ -894,6 +960,10 @@ async function boot(): Promise<void> {
         createdAt: entry.createdAt,
         state: action.state,
       });
+      // Conservative: the pre-restart recorded token is gone, so treat the
+      // current marker as already-consumed — idle requires a NEW prompt.
+      t.recordedToken = row.readyToken;
+      t.lastSeenToken = row.readyToken;
       terminals.set(t.id, t);
       await bindLiveSession(t, row);
     } else if (action.kind === "adopt") {
@@ -908,8 +978,10 @@ async function boot(): Promise<void> {
         command: null,
         cwd: row.currentPath,
         createdAt: new Date().toISOString(),
-        state: classifyRow(row, ""),
+        state: classifyRow(row, row.readyToken),
       });
+      t.recordedToken = row.readyToken;
+      t.lastSeenToken = row.readyToken;
       terminals.set(t.id, t);
       await bindLiveSession(t, row);
     } else if (action.kind === "tombstone") {
@@ -976,11 +1048,20 @@ let bootPromise: Promise<void> | null = null;
 function ensureBoot(): Promise<void> {
   if (!bootPromise) {
     bootPromise = boot().catch((e) => {
-      ready = true; // serve empty rather than wedge; the error is logged
+      /*
+       * ready stays FALSE: a failed boot means no lease and no reconciled
+       * pool, and serving writes in that state mutates tmux unguarded. Every
+       * route answers 503 until a later boot attempt succeeds.
+       */
       console.error("terminal pool boot failed:", e);
+      bootPromise = null; // allow the next request to retry the boot
     });
   }
   return bootPromise;
+}
+
+function notReady(): { code: number; body: Record<string, unknown> } | null {
+  return ready ? null : { code: 503, body: { error: "terminal pool is not ready — retry" } };
 }
 
 // --- guard integration ---------------------------------------------------------
@@ -1118,7 +1199,7 @@ async function resumeIdleLocked(
       hasNonShellDescendants: tmx.hasNonShellDescendants(row.panePid),
       readyToken: row.readyToken,
       recordedToken: t.recordedToken,
-      adapterSupported: true,
+      adapterSupported: row.adapter === "bash",
     });
     if (freshState !== "idle") {
       return { code: 409, body: { error: "terminal is not idle", state: freshState } };
@@ -1144,7 +1225,14 @@ async function resumeIdleLocked(
     t.command = recipe.command;
     t.recordedToken = "";
     t.lastSeenToken = "";
+    await tmx.clearReady(t.sessionId);
     await tmx.respawnPane(t.sessionId, t.uuid, recipe.command);
+    try {
+      const fresh = (await tmx.listSessions()).find((x) => x.uuid === t.uuid);
+      if (fresh) panePids.set(t.uuid, fresh.panePid);
+    } catch {
+      // observation refreshes within a tick
+    }
     t.state = "running";
     broadcastControl(t, { type: "state", state: "running", ...stamp() });
     invalidateProcessScan();
@@ -1169,6 +1257,8 @@ export function registerTerminalRoutes(
 
   app.post("/api/terminals", async (req, reply) => {
     await ensureBoot();
+    const gate = notReady();
+    if (gate) return reply.code(gate.code).send(gate.body);
     const body = (req.body ?? {}) as {
       hostId?: string;
       threadId?: string;
@@ -1315,6 +1405,8 @@ export function registerTerminalRoutes(
 
   app.post("/api/terminals/:id/resume", async (req, reply) => {
     await ensureBoot();
+    const gate = notReady();
+    if (gate) return reply.code(gate.code).send(gate.body);
     const { id } = req.params as { id: string };
     const body = (req.body ?? {}) as { force?: boolean };
     const t = terminals.get(id);
@@ -1325,6 +1417,8 @@ export function registerTerminalRoutes(
 
   app.post("/api/terminals/:id/restart-shell", async (req, reply) => {
     await ensureBoot();
+    const gate = notReady();
+    if (gate) return reply.code(gate.code).send(gate.body);
     const { id } = req.params as { id: string };
     const t = terminals.get(id);
     if (!t) return reply.code(404).send({ error: "no such terminal" });
@@ -1345,12 +1439,21 @@ export function registerTerminalRoutes(
           };
         }
         t.sessionId = row.sessionId;
+        await tmx.clearReady(t.sessionId);
         await tmx.respawnPane(t.sessionId, t.uuid, null);
-        t.state = "idle";
+        // Busy until the fresh shell paints a prompt and stamps a NEW marker;
+        // observation flips it to idle. The old pane pid is dead — refresh.
+        t.state = "busy";
         t.command = null;
         t.recordedToken = "";
         t.lastSeenToken = "";
-        broadcastControl(t, { type: "state", state: "idle", ...stamp() });
+        try {
+          const fresh = (await tmx.listSessions()).find((x) => x.uuid === t.uuid);
+          if (fresh) panePids.set(t.uuid, fresh.panePid);
+        } catch {
+          // observation refreshes within a tick
+        }
+        broadcastControl(t, { type: "state", state: "running", ...stamp() });
         return { code: 200, body: publicView(t) };
       },
     );
@@ -1359,21 +1462,33 @@ export function registerTerminalRoutes(
 
   app.delete("/api/terminals/:id", async (req, reply) => {
     await ensureBoot();
+    const gate = notReady();
+    if (gate) return reply.code(gate.code).send(gate.body);
     const { id } = req.params as { id: string };
     const t = terminals.get(id);
     if (!t) return reply.code(404).send({ error: "no such terminal" });
-    await serialized(async () => {
-      if (t.sessionId) {
-        // Resolve + verify the marker before killing exactly that session.
-        const verified = await tmx.resolveVerified(t.uuid);
-        if (verified) await tmx.killSession(verified);
-        t.sessionId = null;
-      }
-      detachBridge(t);
-      t.state = "exited";
-      dropTerminal(t);
-    });
-    return { ok: true, id, status: "exited" };
+    const r = await serialized(
+      async (): Promise<{ code: number; body: Record<string, unknown> }> => {
+        if (t.sessionId) {
+          // Resolve + verify the marker before killing exactly that session.
+          // killSession is strict: success means confirmed dead or absent —
+          // never report a deletion the session may have survived.
+          try {
+            const verified = await tmx.resolveVerified(t.uuid);
+            if (verified) await tmx.killSession(verified);
+          } catch {
+            return { code: 503, body: { error: "could not kill the session — retry" } };
+          }
+          t.sessionId = null;
+        }
+        detachBridge(t);
+        t.state = "exited";
+        dropTerminal(t);
+        recomputeConflicts();
+        return { code: 200, body: { ok: true, id, status: "exited" } };
+      },
+    );
+    return reply.code(r.code).send(r.body);
   });
 
   app.get("/api/terminals/:id/ws", { websocket: true }, (socket: WebSocket, req) => {

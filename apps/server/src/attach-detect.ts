@@ -109,7 +109,7 @@ function hasToken(args: string, token: string): boolean {
  * count. A bare `cc-lhc` with no `--resume` could be attached to anything, so
  * it is not matched at all (see the misses noted in docs/spec.md).
  */
-function matchesThread(
+export function matchesThread(
   args: string,
   hostId: string,
   threadId: string,

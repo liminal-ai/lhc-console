@@ -243,12 +243,11 @@ hand — the cap gates what the console starts, it is not an invariant).
 
 **Creation & relaunch — no send-keys anywhere.** Sessions are created with a
 wrapper as the pane command (recipe passed via environment, no nested
-quoting; `LHC_SHELL` is validated server-side with `/bin/bash` fallback —
-never trust inherited `SHELL`):
+quoting; the shell is always /bin/bash — see State detection):
 
     cmd=$LHC_CMD; unset LHC_CMD
     eval "$cmd"
-    exec "$LHC_SHELL" -l
+    exec /bin/bash -l
 
 CLI exit drops into a login shell automatically. Idle relaunch =
 `respawn-pane -k` with the same wrapper and a freshly computed recipe

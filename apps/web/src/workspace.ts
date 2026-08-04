@@ -542,6 +542,10 @@ function attachTerm(t: Term): void {
  * lower-priority change can never erase a higher-priority warning.
  */
 function paintStrip(t: Term): void {
+  // deadStrip installs a click-to-restart handler; every repaint clears it so
+  // a conflict/human/clear strip can never carry a stale restart action.
+  t.strip.onclick = null;
+  t.strip.style.cursor = "";
   if (t.info.conflict) setStrip(t, "another terminal claims this thread", "warn");
   else if (t.info.humanAttached) setStrip(t, "attached elsewhere — read-only", "warn");
   else if (t.info.state === "dead") deadStrip(t);

@@ -52,6 +52,9 @@ const app = Fastify({ logger: { level: "info" } });
  */
 const statsCache = new Map<string, { mtime: string; stats: ThreadQuickStats }>();
 
+/** A zero-message thread this old is a shell that will never fill in. */
+const EMPTY_QUIESCENT_MS = 10 * 60_000;
+
 function cachedQuickStats(t: ThreadSummary): ThreadQuickStats | null {
   if (!t.fileMtime) return null;
   const hit = statsCache.get(t.filePath);
@@ -243,8 +246,15 @@ app.get("/api/quick-dirs", async () => {
 });
 
 app.get("/api/threads", async (req, reply) => {
-  const q = req.query as { host?: string; cwd?: string; q?: string; includeHidden?: string };
+  const q = req.query as {
+    host?: string;
+    cwd?: string;
+    q?: string;
+    includeHidden?: string;
+    includeEmpty?: string;
+  };
   const includeHidden = q.includeHidden === "1" || q.includeHidden === "true";
+  const includeEmpty = q.includeEmpty === "1" || q.includeEmpty === "true";
   const known = discoverHosts();
   const scoped = q.host ? known.filter((h) => h.id === q.host) : known;
   if (q.host && scoped.length === 0) return reply.code(404).send({ error: "unknown host" });
@@ -281,6 +291,26 @@ app.get("/api/threads", async (req, reply) => {
       attachments.get(`${t.hostId}/${t.threadId}`),
     ),
   }));
+  /*
+   * Threads with zero captured messages are shells, not sessions — hermes
+   * background-review/curator forks create the file at agent init with
+   * persistence disabled, so nothing can ever land in them (aborted sessions
+   * on other hosts leave the same debris). They are dropped outright — no UI
+   * toggle, by design. The age guard keeps a just-launched real session
+   * visible while its first turn is still being captured; a missing stats
+   * read (unreadable file) stays visible because that is an anomaly worth
+   * seeing. This filter lives here, not in core listThreads: the terminal
+   * newborn-association poll must keep seeing brand-new empty rows.
+   */
+  if (!includeEmpty) {
+    const quiescentBefore = Date.now() - EMPTY_QUIESCENT_MS;
+    enriched = enriched.filter(
+      (t) =>
+        !t.stats ||
+        t.stats.messageCount > 0 ||
+        Date.parse(t.fileMtime ?? t.createdAt) > quiescentBefore,
+    );
+  }
   if (q.q) {
     const needle = q.q.toLowerCase();
     enriched = enriched.filter(

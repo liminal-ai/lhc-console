@@ -9,7 +9,7 @@
 
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -99,7 +99,9 @@ function confPath(): string {
  * (re)start. It also shadows ~/.tmux.conf, so personal settings (e.g. the
  * user's escape-time 10) never leak into the pool server.
  */
-const CONF = `# lhc-console pool server — generated; do not edit (docs/spec.md tmux pool)
+function confContent(): string {
+  const evt = join(stateDir(), "attach-event");
+  return `# lhc-console pool server — generated; do not edit (docs/spec.md tmux pool)
 set -g default-terminal tmux-256color
 set -s escape-time 15
 set -s extended-keys on
@@ -110,14 +112,21 @@ set -s set-clipboard external
 set -g history-limit 50000
 set -g remain-on-exit on
 set -sa terminal-features 'xterm-256color:RGB:extkeys:focus'
+# Attach/detach hooks close the human-attachment observation window: the pool
+# re-observes within milliseconds instead of the 3s poll tick.
+set-hook -g client-attached 'run-shell "touch ${evt}"'
+set-hook -g client-detached 'run-shell "touch ${evt}"'
+set-hook -g client-session-changed 'run-shell "touch ${evt}"'
 `;
+}
 
 /** Idempotent: write config + wrapper. The server starts on first session. */
 export async function ensureServer(): Promise<void> {
   if (bootstrapped) return;
   mkdirSync(stateDir(), { recursive: true });
   writeFileSync(join(stateDir(), "wrapper.sh"), WRAPPER, { mode: 0o755 });
-  writeFileSync(confPath(), CONF);
+  writeFileSync(confPath(), confContent());
+  writeFileSync(join(stateDir(), "attach-event"), "");
   bootstrapped = true;
 }
 
@@ -183,7 +192,17 @@ export async function createSession(input: CreateSessionInput): Promise<CreatedS
     "bash",
     wrapperPath,
   ];
-  const sessionId = (await tmux(args)).trim();
+  let sessionId: string;
+  try {
+    sessionId = (await tmux(args)).trim();
+  } catch (e) {
+    try {
+      unlinkSync(cmdFile);
+    } catch {
+      // already consumed or never written
+    }
+    throw e;
+  }
   const opts: [string, string][] = [
     ["@lhc_uuid", uuid],
     ["@lhc_owner", OWNER],
@@ -236,10 +255,19 @@ export async function respawnPane(
   command: string | null,
 ): Promise<void> {
   const cmdFile = writeCmdFile(uuid, command);
-  await tmux(["set-environment", "-t", sessionId, "LHC_CMD_FILE", cmdFile]);
-  const wrapperPath = join(stateDir(), "wrapper.sh");
-  await tmux(["respawn-pane", "-k", "-t", sessionId, "bash", wrapperPath]);
-  await tmux(["set-environment", "-t", sessionId, "-r", "LHC_CMD_FILE"]);
+  try {
+    await tmux(["set-environment", "-t", sessionId, "LHC_CMD_FILE", cmdFile]);
+    const wrapperPath = join(stateDir(), "wrapper.sh");
+    await tmux(["respawn-pane", "-k", "-t", sessionId, "bash", wrapperPath]);
+    await tmux(["set-environment", "-t", sessionId, "-r", "LHC_CMD_FILE"]);
+  } catch (e) {
+    try {
+      unlinkSync(cmdFile);
+    } catch {
+      // already consumed
+    }
+    throw e;
+  }
 }
 
 // --- observation --------------------------------------------------------------
@@ -284,8 +312,20 @@ const FMT = [
   "#{session_attached}",
 ].join(SEP);
 
+/**
+ * Strict: only the canonical "no server running" maps to an empty list. Any
+ * other failure (transient exec, resource, format error) throws — callers
+ * must NOT interpret it as "all sessions gone" (that path tombstones panes).
+ */
 export async function listSessions(): Promise<TmuxPaneRow[]> {
-  const out = await tmuxList(["list-panes", "-a", "-F", FMT]);
+  let out = "";
+  try {
+    out = await tmux(["list-panes", "-a", "-F", FMT]);
+  } catch (e) {
+    const msg = String(e);
+    if (msg.includes("no server running") || msg.includes("error connecting")) return [];
+    throw e;
+  }
   const rows: TmuxPaneRow[] = [];
   for (const line of out.split("\n")) {
     if (!line.trim()) continue;

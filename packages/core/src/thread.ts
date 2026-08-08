@@ -17,6 +17,12 @@ export interface ThreadQuickStats {
   lastCompactAt: string | null;
   pendingWork: number;
   failedDerivations: number;
+  /**
+   * Non-deleted `user_prompt` messages. Zero on a thread that has other
+   * messages marks an agent-spawned sub-session (codex review swarms get
+   * their task as an agent message, never a user prompt).
+   */
+  userPromptCount: number;
   /** Short description: latest ready chunk_summary_brief, else first prompt. */
   summary: string | null;
 }
@@ -44,6 +50,9 @@ export function threadQuickStats(filePath: string): ThreadQuickStats {
     );
     const turns = one<{ c: number; closed: number }>(
       "select count(*) c, sum(status = 'closed') closed from turns where deleted_at is null",
+    );
+    const userPrompts = one<{ c: number }>(
+      "select count(*) c from message where deleted_at is null and kind = 'user_prompt'",
     );
     const view = one<{ last: string | null }>("select max(created_at) last from thread_view");
     const work = one<{ c: number }>("select count(*) c from work_item");
@@ -82,6 +91,7 @@ export function threadQuickStats(filePath: string): ThreadQuickStats {
       lastCompactAt: view.last,
       pendingWork: work.c,
       failedDerivations: failed.c,
+      userPromptCount: userPrompts.c,
       summary: threadSummaryText(db),
     };
   });

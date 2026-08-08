@@ -252,9 +252,11 @@ app.get("/api/threads", async (req, reply) => {
     q?: string;
     includeHidden?: string;
     includeEmpty?: string;
+    includeSubagents?: string;
   };
   const includeHidden = q.includeHidden === "1" || q.includeHidden === "true";
   const includeEmpty = q.includeEmpty === "1" || q.includeEmpty === "true";
+  const includeSubagents = q.includeSubagents === "1" || q.includeSubagents === "true";
   const known = discoverHosts();
   const scoped = q.host ? known.filter((h) => h.id === q.host) : known;
   if (q.host && scoped.length === 0) return reply.code(404).send({ error: "unknown host" });
@@ -280,17 +282,27 @@ app.get("/api/threads", async (req, reply) => {
     })),
     ownTerminals(),
   );
-  let enriched = threads.map((t) => ({
-    ...t,
-    hidden: isHidden(t.hostId, t.threadId),
-    custom: customName(t.hostId, t.threadId),
-    stats: cachedQuickStats(t),
-    launch: withAttach(
-      t.hostId,
-      recipes.get(`${t.hostId}/${t.threadId}`) ?? null,
-      attachments.get(`${t.hostId}/${t.threadId}`),
-    ),
-  }));
+  let enriched = threads.map((t) => {
+    const stats = cachedQuickStats(t);
+    return {
+      ...t,
+      hidden: isHidden(t.hostId, t.threadId),
+      custom: customName(t.hostId, t.threadId),
+      stats,
+      /**
+       * Agent-spawned sub-session: real captured traffic but not one user
+       * prompt (codex validation swarms get their task as an agent message).
+       * Excluded by default — they are host workers, not sessions the board
+       * exists for — and available under `includeSubagents=1`.
+       */
+      subagent: stats != null && stats.messageCount > 0 && stats.userPromptCount === 0,
+      launch: withAttach(
+        t.hostId,
+        recipes.get(`${t.hostId}/${t.threadId}`) ?? null,
+        attachments.get(`${t.hostId}/${t.threadId}`),
+      ),
+    };
+  });
   /*
    * Threads with zero captured messages are shells, not sessions — hermes
    * background-review/curator forks create the file at agent init with
@@ -302,6 +314,7 @@ app.get("/api/threads", async (req, reply) => {
    * seeing. This filter lives here, not in core listThreads: the terminal
    * newborn-association poll must keep seeing brand-new empty rows.
    */
+  if (!includeSubagents) enriched = enriched.filter((t) => !t.subagent);
   if (!includeEmpty) {
     const quiescentBefore = Date.now() - EMPTY_QUIESCENT_MS;
     enriched = enriched.filter(

@@ -66,9 +66,20 @@ const REGISTRY_HOST_IDS = [
 /** Registry-less hosts, discovered by scanning directories of thread files. */
 const SCAN_HOST_IDS = ["hermes"] as const;
 
+/**
+ * Hosts whose home is not `~/.{id}`. codex-lhc's live integration is the
+ * native fork writing under `~/.codex/lhc` (registry + threads); the retired
+ * TS wrapper's `~/.codex-lhc` registry rows were merged into the native
+ * registry 2026-08-07, so one host covers both eras.
+ */
+const HOME_OVERRIDES: Record<string, string[]> = {
+  "codex-lhc": [".codex", "lhc"],
+};
+
 function homeFor(id: string): string {
   const envKey = `${id.toUpperCase().replace(/-/g, "_")}_HOME`;
-  return process.env[envKey] ?? join(homedir(), `.${id}`);
+  const override = HOME_OVERRIDES[id];
+  return process.env[envKey] ?? join(homedir(), ...(override ?? [`.${id}`]));
 }
 
 /**

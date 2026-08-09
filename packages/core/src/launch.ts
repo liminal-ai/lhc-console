@@ -60,6 +60,16 @@ const LINEAGE: Record<string, LineageSpec> = {
  */
 const lineageCache = new Map<string, { key: string; byThread: Map<string, string> }>();
 
+/** The uuid stem of a thread file path, or null when the name is not a uuid. */
+function fileStemUuid(filePath: string): string | null {
+  const stem =
+    filePath
+      .split("/")
+      .at(-1)
+      ?.replace(/\.sqlite$/, "") ?? "";
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(stem) ? stem : null;
+}
+
 function lineageFor(hostId: string): Map<string, string> {
   const spec = LINEAGE[hostId];
   if (!spec) return new Map();
@@ -158,7 +168,10 @@ export function launchRecipe(thread: ThreadSummary): LaunchRecipe | null {
       };
     }
     case "codex-lhc": {
-      const sid = lineageFor("codex-lhc").get(thread.threadId);
+      // Lineage first; fall back to the thread file stem — the native fork
+      // names thread files by their codex session uuid, so the stem IS the
+      // session id (nothing writes the lineage side-db for this host today).
+      const sid = lineageFor("codex-lhc").get(thread.threadId) ?? fileStemUuid(thread.filePath);
       return sid
         ? {
             command: withCwd(
@@ -168,7 +181,7 @@ export function launchRecipe(thread: ThreadSummary): LaunchRecipe | null {
             sessionRef: sid,
           }
         : unavailable(
-            "no codex session lineage row for this thread, so the session id to resume is unknown",
+            "no codex session lineage row and the thread file is not named by a session uuid",
           );
     }
     case "hermes": {

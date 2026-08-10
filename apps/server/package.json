@@ -2,6 +2,9 @@
   "name": "@lhc-console/server",
   "version": "0.0.0",
   "private": true,
+  "bin": {
+    "lhc-monitor": "src/monitor-cli.ts"
+  },
   "type": "module",
   "scripts": {
     "dev": "node --watch src/index.ts",

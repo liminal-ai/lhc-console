@@ -1,5 +1,7 @@
 import Fastify from "fastify";
 import websocket from "@fastify/websocket";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import {
   browseDirs,
   discoverHosts,
@@ -40,11 +42,72 @@ import {
   registerTerminalRoutes,
   shutdownTerminals,
 } from "./terminals.ts";
-import { detectAttached, type AttachInfo } from "./attach-detect.ts";
+import {
+  detectAttached,
+  detectAttachedOne,
+  invalidateProcessScan,
+  type AttachInfo,
+} from "./attach-detect.ts";
+import { loadRelayToken } from "./relay-config.ts";
+import { executeRelayTarget } from "./relay-process.ts";
+import { registerRelayRoutes } from "./relay-routes.ts";
+import { RelayQueue, type RelayTarget } from "./relay.ts";
 
 const PORT = Number(process.env.LHC_CONSOLE_PORT ?? 5959);
 
 const app = Fastify({ logger: { level: "info" } });
+
+const consoleHome = process.env.LHC_CONSOLE_HOME ?? join(homedir(), ".lhc-console");
+const fable: RelayTarget = {
+  hostId: "pi-lhc",
+  threadId: "th_74de806aa356437f",
+  cwd: "/srv/work/long-horizon-context",
+  command: "pi-lhc",
+  args: ["--lhc-thread", "th_74de806aa356437f", "-p"],
+};
+
+const relayQueue = new RelayQueue({
+  dbPath: join(consoleHome, "relay.sqlite"),
+  targets: { fable },
+  isBusy: (target) => {
+    invalidateProcessScan();
+    return (
+      detectAttachedOne(
+        {
+          hostId: target.hostId,
+          threadId: target.threadId,
+          recipe: { command: target.command, sessionRef: target.threadId },
+        },
+        [],
+        { includeOwnProcesses: true },
+      ).attached.length > 0
+    );
+  },
+  execute: (target, prompt, signal) =>
+    executeRelayTarget(target, prompt, {
+      timeoutMs: Number(process.env.LHC_RELAY_TURN_TIMEOUT_MS ?? 30 * 60_000),
+      signal,
+    }),
+  deliver: async (job) => {
+    const message = `Fable relay reply\n\n${job.output ?? "(empty reply)"}`;
+    await executeRelayTarget(
+      {
+        hostId: "hermes",
+        threadId: "photon",
+        cwd: homedir(),
+        command: "hermes",
+        args: ["send", "--to", "photon"],
+        env: {
+          ...process.env,
+          HERMES_HOME:
+            process.env.LHC_RELAY_HERMES_HOME ?? join(homedir(), ".hermes", "profiles", "console"),
+        },
+      },
+      message,
+      { timeoutMs: 60_000 },
+    );
+  },
+});
 
 /**
  * Quick-stats cache keyed by thread file path + mtime, so the aggregated
@@ -145,6 +208,10 @@ function lookupThread(hostId: string, threadId: string): Lookup {
 
 await app.register(websocket);
 registerTerminalRoutes(app, lookupThread);
+registerRelayRoutes(app, {
+  queue: relayQueue,
+  token: loadRelayToken(consoleHome),
+});
 
 app.get("/api/hosts", async () => {
   const launchable = new Set(launchableHostIds(discoverHosts().map((h) => h.id)));
@@ -484,9 +551,11 @@ app.get("/api/threads/:hostId/:threadId/view-arrangement", async (req, reply) =>
 });
 
 for (const sig of ["SIGINT", "SIGTERM"] as const) {
-  process.once(sig, () => {
+  process.once(sig, async () => {
     shutdownTerminals();
-    void app.close().then(() => process.exit(0));
+    await app.close();
+    await relayQueue.close();
+    process.exit(0);
   });
 }
 

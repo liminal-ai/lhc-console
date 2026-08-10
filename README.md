@@ -17,6 +17,28 @@ and does not depend on the `lhc` SDK. Its operations live in
 | `apps/server`   | Fastify REST API (`/api/hosts`, `/api/threads`, thread detail/turns/messages/view) |
 | `apps/web`      | Vite front end — thread finder, turn/message navigation                            |
 
+## One-shot relay (loopback only)
+
+The server exposes a small authenticated job relay at `127.0.0.1:5959`. V1 has
+one configured target, `fable`, and serializes prompts into Fable's durable
+pi-lhc thread. Jobs remain `blocked` while another process holds that thread.
+
+On first server boot, an owner-only bearer token is created at
+`~/.lhc-console/relay-token` (or set `LHC_RELAY_TOKEN`). Synchronous call:
+
+```bash
+TOKEN=$(<~/.lhc-console/relay-token)
+curl -sS -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"Reply with one short sentence."}' \
+  http://127.0.0.1:5959/api/relay/targets/fable/jobs
+```
+
+For long turns, add `Prefer: respond-async`; the `202` response includes a job
+id and `Location`, and `GET /api/relay/jobs/:id` reports
+`queued|blocked|running|completed|failed`. Add `"notify":"photon"` for the
+completed reply to be sent to Console's configured Photon home channel.
+
 ## Development
 
 Two processes (Vite proxies `/api` to the server):

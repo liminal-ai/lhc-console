@@ -165,6 +165,11 @@ export interface OwnTerminal {
   threadId: string;
 }
 
+export interface DetectOptions {
+  /** Include matching descendants of this server (needed by the relay guard). */
+  includeOwnProcesses?: boolean;
+}
+
 /**
  * Detect attachments for a batch of threads with one process scan.
  *
@@ -174,6 +179,7 @@ export interface OwnTerminal {
 export function detectAttached(
   subjects: AttachSubject[],
   ownTerminals: OwnTerminal[] = [],
+  options: DetectOptions = {},
 ): Map<string, AttachInfo> {
   const wanted = subjects.filter((s) => s.recipe);
   const result = new Map<string, AttachInfo>();
@@ -230,7 +236,7 @@ export function detectAttached(
       const owner = ownerTerminal(p);
       // Our own shell-outs are not writers; our terminals are, and are listed
       // above as such — either way this row is not a stranger holding the id.
-      if (owner === null && isOurs(p)) continue;
+      if (owner === null && isOurs(p) && !options.includeOwnProcesses) continue;
       // Under one of our PTYs: it is that terminal, already listed above.
       if (owner !== null) continue;
       attached.push({
@@ -254,9 +260,12 @@ export function detectAttached(
 export function detectAttachedOne(
   subject: AttachSubject,
   ownTerminals: OwnTerminal[] = [],
+  options: DetectOptions = {},
 ): AttachInfo {
   return (
-    detectAttached([subject], ownTerminals).get(`${subject.hostId}/${subject.threadId}`) ?? {
+    detectAttached([subject], ownTerminals, options).get(
+      `${subject.hostId}/${subject.threadId}`,
+    ) ?? {
       attached: [],
       inUse: false,
       writerPolicy: writerPolicyFor(subject.hostId),

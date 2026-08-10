@@ -51,25 +51,21 @@ import {
 import { loadRelayToken } from "./relay-config.ts";
 import { executeRelayTarget } from "./relay-process.ts";
 import { registerRelayRoutes } from "./relay-routes.ts";
-import { RelayQueue, type RelayTarget } from "./relay.ts";
+import { RelayQueue } from "./relay.ts";
+import { loadAgentRegistry } from "./agent-registry.ts";
+import { PhotonConnectorManager } from "./photon-connector.ts";
 
 const PORT = Number(process.env.LHC_CONSOLE_PORT ?? 5959);
 
 const app = Fastify({ logger: { level: "info" } });
 
 const consoleHome = process.env.LHC_CONSOLE_HOME ?? join(homedir(), ".lhc-console");
-const fable: RelayTarget = {
-  hostId: "pi-lhc",
-  threadId: "th_74de806aa356437f",
-  cwd: "/srv/work/long-horizon-context",
-  command: "pi-lhc",
-  args: ["--lhc-thread", "th_74de806aa356437f", "-p"],
-  timeoutMs: Number(process.env.LHC_RELAY_FABLE_TIMEOUT_MS ?? 30 * 60_000),
-};
+const agentRegistry = loadAgentRegistry(consoleHome);
+const photonRef: { current: PhotonConnectorManager | null } = { current: null };
 
 const relayQueue = new RelayQueue({
   dbPath: join(consoleHome, "relay.sqlite"),
-  targets: { fable },
+  targets: agentRegistry.relayTargets,
   isBusy: (target) => {
     invalidateProcessScan();
     return (
@@ -86,25 +82,26 @@ const relayQueue = new RelayQueue({
   },
   execute: (target, prompt, signal) => executeRelayTarget(target, prompt, { signal }),
   deliver: async (job) => {
-    const message = `Fable relay reply\n\n${job.output ?? "(empty reply)"}`;
-    await executeRelayTarget(
-      {
-        hostId: "hermes",
-        threadId: "photon",
-        cwd: homedir(),
-        command: "hermes",
-        args: ["send", "--to", "photon"],
-        env: {
-          ...process.env,
-          HERMES_HOME:
-            process.env.LHC_RELAY_HERMES_HOME ?? join(homedir(), ".hermes", "profiles", "console"),
-        },
-      },
-      message,
-      { timeoutMs: 60_000 },
-    );
+    const agent = agentRegistry.agents.find((entry) => entry.id === job.target);
+    const spaceId = agent?.channels.photon?.notifySpaceId;
+    if (!spaceId) {
+      throw new Error(`agent ${job.target} has no channels.photon.notifySpaceId configured`);
+    }
+    if (!photonRef.current) {
+      throw new Error("photon connectors are not running");
+    }
+    const message = job.output ?? "(empty reply)";
+    await photonRef.current.send(job.target, spaceId, message);
   },
 });
+
+const photonConnectors = new PhotonConnectorManager({
+  agents: agentRegistry.agents,
+  consoleHome,
+  queue: relayQueue,
+});
+photonRef.current = photonConnectors;
+await photonConnectors.start();
 
 /**
  * Quick-stats cache keyed by thread file path + mtime, so the aggregated
@@ -550,6 +547,7 @@ app.get("/api/threads/:hostId/:threadId/view-arrangement", async (req, reply) =>
 for (const sig of ["SIGINT", "SIGTERM"] as const) {
   process.once(sig, async () => {
     shutdownTerminals();
+    await photonConnectors.stop();
     await app.close();
     await relayQueue.close();
     process.exit(0);

@@ -1,6 +1,7 @@
 import { timingSafeEqual } from "node:crypto";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { RelayJob, RelayQueue } from "./relay.ts";
+import { renderRelayPrompt } from "./relay-prompt.ts";
 
 interface RelayRouteOptions {
   queue: RelayQueue;
@@ -68,11 +69,6 @@ export function registerRelayRoutes(app: FastifyInstance, options: RelayRouteOpt
     if (!job) return reply.code(404).send({ error: "relay job not found" });
     return job;
   });
-}
-
-function renderRelayPrompt(prompt: string, channelContext?: string): string {
-  if (!channelContext) return prompt;
-  return `${channelContext}\n\n[New message]\n${prompt}`;
 }
 
 async function waitWithin(

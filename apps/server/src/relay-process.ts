@@ -11,7 +11,7 @@ export function executeRelayTarget(
   prompt: string,
   options: ExecuteOptions = {},
 ): Promise<string> {
-  const timeoutMs = options.timeoutMs ?? 20 * 60_000;
+  const timeoutMs = options.timeoutMs ?? target.timeoutMs ?? 20 * 60_000;
   return new Promise((resolve, reject) => {
     execFile(
       target.command,

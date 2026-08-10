@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import { RelayQueue } from "../src/relay.ts";
 
@@ -187,6 +188,51 @@ describe("RelayQueue", () => {
 
     await queue.close();
     expect(aborted).toBe(true);
+  });
+
+  it("marks an orphaned running job as indeterminate rather than definitely failed", async () => {
+    const dbPath = tempDb();
+    const seed = new DatabaseSync(dbPath);
+    seed.exec(`
+      CREATE TABLE relay_jobs (
+        id TEXT PRIMARY KEY, target TEXT NOT NULL, prompt TEXT NOT NULL,
+        status TEXT NOT NULL, output TEXT, error TEXT, created_at TEXT NOT NULL,
+        started_at TEXT, finished_at TEXT, notify TEXT, delivery_status TEXT,
+        delivery_error TEXT, owner_pid INTEGER
+      )
+    `);
+    const now = new Date().toISOString();
+    seed
+      .prepare(
+        `INSERT INTO relay_jobs
+         (id, target, prompt, status, created_at, started_at, owner_pid)
+         VALUES (?, ?, ?, 'running', ?, ?, ?)`,
+      )
+      .run("orphan", "fable", "possibly landed", now, now, 999_999_999);
+    seed.close();
+
+    const queue = new RelayQueue({
+      dbPath,
+      targets: {
+        fable: {
+          hostId: "pi-lhc",
+          threadId: "th_fable",
+          cwd: "/tmp",
+          command: "unused",
+          args: [],
+        },
+      },
+      isBusy: () => false,
+      execute: async () => "unused",
+      busyPollMs: 5,
+    });
+    try {
+      await expect.poll(() => queue.get("orphan")?.status).toBe("failed");
+      expect(queue.get("orphan")?.error).toContain("may have completed");
+      expect(queue.get("orphan")?.error).toContain("durable thread");
+    } finally {
+      await queue.close();
+    }
   });
 
   it("retries a pending human delivery after restart", async () => {

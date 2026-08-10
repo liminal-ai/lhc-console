@@ -12,6 +12,8 @@ export interface RelayTarget {
   command: string;
   /** Arguments before the prompt. The prompt is always appended as one argv item. */
   args: string[];
+  /** Maximum wall-clock time for one turn. */
+  timeoutMs?: number;
   env?: NodeJS.ProcessEnv;
 }
 
@@ -212,7 +214,8 @@ export class RelayQueue {
         this.#db
           .prepare(
             `UPDATE relay_jobs
-             SET status = 'failed', error = 'relay server stopped while the job was running',
+             SET status = 'failed',
+                 error = 'relay lost track of this job after restart; the turn may have completed — check the durable thread',
                  finished_at = ?
              WHERE id = ? AND status = 'running'`,
           )
@@ -235,6 +238,9 @@ export class RelayQueue {
           this.#defer(targetName);
           return;
         }
+        // The busy scan is advisory. An interactive writer can still attach
+        // before spawn; the LHC single-writer lock remains authoritative and
+        // its collision is surfaced as a failed relay job.
         const startedAt = new Date().toISOString();
         const claim = this.#db
           .prepare(

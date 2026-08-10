@@ -25,6 +25,15 @@ describe("executeRelayTarget", () => {
     );
   });
 
+  it("uses a target-specific timeout when the caller does not override it", async () => {
+    const slow = {
+      ...target,
+      timeoutMs: 20,
+      args: ["-e", "setTimeout(() => {}, 1000)"],
+    };
+    await expect(executeRelayTarget(slow, "ignored")).rejects.toThrow("timed out after 20ms");
+  });
+
   it("terminates a turn when shutdown aborts it", async () => {
     const controller = new AbortController();
     const slow = {

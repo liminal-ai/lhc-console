@@ -44,7 +44,18 @@ The relay prepends it using Hermes' read-only catch-up envelope—followed by
 `[New message]` and the addressed prompt—so console-hosted agents receive the
 same prompt shape as Hermes agents. The connector remains responsible for
 owner-only wake authorization, per-agent cursors, and durable group history;
-this endpoint only accepts an already-authorized addressed turn.
+this endpoint only accepts an already-authorized addressed turn. It must also
+pseudonymize participant identifiers, label unverified participants, and wrap
+their words as read-only background context before calling the relay. No
+connector may pass raw participant text through `channelContext` without that
+framing. A bearer holder already has full prompt authority, so the relay does
+not attempt to re-authorize or sanitize this trusted envelope.
+
+Turn timeouts are configured per target. Fable uses
+`LHC_RELAY_FABLE_TIMEOUT_MS` (30 minutes by default). If a relay process loses
+track of a running child across restart, the job is failed as indeterminate:
+the durable agent thread is canonical and may contain a completed turn even
+when relay telemetry does not.
 
 ## Development
 

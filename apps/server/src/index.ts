@@ -64,6 +64,7 @@ const fable: RelayTarget = {
   cwd: "/srv/work/long-horizon-context",
   command: "pi-lhc",
   args: ["--lhc-thread", "th_74de806aa356437f", "-p"],
+  timeoutMs: Number(process.env.LHC_RELAY_FABLE_TIMEOUT_MS ?? 30 * 60_000),
 };
 
 const relayQueue = new RelayQueue({
@@ -83,11 +84,7 @@ const relayQueue = new RelayQueue({
       ).attached.length > 0
     );
   },
-  execute: (target, prompt, signal) =>
-    executeRelayTarget(target, prompt, {
-      timeoutMs: Number(process.env.LHC_RELAY_TURN_TIMEOUT_MS ?? 30 * 60_000),
-      signal,
-    }),
+  execute: (target, prompt, signal) => executeRelayTarget(target, prompt, { signal }),
   deliver: async (job) => {
     const message = `Fable relay reply\n\n${job.output ?? "(empty reply)"}`;
     await executeRelayTarget(

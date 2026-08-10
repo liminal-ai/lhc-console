@@ -15,6 +15,19 @@ describe("executeRelayTarget", () => {
     await expect(executeRelayTarget(target, prompt, { timeoutMs: 1000 })).resolves.toBe(prompt);
   });
 
+  it("closes stdin so print-mode targets can observe EOF", async () => {
+    const waitsForEof = {
+      ...target,
+      args: [
+        "-e",
+        "process.stdin.resume(); process.stdin.on('end', () => process.stdout.write(process.argv[1]))",
+      ],
+    };
+    await expect(executeRelayTarget(waitsForEof, "after-eof", { timeoutMs: 1000 })).resolves.toBe(
+      "after-eof",
+    );
+  });
+
   it("terminates a turn that exceeds its timeout", async () => {
     const slow = {
       ...target,

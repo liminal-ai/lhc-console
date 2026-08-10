@@ -33,6 +33,7 @@ function setup() {
     isBusy: () => false,
     execute: async (_target, prompt) => `reply:${prompt}`,
   });
+  queue.start();
   queues.push(queue);
   const app = Fastify();
   apps.push(app);

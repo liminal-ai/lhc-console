@@ -1,10 +1,13 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import type { AgentRecord } from "../src/agent-registry.ts";
-import { PhotonConnector } from "../src/photon-connector.ts";
+import { GroupCatchUpStore } from "../src/group-catch-up.ts";
+import { PhotonConnector, type PhotonConnectorManager } from "../src/photon-connector.ts";
+import { deliverRelayJob } from "../src/relay-delivery.ts";
 import { RelayQueue, type RelayTarget } from "../src/relay.ts";
 
 type RelayExecute = (target: RelayTarget, prompt: string, signal: AbortSignal) => Promise<string>;
@@ -56,14 +59,36 @@ function agentRecord(): AgentRecord {
   };
 }
 
-function relayQueue(execute: RelayExecute): RelayQueue {
+function relayQueue(execute: RelayExecute, sidecar: FakeSidecar, consoleHome: string): RelayQueue {
   const dir = mkdtempSync(join(tmpdir(), "lhc-photon-relay-"));
   dirs.push(dir);
+  const photonConnectors = {
+    send: async (_agentId: string, spaceId: string, text: string) => {
+      const response = await fetch(`${sidecar.baseUrl}/send`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "X-Hermes-Sidecar-Token": sidecar.token,
+        },
+        body: JSON.stringify({ spaceId, text, format: "text" }),
+      });
+      if (!response.ok) throw new Error(`send failed with ${response.status}`);
+    },
+  } as PhotonConnectorManager;
   const queue = new RelayQueue({
     dbPath: join(dir, "relay.sqlite"),
     targets: { fable: agentRecord().relay },
     isBusy: () => false,
     execute,
+    deliver: async (job) => {
+      await deliverRelayJob(job, {
+        agents: [agentRecord()],
+        consoleHome,
+        photonConnectors,
+      });
+    },
+    busyPollMs: 5,
+    consoleHome,
   });
   queues.push(queue);
   return queue;
@@ -176,24 +201,44 @@ function groupEvent(
   };
 }
 
+async function startConnector(options: {
+  sidecar: FakeSidecar;
+  execute: RelayExecute;
+  backlogLimits?: { maxBacklogMessages?: number; maxBacklogBytes?: number };
+  spawnSidecar?: PhotonConnector["constructor"] extends new (opts: infer O) => unknown
+    ? O extends { spawnSidecar?: infer S }
+      ? S
+      : never
+    : never;
+}): Promise<{ connector: PhotonConnector; dir: string; queue: RelayQueue }> {
+  const dir = mkdtempSync(join(tmpdir(), "lhc-photon-connector-"));
+  dirs.push(dir);
+  const queue = relayQueue(options.execute, options.sidecar, dir);
+  const connector = new PhotonConnector({
+    agent: agentRecord(),
+    consoleHome: dir,
+    queue,
+    sidecar: { baseUrl: options.sidecar.baseUrl, token: options.sidecar.token },
+    backlogLimits: options.backlogLimits,
+    spawnSidecar: options.spawnSidecar,
+  });
+  connectors.push(connector);
+  await connector.start();
+  queue.start();
+  return { connector, dir, queue };
+}
+
 describe("PhotonConnector", () => {
   it("routes authorized owner DMs through relay and replies in the originating space", async () => {
     const sidecar = await startFakeSidecar();
     const prompts: string[] = [];
-    const queue = relayQueue(async (_target, prompt) => {
-      prompts.push(prompt);
-      return "agent reply";
+    await startConnector({
+      sidecar,
+      execute: async (_target, prompt) => {
+        prompts.push(prompt);
+        return "agent reply";
+      },
     });
-    const dir = mkdtempSync(join(tmpdir(), "lhc-photon-connector-"));
-    dirs.push(dir);
-    const connector = new PhotonConnector({
-      agent: agentRecord(),
-      consoleHome: dir,
-      queue,
-      sidecar: { baseUrl: sidecar.baseUrl, token: sidecar.token },
-    });
-    connectors.push(connector);
-    await connector.start();
     sidecar.pushInbound(dmEvent({ text: "status?" }));
     await expect.poll(() => prompts, { timeout: 1_000 }).toEqual(["status?"]);
     await expect
@@ -204,20 +249,13 @@ describe("PhotonConnector", () => {
   it("deduplicates replayed owner DMs by chat and message id", async () => {
     const sidecar = await startFakeSidecar();
     let calls = 0;
-    const queue = relayQueue(async (_target, prompt) => {
-      calls += 1;
-      return `reply:${prompt}`;
+    await startConnector({
+      sidecar,
+      execute: async (_target, prompt) => {
+        calls += 1;
+        return `reply:${prompt}`;
+      },
     });
-    const dir = mkdtempSync(join(tmpdir(), "lhc-photon-connector-"));
-    dirs.push(dir);
-    const connector = new PhotonConnector({
-      agent: agentRecord(),
-      consoleHome: dir,
-      queue,
-      sidecar: { baseUrl: sidecar.baseUrl, token: sidecar.token },
-    });
-    connectors.push(connector);
-    await connector.start();
     const event = dmEvent({ messageId: "dm-dup", text: "once" });
     sidecar.pushInbound(event);
     sidecar.pushInbound(event);
@@ -227,15 +265,49 @@ describe("PhotonConnector", () => {
       .toEqual([{ spaceId: "+15559876543", text: "reply:once" }]);
   });
 
-  it("drops unauthorized DMs without enqueueing relay work", async () => {
+  it("reclaims an inbound DM after a crash before durable enqueue", async () => {
     const sidecar = await startFakeSidecar();
     let calls = 0;
-    const queue = relayQueue(async () => {
-      calls += 1;
-      return "nope";
-    });
     const dir = mkdtempSync(join(tmpdir(), "lhc-photon-connector-"));
     dirs.push(dir);
+    const dedupePath = join(dir, "agents", "fable", "inbound-dedupe.sqlite");
+    mkdirSync(dirname(dedupePath), { recursive: true });
+    const seed = new DatabaseSync(dedupePath);
+    seed.exec(`
+      CREATE TABLE inbound_messages (
+        chat_id TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        state TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        owner_pid INTEGER,
+        owner_token TEXT,
+        lease_expires_at TEXT,
+        PRIMARY KEY (chat_id, message_id)
+      )
+    `);
+    seed
+      .prepare(
+        `INSERT INTO inbound_messages
+         (chat_id, message_id, state, updated_at, owner_pid, owner_token, lease_expires_at)
+         VALUES (?, ?, 'processing', ?, ?, ?, ?)`,
+      )
+      .run(
+        "+15559876543",
+        "dm-reclaim",
+        new Date().toISOString(),
+        999_999_999,
+        "dead",
+        new Date(Date.now() + 60_000).toISOString(),
+      );
+    seed.close();
+    const queue = relayQueue(
+      async (_target, prompt) => {
+        calls += 1;
+        return `reply:${prompt}`;
+      },
+      sidecar,
+      dir,
+    );
     const connector = new PhotonConnector({
       agent: agentRecord(),
       consoleHome: dir,
@@ -244,6 +316,21 @@ describe("PhotonConnector", () => {
     });
     connectors.push(connector);
     await connector.start();
+    queue.start();
+    sidecar.pushInbound(dmEvent({ messageId: "dm-reclaim", text: "retry" }));
+    await expect.poll(() => calls, { timeout: 1_000 }).toBe(1);
+  });
+
+  it("drops unauthorized DMs without enqueueing relay work", async () => {
+    const sidecar = await startFakeSidecar();
+    let calls = 0;
+    await startConnector({
+      sidecar,
+      execute: async () => {
+        calls += 1;
+        return "nope";
+      },
+    });
     sidecar.pushInbound(dmEvent({ senderId: "+15559999999", text: "intruder" }));
     await new Promise((resolve) => setTimeout(resolve, 100));
     expect(calls).toBe(0);
@@ -253,20 +340,13 @@ describe("PhotonConnector", () => {
   it("buffers untagged group messages and wakes with chronological catch-up", async () => {
     const sidecar = await startFakeSidecar();
     const prompts: string[] = [];
-    const queue = relayQueue(async (_target, prompt) => {
-      prompts.push(prompt);
-      return "group reply";
+    await startConnector({
+      sidecar,
+      execute: async (_target, prompt) => {
+        prompts.push(prompt);
+        return "group reply";
+      },
     });
-    const dir = mkdtempSync(join(tmpdir(), "lhc-photon-connector-"));
-    dirs.push(dir);
-    const connector = new PhotonConnector({
-      agent: agentRecord(),
-      consoleHome: dir,
-      queue,
-      sidecar: { baseUrl: sidecar.baseUrl, token: sidecar.token },
-    });
-    connectors.push(connector);
-    await connector.start();
     sidecar.pushInbound(
       groupEvent({ messageId: "g1", senderId: "+15550000001", text: "earlier point" }),
     );
@@ -290,22 +370,15 @@ describe("PhotonConnector", () => {
     const sidecar = await startFakeSidecar();
     const prompts: string[] = [];
     let attempts = 0;
-    const queue = relayQueue(async (_target, prompt) => {
-      prompts.push(prompt);
-      attempts += 1;
-      if (attempts === 1) throw new Error("relay failed");
-      return "group reply";
+    await startConnector({
+      sidecar,
+      execute: async (_target, prompt) => {
+        prompts.push(prompt);
+        attempts += 1;
+        if (attempts === 1) throw new Error("relay failed");
+        return "group reply";
+      },
     });
-    const dir = mkdtempSync(join(tmpdir(), "lhc-photon-connector-"));
-    dirs.push(dir);
-    const connector = new PhotonConnector({
-      agent: agentRecord(),
-      consoleHome: dir,
-      queue,
-      sidecar: { baseUrl: sidecar.baseUrl, token: sidecar.token },
-    });
-    connectors.push(connector);
-    await connector.start();
     sidecar.pushInbound(groupEvent({ messageId: "bg-1", text: "background" }));
     sidecar.pushInbound(groupEvent({ messageId: "wake-1", text: "fable try again" }));
     await expect.poll(() => prompts.length, { timeout: 1_000 }).toBe(1);
@@ -319,15 +392,42 @@ describe("PhotonConnector", () => {
       .toEqual([{ spaceId: "chat-guid-group", text: "group reply" }]);
   });
 
-  it("ignores reactions and polls without waking or buffering", async () => {
+  it("advances group backlog only after successful reply delivery", async () => {
     const sidecar = await startFakeSidecar();
-    let calls = 0;
-    const queue = relayQueue(async () => {
-      calls += 1;
-      return "unused";
-    });
     const dir = mkdtempSync(join(tmpdir(), "lhc-photon-connector-"));
     dirs.push(dir);
+    let deliverAttempts = 0;
+    const relayDb = join(dir, "relay.sqlite");
+    const photonConnectors = {
+      send: async (_agentId: string, spaceId: string, text: string) => {
+        deliverAttempts += 1;
+        if (deliverAttempts === 1) throw new Error("send failed");
+        const response = await fetch(`${sidecar.baseUrl}/send`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "X-Hermes-Sidecar-Token": sidecar.token,
+          },
+          body: JSON.stringify({ spaceId, text, format: "text" }),
+        });
+        if (!response.ok) throw new Error(`send failed with ${response.status}`);
+      },
+    } as PhotonConnectorManager;
+    const queue = new RelayQueue({
+      dbPath: relayDb,
+      targets: { fable: agentRecord().relay },
+      isBusy: () => false,
+      execute: async () => "group reply",
+      deliver: async (job) => {
+        await deliverRelayJob(job, {
+          agents: [agentRecord()],
+          consoleHome: dir,
+          photonConnectors,
+        });
+      },
+      busyPollMs: 5,
+    });
+    queues.push(queue);
     const connector = new PhotonConnector({
       agent: agentRecord(),
       consoleHome: dir,
@@ -336,6 +436,27 @@ describe("PhotonConnector", () => {
     });
     connectors.push(connector);
     await connector.start();
+    queue.start();
+    const catchUp = new GroupCatchUpStore(join(dir, "agents", "fable", "group-catch-up.sqlite"));
+    sidecar.pushInbound(groupEvent({ messageId: "bg-1", text: "background" }));
+    sidecar.pushInbound(groupEvent({ messageId: "wake-1", text: "fable hello" }));
+    await expect.poll(() => deliverAttempts, { timeout: 1_000 }).toBe(1);
+    expect(catchUp.pendingMessageIds("chat-guid-group")).toEqual(["bg-1"]);
+    await expect
+      .poll(() => catchUp.pendingMessageIds("chat-guid-group"), { timeout: 2_000 })
+      .toEqual([]);
+  });
+
+  it("ignores reactions and polls without waking or buffering", async () => {
+    const sidecar = await startFakeSidecar();
+    let calls = 0;
+    await startConnector({
+      sidecar,
+      execute: async () => {
+        calls += 1;
+        return "unused";
+      },
+    });
     sidecar.pushInbound({
       messageId: "rx-1",
       platform: "iMessage",
@@ -356,22 +477,76 @@ describe("PhotonConnector", () => {
     expect(calls).toBe(0);
   });
 
+  it("shuts down within a bounded time without waiting on relay execution", async () => {
+    const sidecar = await startFakeSidecar();
+    const { connector } = await startConnector({
+      sidecar,
+      execute: async (_target, _prompt, signal) =>
+        new Promise((resolve, reject) => {
+          const timer = setTimeout(() => resolve("late"), 5_000);
+          signal.addEventListener("abort", () => {
+            clearTimeout(timer);
+            reject(new Error("aborted"));
+          });
+        }),
+    });
+    sidecar.pushInbound(dmEvent({ text: "slow" }));
+    const started = Date.now();
+    await connector.stop();
+    expect(Date.now() - started).toBeLessThan(2_500);
+  });
+
   it("shuts down without leaving inbound handlers running", async () => {
     const sidecar = await startFakeSidecar();
-    const queue = relayQueue(async () => "ok");
+    const { connector } = await startConnector({
+      sidecar,
+      execute: async () => "ok",
+    });
+    await connector.stop();
+    sidecar.pushInbound(dmEvent({ text: "late" }));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(sidecar.sent).toEqual([]);
+  });
+
+  it("refuses oversized group wake while retaining backlog", async () => {
+    const sidecar = await startFakeSidecar();
     const dir = mkdtempSync(join(tmpdir(), "lhc-photon-connector-"));
     dirs.push(dir);
+    const catchUpPath = join(dir, "agents", "fable", "group-catch-up.sqlite");
+    const seed = new GroupCatchUpStore(catchUpPath, { maxBacklogMessages: 10 });
+    seed.append("chat-guid-group", {
+      messageId: "bg-1",
+      senderId: "+15550000001",
+      text: "one",
+      timestamp: "2026-01-01T00:00:00.000Z",
+      senderAuthorized: false,
+    });
+    seed.append("chat-guid-group", {
+      messageId: "bg-2",
+      senderId: "+15550000001",
+      text: "two",
+      timestamp: "2026-01-01T00:00:01.000Z",
+      senderAuthorized: false,
+    });
+    const queue = relayQueue(async () => "unused", sidecar, dir);
     const connector = new PhotonConnector({
       agent: agentRecord(),
       consoleHome: dir,
       queue,
       sidecar: { baseUrl: sidecar.baseUrl, token: sidecar.token },
+      backlogLimits: { maxBacklogMessages: 1 },
     });
     connectors.push(connector);
     await connector.start();
-    await connector.stop();
-    sidecar.pushInbound(dmEvent({ text: "late" }));
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(sidecar.sent).toEqual([]);
+    queue.start();
+    sidecar.pushInbound(groupEvent({ messageId: "wake-1", text: "fable wake" }));
+    await expect
+      .poll(() => sidecar.sent, { timeout: 1_000 })
+      .toEqual([
+        {
+          spaceId: "chat-guid-group",
+          text: "group backlog has 2 messages, exceeding the safety limit of 1; wake refused; backlog retained.",
+        },
+      ]);
   });
 });

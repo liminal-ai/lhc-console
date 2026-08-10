@@ -52,6 +52,7 @@ import { loadRelayToken } from "./relay-config.ts";
 import { executeRelayTarget } from "./relay-process.ts";
 import { registerRelayRoutes } from "./relay-routes.ts";
 import { RelayQueue } from "./relay.ts";
+import { deliverRelayJob } from "./relay-delivery.ts";
 import { loadAgentRegistry } from "./agent-registry.ts";
 import { PhotonConnectorManager } from "./photon-connector.ts";
 
@@ -61,6 +62,7 @@ const app = Fastify({ logger: { level: "info" } });
 
 const consoleHome = process.env.LHC_CONSOLE_HOME ?? join(homedir(), ".lhc-console");
 const agentRegistry = loadAgentRegistry(consoleHome);
+const relayToken = loadRelayToken(consoleHome);
 const photonRef: { current: PhotonConnectorManager | null } = { current: null };
 
 const relayQueue = new RelayQueue({
@@ -82,17 +84,13 @@ const relayQueue = new RelayQueue({
   },
   execute: (target, prompt, signal) => executeRelayTarget(target, prompt, { signal }),
   deliver: async (job) => {
-    const agent = agentRegistry.agents.find((entry) => entry.id === job.target);
-    const spaceId = agent?.channels.photon?.notifySpaceId;
-    if (!spaceId) {
-      throw new Error(`agent ${job.target} has no channels.photon.notifySpaceId configured`);
-    }
-    if (!photonRef.current) {
-      throw new Error("photon connectors are not running");
-    }
-    const message = job.output ?? "(empty reply)";
-    await photonRef.current.send(job.target, spaceId, message);
+    await deliverRelayJob(job, {
+      agents: agentRegistry.agents,
+      consoleHome,
+      photonConnectors: photonRef.current,
+    });
   },
+  consoleHome,
 });
 
 const photonConnectors = new PhotonConnectorManager({
@@ -102,6 +100,7 @@ const photonConnectors = new PhotonConnectorManager({
 });
 photonRef.current = photonConnectors;
 await photonConnectors.start();
+relayQueue.start();
 
 /**
  * Quick-stats cache keyed by thread file path + mtime, so the aggregated
@@ -204,7 +203,7 @@ await app.register(websocket);
 registerTerminalRoutes(app, lookupThread);
 registerRelayRoutes(app, {
   queue: relayQueue,
-  token: loadRelayToken(consoleHome),
+  token: relayToken,
 });
 
 app.get("/api/hosts", async () => {
@@ -547,9 +546,9 @@ app.get("/api/threads/:hostId/:threadId/view-arrangement", async (req, reply) =>
 for (const sig of ["SIGINT", "SIGTERM"] as const) {
   process.once(sig, async () => {
     shutdownTerminals();
+    await relayQueue.close();
     await photonConnectors.stop();
     await app.close();
-    await relayQueue.close();
     process.exit(0);
   });
 }

@@ -1,6 +1,7 @@
 import { chmodSync, closeSync, existsSync, mkdirSync, openSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { ensureColumn, runExclusiveMigration } from "./sqlite-migrate.ts";
 
 const CATCH_UP_HEADER = "[Group messages since your last reply]";
 const UNVERIFIED_NOTICE =
@@ -11,6 +12,71 @@ export class GroupCatchUpStoreError extends Error {
     super(message, options);
     this.name = "GroupCatchUpStoreError";
   }
+}
+
+export class GroupBacklogLimitError extends GroupCatchUpStoreError {
+  constructor(message: string) {
+    super(message);
+    this.name = "GroupBacklogLimitError";
+  }
+}
+
+export interface GroupCatchUpLimits {
+  maxBacklogMessages?: number;
+  maxBacklogBytes?: number;
+}
+
+export const DEFAULT_MAX_BACKLOG_MESSAGES = 100_000;
+export const DEFAULT_MAX_BACKLOG_BYTES = 100 * 1024 * 1024;
+
+export interface GroupWakeDeliveryMetadata extends Record<string, unknown> {
+  kind: "photon_group_wake";
+  spaceId: string;
+  wakeMessageId: string;
+  consumedIds: string[];
+  fallback: {
+    messageId: string;
+    senderId: string | null;
+    text: string;
+    timestamp: string;
+  };
+}
+
+export function resolveBacklogLimits(overrides: GroupCatchUpLimits = {}): GroupCatchUpLimits {
+  return {
+    maxBacklogMessages: parsePositiveLimit(
+      overrides.maxBacklogMessages,
+      process.env.LHC_PHOTON_MAX_BACKLOG_MESSAGES,
+      DEFAULT_MAX_BACKLOG_MESSAGES,
+    ),
+    maxBacklogBytes: parsePositiveLimit(
+      overrides.maxBacklogBytes,
+      process.env.LHC_PHOTON_MAX_BACKLOG_BYTES,
+      DEFAULT_MAX_BACKLOG_BYTES,
+    ),
+  };
+}
+
+function parsePositiveLimit(
+  override: number | undefined,
+  envValue: string | undefined,
+  fallback: number,
+): number {
+  if (override !== undefined) {
+    return normalizePositiveLimit(override, fallback);
+  }
+  if (envValue === undefined || envValue === "") {
+    return fallback;
+  }
+  const parsed = Number(envValue);
+  return normalizePositiveLimit(parsed, fallback);
+}
+
+function normalizePositiveLimit(value: number, fallback: number): number {
+  if (!Number.isFinite(value) || value <= 0 || !Number.isInteger(value)) {
+    return fallback;
+  }
+  return value;
 }
 
 interface AppendInput {
@@ -30,35 +96,48 @@ interface BacklogRow {
 
 export class GroupCatchUpStore {
   readonly #dbPath: string;
+  readonly #limits: GroupCatchUpLimits;
 
-  constructor(dbPath: string) {
+  constructor(dbPath: string, limits: GroupCatchUpLimits = {}) {
     this.#dbPath = dbPath;
+    this.#limits = resolveBacklogLimits(limits);
   }
 
   append(chatId: string, input: AppendInput): boolean {
     if (!input.messageId) return false;
+    const textBytes = Buffer.byteLength(input.text, "utf8");
     return this.#withDb((db) => {
-      const participantLabel = this.#participantLabel(db, chatId, input.senderId);
-      const result = db
-        .prepare(
-          `INSERT OR IGNORE INTO backlog_messages (
-             message_id, chat_id, participant_label, text, timestamp, sender_authorized
-           ) VALUES (?, ?, ?, ?, ?, ?)`,
-        )
-        .run(
-          input.messageId,
-          chatId,
-          participantLabel,
-          input.text,
-          input.timestamp,
-          authorizedToDb(input.senderAuthorized),
-        );
-      return result.changes === 1;
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        this.#assertAppendAllowed(db, chatId, textBytes);
+        const participantLabel = this.#participantLabel(db, chatId, input.senderId);
+        const result = db
+          .prepare(
+            `INSERT OR IGNORE INTO backlog_messages (
+               message_id, chat_id, participant_label, text, timestamp, sender_authorized, text_bytes
+             ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            input.messageId,
+            chatId,
+            participantLabel,
+            input.text,
+            input.timestamp,
+            authorizedToDb(input.senderAuthorized),
+            textBytes,
+          );
+        db.exec("COMMIT");
+        return result.changes === 1;
+      } catch (error) {
+        db.exec("ROLLBACK");
+        throw error;
+      }
     });
   }
 
   readWakeSnapshot(chatId: string): [string | null, string[]] {
     return this.#withDb((db) => {
+      this.#assertWakeAllowed(db, chatId);
       const rows = db
         .prepare(
           `SELECT message_id, participant_label, text, sender_authorized
@@ -93,20 +172,28 @@ export class GroupCatchUpStore {
     if (!wakeMessageId) return;
     try {
       this.#withDb((db) => {
-        if (consumedIds.length) {
-          const placeholders = consumedIds.map(() => "?").join(", ");
+        db.exec("BEGIN IMMEDIATE");
+        try {
+          if (consumedIds.length) {
+            const placeholders = consumedIds.map(() => "?").join(", ");
+            db.prepare(
+              `DELETE FROM backlog_messages
+               WHERE chat_id = ? AND message_id IN (${placeholders})`,
+            ).run(chatId, ...consumedIds);
+          }
           db.prepare(
-            `DELETE FROM backlog_messages
-             WHERE chat_id = ? AND message_id IN (${placeholders})`,
-          ).run(chatId, ...consumedIds);
+            `INSERT INTO chat_cursors (chat_id, cursor_message_id)
+             VALUES (?, ?)
+             ON CONFLICT(chat_id) DO UPDATE SET cursor_message_id = excluded.cursor_message_id`,
+          ).run(chatId, wakeMessageId);
+          db.exec("COMMIT");
+        } catch (error) {
+          db.exec("ROLLBACK");
+          throw error;
         }
-        db.prepare(
-          `INSERT INTO chat_cursors (chat_id, cursor_message_id)
-           VALUES (?, ?)
-           ON CONFLICT(chat_id) DO UPDATE SET cursor_message_id = excluded.cursor_message_id`,
-        ).run(chatId, wakeMessageId);
       });
     } catch (error) {
+      if (error instanceof GroupCatchUpStoreError) throw error;
       throw new GroupCatchUpStoreError(
         `could not advance group catch-up cursor for ${chatId}: ${error instanceof Error ? error.message : String(error)}`,
         { cause: error },
@@ -114,15 +201,66 @@ export class GroupCatchUpStore {
     }
   }
 
+  #assertWakeAllowed(db: DatabaseSync, chatId: string): void {
+    const row = this.#backlogTotals(db, chatId);
+    this.#assertWithinLimits(row.n, row.bytes);
+  }
+
+  #assertAppendAllowed(db: DatabaseSync, chatId: string, incomingBytes: number): void {
+    const row = this.#backlogTotals(db, chatId);
+    const maxMessages = this.#limits.maxBacklogMessages ?? DEFAULT_MAX_BACKLOG_MESSAGES;
+    const maxBytes = this.#limits.maxBacklogBytes ?? DEFAULT_MAX_BACKLOG_BYTES;
+    if (row.n >= maxMessages) {
+      throw new GroupBacklogLimitError(
+        `group backlog has ${row.n} messages, at the safety limit of ${maxMessages}; append refused`,
+      );
+    }
+    if (row.bytes + incomingBytes > maxBytes) {
+      throw new GroupBacklogLimitError(
+        `group backlog is ${row.bytes} bytes, adding ${incomingBytes} would exceed the safety limit of ${maxBytes}; append refused`,
+      );
+    }
+  }
+
+  #assertWithinLimits(messageCount: number, byteCount: number): void {
+    const maxMessages = this.#limits.maxBacklogMessages ?? DEFAULT_MAX_BACKLOG_MESSAGES;
+    const maxBytes = this.#limits.maxBacklogBytes ?? DEFAULT_MAX_BACKLOG_BYTES;
+    if (messageCount > maxMessages) {
+      throw new GroupBacklogLimitError(
+        `group backlog has ${messageCount} messages, exceeding the safety limit of ${maxMessages}; wake refused`,
+      );
+    }
+    if (byteCount > maxBytes) {
+      throw new GroupBacklogLimitError(
+        `group backlog is ${byteCount} bytes, exceeding the safety limit of ${maxBytes}; wake refused`,
+      );
+    }
+  }
+
+  #backlogTotals(db: DatabaseSync, chatId: string): { n: number; bytes: number } {
+    const row = db
+      .prepare(
+        `SELECT COUNT(*) AS n, COALESCE(SUM(text_bytes), 0) AS bytes
+         FROM backlog_messages
+         WHERE chat_id = ?`,
+      )
+      .get(chatId) as { n: number; bytes: number };
+    return { n: Number(row.n), bytes: Number(row.bytes) };
+  }
+
   #participantLabel(db: DatabaseSync, chatId: string, senderId: string): string {
     const existing = db
       .prepare("SELECT label FROM chat_participants WHERE chat_id = ? AND sender_id = ?")
       .get(chatId, senderId) as { label: string } | undefined;
     if (existing) return existing.label;
-    const countRow = db
-      .prepare("SELECT COUNT(*) AS n FROM chat_participants WHERE chat_id = ?")
-      .get(chatId) as { n: number };
-    const label = `participant-${Number(countRow.n) + 1}`;
+    const maxRow = db
+      .prepare(
+        `SELECT COALESCE(MAX(CAST(SUBSTR(label, 13) AS INTEGER)), 0) AS max_n
+         FROM chat_participants
+         WHERE chat_id = ? AND label GLOB 'participant-[0-9]*'`,
+      )
+      .get(chatId) as { max_n: number };
+    const label = `participant-${Number(maxRow.max_n) + 1}`;
     db.prepare("INSERT INTO chat_participants (chat_id, sender_id, label) VALUES (?, ?, ?)").run(
       chatId,
       senderId,
@@ -159,6 +297,7 @@ export class GroupCatchUpStore {
   #initialize(db: DatabaseSync): void {
     db.exec(`
       PRAGMA journal_mode = WAL;
+      PRAGMA busy_timeout = 5000;
       CREATE TABLE IF NOT EXISTS chat_cursors (
         chat_id TEXT PRIMARY KEY,
         cursor_message_id TEXT NOT NULL
@@ -177,11 +316,25 @@ export class GroupCatchUpStore {
         text TEXT NOT NULL,
         timestamp TEXT NOT NULL,
         sender_authorized INTEGER,
+        text_bytes INTEGER NOT NULL DEFAULT 0,
         UNIQUE(chat_id, message_id)
       );
       CREATE INDEX IF NOT EXISTS idx_backlog_chat_order
         ON backlog_messages(chat_id, timestamp, id);
     `);
+    runExclusiveMigration(db, () => {
+      ensureColumn(
+        db,
+        "backlog_messages",
+        "text_bytes",
+        "ALTER TABLE backlog_messages ADD COLUMN text_bytes INTEGER NOT NULL DEFAULT 0",
+      );
+      db.prepare(
+        `UPDATE backlog_messages
+         SET text_bytes = length(CAST(text AS BLOB))
+         WHERE text_bytes = 0`,
+      ).run();
+    });
   }
 }
 

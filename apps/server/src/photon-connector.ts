@@ -1,10 +1,17 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { randomBytes } from "node:crypto";
 import { createServer as createTcpServer } from "node:net";
 import { join } from "node:path";
 import type { AgentRecord } from "./agent-registry.ts";
 import { loadPhotonEnvFile } from "./env-file.ts";
-import { GroupCatchUpStore, GroupCatchUpStoreError } from "./group-catch-up.ts";
+import {
+  GroupCatchUpStore,
+  GroupCatchUpStoreError,
+  GroupBacklogLimitError,
+  resolveBacklogLimits,
+  type GroupWakeDeliveryMetadata,
+} from "./group-catch-up.ts";
 import { InboundDedupeStore } from "./inbound-dedupe.ts";
 import { cleanMentionText, compileMentionPatterns, matchesMention } from "./mention-patterns.ts";
 import type { RelayQueue } from "./relay.ts";
@@ -13,6 +20,11 @@ import { renderRelayPrompt } from "./relay-prompt.ts";
 const DEFAULT_SIDECAR_PATH =
   process.env.LHC_PHOTON_SIDECAR_PATH ??
   "/srv/work/hermes-agent/plugins/platforms/photon/sidecar/index.mjs";
+
+const MAX_SIDECAR_BACKOFF_MS = 30_000;
+const STOP_TIMEOUT_MS = 2_000;
+const INBOUND_SETTLE_TIMEOUT_MS = STOP_TIMEOUT_MS;
+const INBOUND_RECONNECT_MS = 250;
 
 interface SidecarBinding {
   baseUrl: string;
@@ -36,6 +48,8 @@ interface PhotonInboundEvent {
   timestamp?: string | null;
 }
 
+interface GroupWakeMetadata extends GroupWakeDeliveryMetadata {}
+
 export interface PhotonConnectorOptions {
   agent: AgentRecord;
   consoleHome: string;
@@ -45,6 +59,14 @@ export interface PhotonConnectorOptions {
   fetchImpl?: typeof fetch;
   loadPhotonEnv?: (path: string) => Record<string, string>;
   onError?: (message: string) => void;
+  backlogLimits?: ReturnType<typeof resolveBacklogLimits>;
+  spawnChild?: typeof spawn;
+  spawnSidecar?: (options: {
+    sidecarPath: string;
+    photonEnv: Record<string, string>;
+    port: number;
+    token: string;
+  }) => ChildProcess;
 }
 
 export class PhotonConnector {
@@ -60,12 +82,16 @@ export class PhotonConnector {
   readonly #catchUp: GroupCatchUpStore;
   readonly #dedupe: InboundDedupeStore;
   readonly #photonEnvFile: string;
+  readonly #spawnChild: typeof spawn;
+  readonly #spawnSidecar: PhotonConnectorOptions["spawnSidecar"];
   readonly #injectedSidecar?: SidecarBinding;
   #sidecar?: SidecarBinding;
   #child: ChildProcess | null = null;
   #abort: AbortController | null = null;
   #inboundTask: Promise<void> | null = null;
   #processing: Promise<void> = Promise.resolve();
+  #sidecarRespawnTimer: NodeJS.Timeout | null = null;
+  #sidecarRespawnAttempt = 0;
   #started = false;
   #stopped = false;
 
@@ -84,8 +110,11 @@ export class PhotonConnector {
     this.#photonEnvFile = photon.envFile;
     this.#owners = new Set(options.agent.ownerSenderIds);
     this.#mentionPatterns = compileMentionPatterns(options.agent.mentionPatterns);
+    this.#spawnChild = options.spawnChild ?? spawn;
+    this.#spawnSidecar = options.spawnSidecar;
     const stateDir = join(options.consoleHome, "agents", options.agent.id);
-    this.#catchUp = new GroupCatchUpStore(join(stateDir, "group-catch-up.sqlite"));
+    const backlogLimits = options.backlogLimits ?? resolveBacklogLimits();
+    this.#catchUp = new GroupCatchUpStore(join(stateDir, "group-catch-up.sqlite"), backlogLimits);
     this.#dedupe = new InboundDedupeStore(join(stateDir, "inbound-dedupe.sqlite"));
     this.#injectedSidecar = options.sidecar;
   }
@@ -93,7 +122,7 @@ export class PhotonConnector {
   async start(): Promise<void> {
     if (this.#started) return;
     this.#started = true;
-    this.#sidecar = this.#injectedSidecar ?? (await this.#spawnSidecar());
+    this.#sidecar = this.#injectedSidecar ?? (await this.#startManagedSidecar());
     this.#abort = new AbortController();
     this.#inboundTask = this.#consumeInbound(this.#abort.signal);
   }
@@ -101,17 +130,25 @@ export class PhotonConnector {
   async stop(): Promise<void> {
     if (this.#stopped) return;
     this.#stopped = true;
+    if (this.#sidecarRespawnTimer) {
+      clearTimeout(this.#sidecarRespawnTimer);
+      this.#sidecarRespawnTimer = null;
+    }
     this.#abort?.abort();
-    if (this.#inboundTask) await this.#inboundTask.catch(() => undefined);
+    const inbound = this.#inboundTask;
+    if (inbound) {
+      await Promise.race([inbound.catch(() => undefined), sleep(STOP_TIMEOUT_MS)]);
+    }
     if (this.#sidecar && !this.#injectedSidecar) {
-      await this.#post(this.#sidecar, "/shutdown", {}).catch(() => undefined);
+      await this.#post(this.#sidecar, "/shutdown", {}, AbortSignal.timeout(STOP_TIMEOUT_MS)).catch(
+        () => undefined,
+      );
     }
     if (this.#child) {
       this.#child.stdin?.end();
       this.#child.kill("SIGTERM");
       this.#child = null;
     }
-    await this.#processing.catch(() => undefined);
   }
 
   async send(spaceId: string, text: string): Promise<void> {
@@ -137,16 +174,20 @@ export class PhotonConnector {
   }
 
   async #consumeInbound(signal: AbortSignal): Promise<void> {
-    const sidecar = this.#sidecar;
-    if (!sidecar) return;
     while (!signal.aborted && !this.#stopped) {
+      const sidecar = this.#sidecar;
+      if (!sidecar) {
+        if (signal.aborted) return;
+        await abortableSleep(INBOUND_RECONNECT_MS, signal);
+        continue;
+      }
       try {
         const response = await this.#fetchImpl(`${sidecar.baseUrl}/inbound`, {
           headers: { "X-Hermes-Sidecar-Token": sidecar.token },
           signal,
         });
         if (!response.ok || !response.body) {
-          await sleep(250);
+          await abortableSleep(INBOUND_RECONNECT_MS, signal);
           continue;
         }
         const reader = response.body.getReader();
@@ -167,10 +208,13 @@ export class PhotonConnector {
             newline = buffer.indexOf("\n");
           }
         }
+        if (!signal.aborted && !this.#stopped) {
+          await abortableSleep(INBOUND_RECONNECT_MS, signal);
+        }
       } catch (error) {
         if (signal.aborted || this.#stopped) return;
         this.#reportProcessingError(error);
-        await sleep(250);
+        await abortableSleep(INBOUND_RECONNECT_MS, signal);
       }
     }
   }
@@ -188,7 +232,6 @@ export class PhotonConnector {
     const senderId = event.sender?.id ?? null;
     const timestamp = event.timestamp ?? new Date().toISOString();
     if (!spaceId || !messageId) return;
-    if (!this.#dedupe.claim(spaceId, messageId)) return;
     if ((event.space?.type ?? "dm") === "group") {
       await this.#handleGroup({
         spaceId,
@@ -200,7 +243,15 @@ export class PhotonConnector {
       return;
     }
     if (!this.#isOwner(senderId)) return;
-    await this.#runRelay(spaceId, text);
+    const claim = this.#dedupe.begin(spaceId, messageId);
+    if (claim.gate === "skip") return;
+    try {
+      this.#enqueueRelay(spaceId, text);
+      this.#dedupe.complete(spaceId, messageId, claim.token);
+    } catch (error) {
+      this.#dedupe.release(spaceId, messageId, claim.token);
+      throw error;
+    }
   }
 
   async #handleGroup(input: {
@@ -219,25 +270,46 @@ export class PhotonConnector {
       await this.#bufferGroup(spaceId, messageId, senderId, text, timestamp);
       return;
     }
+    const claim = this.#dedupe.begin(spaceId, messageId);
+    if (claim.gate === "skip") return;
     let channelContext: string | null;
     let consumedIds: string[];
     try {
       [channelContext, consumedIds] = this.#catchUp.readWakeSnapshot(spaceId);
     } catch (error) {
-      if (error instanceof GroupCatchUpStoreError) {
-        await this.#send(spaceId, "Group catch-up is unavailable; message not processed.");
+      if (error instanceof GroupBacklogLimitError) {
+        await this.#send(spaceId, `${error.message}; backlog retained.`);
+        this.#dedupe.complete(spaceId, messageId, claim.token);
         return;
       }
+      if (error instanceof GroupCatchUpStoreError) {
+        await this.#send(spaceId, "Group catch-up is unavailable; message not processed.");
+        this.#dedupe.release(spaceId, messageId, claim.token);
+        return;
+      }
+      this.#dedupe.release(spaceId, messageId, claim.token);
       throw error;
     }
     const cleaned = cleanMentionText(text, this.#mentionPatterns);
     const prompt = renderRelayPrompt(cleaned, channelContext ?? undefined);
-    const success = await this.#runRelay(spaceId, prompt, { quietFailure: true });
-    if (success) {
-      this.#catchUp.advanceCursor(spaceId, messageId, consumedIds);
-      return;
+    try {
+      this.#enqueueRelay(spaceId, prompt, {
+        kind: "photon_group_wake",
+        spaceId,
+        wakeMessageId: messageId,
+        consumedIds,
+        fallback: {
+          messageId,
+          senderId,
+          text: cleaned,
+          timestamp,
+        },
+      });
+      this.#dedupe.complete(spaceId, messageId, claim.token);
+    } catch (error) {
+      this.#dedupe.release(spaceId, messageId, claim.token);
+      throw error;
     }
-    await this.#bufferGroup(spaceId, messageId, senderId, cleaned, timestamp);
   }
 
   async #bufferGroup(
@@ -247,6 +319,8 @@ export class PhotonConnector {
     text: string,
     timestamp: string,
   ): Promise<void> {
+    const claim = this.#dedupe.begin(spaceId, messageId);
+    if (claim.gate === "skip") return;
     try {
       this.#catchUp.append(spaceId, {
         messageId,
@@ -255,7 +329,13 @@ export class PhotonConnector {
         timestamp,
         senderAuthorized: this.#isOwner(senderId) ? true : senderId ? false : null,
       });
+      this.#dedupe.complete(spaceId, messageId, claim.token);
     } catch (error) {
+      this.#dedupe.release(spaceId, messageId, claim.token);
+      if (error instanceof GroupBacklogLimitError) {
+        await this.#send(spaceId, `${error.message}; backlog retained.`);
+        return;
+      }
       if (error instanceof GroupCatchUpStoreError) {
         await this.#send(spaceId, "Could not persist group message backlog.");
         return;
@@ -264,21 +344,16 @@ export class PhotonConnector {
     }
   }
 
-  async #runRelay(
-    spaceId: string,
-    prompt: string,
-    options: { quietFailure?: boolean } = {},
-  ): Promise<boolean> {
-    const job = this.#queue.enqueue({ target: this.#agent.id, prompt });
-    const completed = await this.#queue.wait(job.id);
-    if (completed.status === "completed") {
-      await this.#send(spaceId, completed.output ?? "");
-      return true;
-    }
-    if (!options.quietFailure) {
-      await this.#send(spaceId, completed.error ?? "Relay failed.");
-    }
-    return false;
+  #enqueueRelay(spaceId: string, prompt: string, groupWake?: GroupWakeMetadata): void {
+    this.#queue.enqueue({
+      target: this.#agent.id,
+      prompt,
+      delivery: {
+        channel: "photon",
+        destination: { spaceId },
+        ...(groupWake ? { metadata: groupWake } : {}),
+      },
+    });
   }
 
   async #send(spaceId: string, text: string): Promise<void> {
@@ -291,7 +366,11 @@ export class PhotonConnector {
     return Boolean(senderId && this.#owners.has(senderId));
   }
 
-  async #spawnSidecar(): Promise<SidecarBinding> {
+  async #startManagedSidecar(): Promise<SidecarBinding> {
+    return this.#spawnSidecarProcess();
+  }
+
+  async #spawnSidecarProcess(): Promise<SidecarBinding> {
     const port = await reservePort();
     const token = randomBytes(24).toString("hex");
     let photonEnv: Record<string, string>;
@@ -311,17 +390,97 @@ export class PhotonConnector {
       PHOTON_SIDECAR_TOKEN: token,
       PHOTON_SIDECAR_WATCH_STDIN: "1",
     };
-    this.#child = spawn("node", [this.#sidecarPath], {
-      env,
-      stdio: ["pipe", "inherit", "inherit"],
-    });
+    if (this.#spawnSidecar) {
+      this.#child = this.#spawnSidecar({
+        sidecarPath: this.#sidecarPath,
+        photonEnv,
+        port,
+        token,
+      });
+    } else {
+      this.#child = this.#spawnChild("node", [this.#sidecarPath], {
+        env,
+        stdio: ["pipe", "inherit", "inherit"],
+      });
+    }
+    if (!this.#injectedSidecar) this.#attachSidecarSupervision();
     const baseUrl = `http://127.0.0.1:${port}`;
     const binding = { baseUrl, token };
     await waitForSidecar(binding, this.#fetchImpl);
+    this.#sidecarRespawnAttempt = 0;
     return binding;
   }
 
-  async #post(sidecar: SidecarBinding, path: string, body: Record<string, unknown>): Promise<void> {
+  #attachSidecarSupervision(): void {
+    const child = this.#child as ChildProcess & EventEmitter & { __lhcSupervised?: boolean };
+    if (!child || child.__lhcSupervised || this.#injectedSidecar) return;
+    child.__lhcSupervised = true;
+    const supervisedChild = child;
+    let handled = false;
+    const onExit = () => {
+      if (handled) return;
+      handled = true;
+      supervisedChild.removeListener("exit", onExit);
+      supervisedChild.removeListener("error", onError);
+      if (this.#stopped) return;
+      if (this.#child !== supervisedChild) return;
+      this.#abort?.abort();
+      this.#child = null;
+      this.#sidecar = undefined;
+      this.#scheduleSidecarRespawn();
+    };
+    const onError = () => onExit();
+    child.once("exit", onExit);
+    child.once("error", onError);
+  }
+
+  #scheduleSidecarRespawn(): void {
+    if (this.#stopped || this.#sidecarRespawnTimer || this.#injectedSidecar) return;
+    const delay = Math.min(250 * 2 ** this.#sidecarRespawnAttempt, MAX_SIDECAR_BACKOFF_MS);
+    this.#sidecarRespawnAttempt += 1;
+    this.#sidecarRespawnTimer = setTimeout(() => {
+      this.#sidecarRespawnTimer = null;
+      void this.#respawnSidecar();
+    }, delay);
+  }
+
+  async #respawnSidecar(): Promise<void> {
+    if (this.#stopped || this.#injectedSidecar) return;
+    const oldInbound = this.#inboundTask;
+    if (oldInbound) {
+      let settled = false;
+      await Promise.race([
+        oldInbound
+          .then(() => {
+            settled = true;
+          })
+          .catch(() => {
+            settled = true;
+          }),
+        sleep(INBOUND_SETTLE_TIMEOUT_MS),
+      ]);
+      if (!settled) {
+        this.#scheduleSidecarRespawn();
+        return;
+      }
+    }
+    try {
+      const binding = await this.#spawnSidecarProcess();
+      this.#sidecar = binding;
+      this.#abort = new AbortController();
+      this.#inboundTask = this.#consumeInbound(this.#abort.signal);
+    } catch (error) {
+      this.#reportProcessingError(error);
+      this.#scheduleSidecarRespawn();
+    }
+  }
+
+  async #post(
+    sidecar: SidecarBinding,
+    path: string,
+    body: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<void> {
     const response = await this.#fetchImpl(`${sidecar.baseUrl}${path}`, {
       method: "POST",
       headers: {
@@ -329,6 +488,7 @@ export class PhotonConnector {
         "X-Hermes-Sidecar-Token": sidecar.token,
       },
       body: JSON.stringify(body),
+      signal,
     });
     if (!response.ok) {
       throw new Error(`sidecar ${path} failed with ${response.status}`);
@@ -396,6 +556,21 @@ function scrubSecrets(message: string): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    signal.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      { once: true },
+    );
+  });
 }
 
 async function reservePort(): Promise<number> {

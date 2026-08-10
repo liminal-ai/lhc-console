@@ -13,7 +13,7 @@ export function executeRelayTarget(
 ): Promise<string> {
   const timeoutMs = options.timeoutMs ?? target.timeoutMs ?? 20 * 60_000;
   return new Promise((resolve, reject) => {
-    execFile(
+    const child = execFile(
       target.command,
       [...target.args, prompt],
       {
@@ -37,5 +37,8 @@ export function executeRelayTarget(
         reject(new Error(stderr.trim() || error.message));
       },
     );
+    // Print-mode CLIs commonly read piped stdin before starting their turn.
+    // No relay payload is sent there, so close it immediately to deliver EOF.
+    child.stdin?.end();
   });
 }

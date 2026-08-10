@@ -55,6 +55,8 @@ import { RelayQueue } from "./relay.ts";
 import { deliverRelayJob } from "./relay-delivery.ts";
 import { loadAgentRegistry } from "./agent-registry.ts";
 import { PhotonConnectorManager } from "./photon-connector.ts";
+import { MonitorService } from "./monitor.ts";
+import { registerMonitorRoutes } from "./monitor-routes.ts";
 
 const PORT = Number(process.env.LHC_CONSOLE_PORT ?? 5959);
 
@@ -101,6 +103,26 @@ const photonConnectors = new PhotonConnectorManager({
 photonRef.current = photonConnectors;
 await photonConnectors.start();
 relayQueue.start();
+
+const monitorService = new MonitorService({
+  dbPath: join(consoleHome, "monitor.sqlite"),
+  enqueue: ({ target, prompt }) => relayQueue.enqueue({ target, prompt }),
+  getJob: (id) => relayQueue.get(id),
+  targetExists: (target) => Boolean(agentRegistry.relayTargets[target]),
+  lastActivityAt: (targetId) => {
+    const target = agentRegistry.relayTargets[targetId];
+    if (!target) return null;
+    const host = discoverHosts().find((candidate) => candidate.id === target.hostId);
+    if (!host) return null;
+    try {
+      const thread = resolveThread(host, target.threadId);
+      return thread?.fileMtime ? new Date(thread.fileMtime) : null;
+    } catch {
+      return null;
+    }
+  },
+});
+monitorService.start();
 
 /**
  * Quick-stats cache keyed by thread file path + mtime, so the aggregated
@@ -205,6 +227,7 @@ registerRelayRoutes(app, {
   queue: relayQueue,
   token: relayToken,
 });
+registerMonitorRoutes(app, { service: monitorService, token: relayToken });
 
 app.get("/api/hosts", async () => {
   const launchable = new Set(launchableHostIds(discoverHosts().map((h) => h.id)));
@@ -546,6 +569,7 @@ app.get("/api/threads/:hostId/:threadId/view-arrangement", async (req, reply) =>
 for (const sig of ["SIGINT", "SIGTERM"] as const) {
   process.once(sig, async () => {
     shutdownTerminals();
+    await monitorService.close();
     await relayQueue.close();
     await photonConnectors.stop();
     await app.close();

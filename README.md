@@ -57,6 +57,32 @@ track of a running child across restart, the job is failed as indeterminate:
 the durable agent thread is canonical and may contain a completed turn even
 when relay telemetry does not.
 
+## Monitors
+
+**Monitor** is the org verb for an external periodic wake with a prompt, until
+its exit condition is reached. Monitors live outside the target agent so work
+keeps moving when an interactive session closes or a one-shot finishes without
+another caller.
+
+V1 monitors are durable in `~/.lhc-console/monitor.sqlite`, address registered
+relay targets, and stop through either explicit removal or a maximum tick cap.
+They use the relay's loopback-only bearer authentication. A due monitor does
+not stack another tick while its previous relay job is still queued, blocked,
+or running. It also waits until the target thread has been idle for three
+minutes by default; `--idle-for` overrides that floor. Skipped ticks do not
+consume the maximum tick budget.
+
+```bash
+lhc-monitor add fable 5m --idle-for 3m --max-ticks 12 \
+  --prompt "Inspect the goal, advance the next unfinished step, and report blockers."
+lhc-monitor list
+lhc-monitor remove <id>
+```
+
+The corresponding authenticated API is `POST/GET /api/monitors` and
+`DELETE /api/monitors/:id`. Generic command targets and richer goal-based exit
+criteria are intentionally deferred until usage teaches us what is needed.
+
 ## Development
 
 Two processes (Vite proxies `/api` to the server):

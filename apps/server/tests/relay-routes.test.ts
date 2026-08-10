@@ -96,4 +96,35 @@ describe("relay HTTP API", () => {
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({ status: "completed", output: "reply:now" });
   });
+
+  it("uses the Hermes channel-context envelope for addressed group turns", async () => {
+    const app = setup();
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/relay/targets/fable/jobs",
+      headers: { authorization: "Bearer test-secret" },
+      payload: {
+        prompt: "What do you think?",
+        channelContext: "[Group messages since your last reply]\n[participant-1] Earlier point",
+      },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      status: "completed",
+      output:
+        "reply:[Group messages since your last reply]\n[participant-1] Earlier point\n\n[New message]\nWhat do you think?",
+    });
+  });
+
+  it("rejects malformed group context", async () => {
+    const app = setup();
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/relay/targets/fable/jobs",
+      headers: { authorization: "Bearer test-secret" },
+      payload: { prompt: "hello", channelContext: ["not", "trusted"] },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toEqual({ error: "channelContext must be a string" });
+  });
 });

@@ -18,9 +18,10 @@ export function registerRelayRoutes(app: FastifyInstance, options: RelayRouteOpt
 
   app.post("/api/relay/targets/:target/jobs", { preHandler: authorize }, async (request, reply) => {
     const { target } = request.params as { target: string };
-    const { prompt, notify } = (request.body ?? {}) as {
+    const { prompt, notify, channelContext } = (request.body ?? {}) as {
       prompt?: unknown;
       notify?: unknown;
+      channelContext?: unknown;
     };
     if (typeof prompt !== "string" || !prompt.trim()) {
       return reply.code(400).send({ error: "prompt is required" });
@@ -28,11 +29,14 @@ export function registerRelayRoutes(app: FastifyInstance, options: RelayRouteOpt
     if (notify !== undefined && notify !== "photon") {
       return reply.code(400).send({ error: 'notify must be "photon"' });
     }
+    if (channelContext !== undefined && typeof channelContext !== "string") {
+      return reply.code(400).send({ error: "channelContext must be a string" });
+    }
     let job;
     try {
       job = options.queue.enqueue({
         target,
-        prompt,
+        prompt: renderRelayPrompt(prompt, channelContext),
         ...(notify === "photon" ? { notify } : {}),
       });
     } catch (error) {
@@ -64,6 +68,11 @@ export function registerRelayRoutes(app: FastifyInstance, options: RelayRouteOpt
     if (!job) return reply.code(404).send({ error: "relay job not found" });
     return job;
   });
+}
+
+function renderRelayPrompt(prompt: string, channelContext?: string): string {
+  if (!channelContext) return prompt;
+  return `${channelContext}\n\n[New message]\n${prompt}`;
 }
 
 async function waitWithin(

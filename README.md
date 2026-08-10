@@ -39,6 +39,13 @@ id and `Location`, and `GET /api/relay/jobs/:id` reports
 `queued|blocked|running|completed|failed`. Add `"notify":"photon"` for the
 completed reply to be sent to Console's configured Photon home channel.
 
+Group-chat connectors can also include an optional string `channelContext`.
+The relay prepends it using Hermes' read-only catch-up envelope—followed by
+`[New message]` and the addressed prompt—so console-hosted agents receive the
+same prompt shape as Hermes agents. The connector remains responsible for
+owner-only wake authorization, per-agent cursors, and durable group history;
+this endpoint only accepts an already-authorized addressed turn.
+
 ## Development
 
 Two processes (Vite proxies `/api` to the server):

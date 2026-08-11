@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import type { LoadedAgentRegistry } from "./agent-registry.ts";
 import {
   GroupCatchUpStore,
@@ -28,7 +29,10 @@ export async function deliverRelayJob(job: RelayJob, context: RelayDeliveryConte
 
 async function deliverPhoton(job: RelayJob, context: RelayDeliveryContext): Promise<void> {
   const agent = context.agents.find((entry) => entry.id === job.target);
-  const spaceId = job.delivery?.destination.spaceId ?? agent?.channels.photon?.notifySpaceId;
+  const spaceId =
+    job.delivery?.destination.spaceId ??
+    agent?.channels.photon?.notifySpaceId ??
+    latestPhotonDestination(context.consoleHome, job.target);
   if (!spaceId) {
     throw new Error(`agent ${job.target} has no delivery destination configured`);
   }
@@ -44,5 +48,29 @@ async function deliverPhoton(job: RelayJob, context: RelayDeliveryContext): Prom
       resolveBacklogLimits(),
     );
     store.advanceCursor(metadata.spaceId, metadata.wakeMessageId, metadata.consumedIds);
+  }
+}
+
+function latestPhotonDestination(consoleHome: string, target: string): string | null {
+  const db = new DatabaseSync(join(consoleHome, "relay.sqlite"), { readOnly: true });
+  try {
+    const row = db
+      .prepare(
+        `SELECT delivery_destination
+         FROM relay_jobs
+         WHERE target = ? AND delivery_channel = 'photon' AND delivery_destination IS NOT NULL
+         ORDER BY created_at DESC
+         LIMIT 1`,
+      )
+      .get(target) as { delivery_destination: string } | undefined;
+    if (!row) return null;
+    const destination = JSON.parse(row.delivery_destination) as Record<string, unknown>;
+    return typeof destination.spaceId === "string" && destination.spaceId
+      ? destination.spaceId
+      : null;
+  } catch {
+    return null;
+  } finally {
+    db.close();
   }
 }

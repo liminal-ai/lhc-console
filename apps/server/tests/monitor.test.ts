@@ -18,14 +18,14 @@ function setup() {
   dirs.push(dir);
   const jobs = new Map<string, RelayJob>();
   let sequence = 0;
-  const prompts: Array<{ target: string; prompt: string }> = [];
+  const prompts: Array<{ target: string; prompt: string; notify?: "photon" }> = [];
   let lastActivityAt: Date | null = new Date(0);
   const service = new MonitorService({
     dbPath: join(dir, "monitor.sqlite"),
     pollMs: 5,
-    enqueue: ({ target, prompt }) => {
+    enqueue: ({ target, prompt, notify }) => {
       const id = `job-${++sequence}`;
-      prompts.push({ target, prompt });
+      prompts.push({ target, prompt, notify });
       jobs.set(id, {
         id,
         target,
@@ -89,12 +89,14 @@ describe("MonitorService", () => {
       expect.objectContaining({
         id: monitor.id,
         target: "fable",
-        prompt: "Continue until the goal is done.",
+        prompt:
+          "Continue until the goal is done.\n\nReply with a short plain-English status a phone reader can skim — a few sentences, phase-level, no ids or jargon. If your status needs an action or decision from Lee, start the message with: NEEDS YOU —",
         intervalMs: 60_000,
         idleForMs: 180_000,
         maxTicks: 3,
         tickCount: 0,
         active: true,
+        quiet: false,
       }),
     ]);
   });
@@ -110,6 +112,12 @@ describe("MonitorService", () => {
     service.start();
 
     await expect.poll(() => prompts.length, { timeout: 250 }).toBe(1);
+    expect(prompts[0]).toEqual({
+      target: "fable",
+      notify: "photon",
+      prompt:
+        "Keep moving.\n\nReply with a short plain-English status a phone reader can skim — a few sentences, phase-level, no ids or jargon. If your status needs an action or decision from Lee, start the message with: NEEDS YOU —",
+    });
     await new Promise((resolve) => setTimeout(resolve, 45));
     expect(prompts).toHaveLength(1);
     expect(service.get(monitor.id)?.tickCount).toBe(1);
@@ -123,6 +131,22 @@ describe("MonitorService", () => {
     firstJob.status = "completed";
     await expect.poll(() => prompts.length, { timeout: 250 }).toBe(2);
     expect(service.get(monitor.id)).toMatchObject({ tickCount: 2, active: false });
+  });
+
+  it("allows a quiet monitor to skip phone delivery", async () => {
+    const { prompts, service } = setup();
+    service.add({
+      target: "fable",
+      prompt: "Run a noisy check.",
+      intervalMs: 15,
+      maxTicks: 1,
+      quiet: true,
+    });
+    service.start();
+
+    await expect.poll(() => prompts.length, { timeout: 250 }).toBe(1);
+    expect(prompts[0]?.notify).toBeUndefined();
+    expect(service.list()[0]).toMatchObject({ quiet: true });
   });
 
   it("skips active targets without consuming a tick and honors an idle override", async () => {

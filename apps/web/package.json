@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vp dev",
+    "test": "vp test",
     "build": "tsc && vp build",
     "preview": "vp preview"
   },

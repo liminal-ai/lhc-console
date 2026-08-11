@@ -29,7 +29,9 @@ async function tmux(args: string[]): Promise<string> {
   // the tmux server decides the env every future session inherits.
   const { stdout } = await exec("tmux", ["-L", SOCKET, "-f", confPath(), ...args], {
     encoding: "utf8",
-    maxBuffer: 8 * 1024 * 1024,
+    // 10k lines at the maximum 500-column pane width can approach 20 MiB
+    // when every cell is four-byte UTF-8.
+    maxBuffer: 32 * 1024 * 1024,
     env: scrubbedEnv({}),
   });
   return stdout;
@@ -434,6 +436,11 @@ export async function capturePane(
     "-1",
   ]);
   return { text, alternateOn: false };
+}
+
+/** Plain-text pane history for copy/scrollback views (no terminal escapes). */
+export async function capturePaneText(sessionId: string, lines: number): Promise<string> {
+  return tmux(["capture-pane", "-p", "-t", sessionId, "-S", `-${lines}`]);
 }
 
 export async function setWindowSizeMode(sessionId: string, mode: "manual" | "latest") {

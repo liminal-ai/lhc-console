@@ -418,6 +418,10 @@ export const api = {
       body: JSON.stringify(payload),
     });
   },
+  terminalHistory: (id: string, lines = 10_000) =>
+    get<{ text: string }>(
+      `/api/terminals/${encodeURIComponent(id)}/history?lines=${encodeURIComponent(String(lines))}`,
+    ),
   killTerminal: (id: string) =>
     send<{ ok: boolean }>(`/api/terminals/${encodeURIComponent(id)}`, { method: "DELETE" }),
   messages: (hostId: string, threadId: string, turnId?: string) => {

@@ -1611,6 +1611,58 @@ body.ws-on {
   padding: 4px 2px 4px 6px;
 }
 
+.ws-copy-view {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  background: #101216;
+}
+
+.ws-copy-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 30px;
+  padding: 0 10px;
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+}
+
+.ws-copy-bar > span {
+  flex: 1;
+}
+
+.ws-copy-button {
+  border: 0;
+  padding: 2px 6px;
+  background: none;
+  color: var(--accent);
+  cursor: pointer;
+  font: inherit;
+}
+
+.ws-copy-text {
+  flex: 1;
+  min-height: 0;
+  margin: 0;
+  padding: 10px 12px 40px;
+  overflow: auto;
+  white-space: pre;
+  color: var(--text);
+  font:
+    13px/1.3 "SF Mono",
+    ui-monospace,
+    "Cascadia Code",
+    Menlo,
+    monospace;
+  user-select: text;
+  cursor: text;
+}
+
 .ws-div {
   flex: 0 0 4px;
   cursor: col-resize;

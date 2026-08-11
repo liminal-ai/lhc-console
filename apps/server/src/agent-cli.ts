@@ -158,12 +158,12 @@ function parseCallFlags(args: string[]): {
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index]!;
     if (arg === "--priority") {
-      if (index > 0) throw new Error("--priority must appear before the agent name");
+      if (rest.length > 0) throw new Error("--priority must appear before the agent name");
       prioritized = true;
       continue;
     }
     if (arg === "--from") {
-      if (index > 0) throw new Error("--from must appear before the agent name");
+      if (rest.length > 0) throw new Error("--from must appear before the agent name");
       const value = args[index + 1];
       if (!value) throw new Error("--from requires a registered agent key");
       from = value;
@@ -188,7 +188,7 @@ async function goal(args: string[], deps: CliDeps): Promise<number> {
   }
   if (args[0] === "start") return await goalStart(args.slice(1), deps);
   if (args[0] === "list") return await goalList(args.slice(1), deps);
-  if (args[0] === "done") return await goalDone(args.slice(1), deps);
+  if (args[0] === "done" || args[0] === "complete") return await goalDone(args.slice(1), deps);
   if (args[0] === "blocked") return await goalBlocked(args.slice(1), deps);
   if (args[0] === "cancel") return await goalCancel(args.slice(1), deps);
   if (args.length === 1) return await goalGet(args[0]!, deps);

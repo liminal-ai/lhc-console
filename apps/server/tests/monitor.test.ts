@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import { MonitorService } from "../src/monitor.ts";
+import { isRegisteredRelayTarget } from "../src/agent-registry.ts";
 import type { RelayJob } from "../src/relay.ts";
 
 const dirs: string[] = [];
@@ -13,7 +14,7 @@ afterEach(async () => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-function setup() {
+function setup(targetExists: (target: string) => boolean = (target) => target === "fable") {
   const dir = mkdtempSync(join(tmpdir(), "lhc-console-monitor-"));
   dirs.push(dir);
   const jobs = new Map<string, RelayJob>();
@@ -47,7 +48,7 @@ function setup() {
       return { id };
     },
     getJob: (id) => jobs.get(id) ?? null,
-    targetExists: (target) => target === "fable",
+    targetExists,
     lastActivityAt: () => lastActivityAt,
     minIntervalMs: 1,
   });
@@ -64,6 +65,27 @@ function setup() {
 }
 
 describe("MonitorService", () => {
+  it("rejects synthetic lee through registered-target wiring", () => {
+    const { service } = setup((target) =>
+      isRegisteredRelayTarget(
+        {
+          fable: {
+            hostId: "pi-lhc",
+            threadId: "th_fable",
+            cwd: "/tmp",
+            command: "unused",
+            args: [],
+          },
+        },
+        target,
+      ),
+    );
+
+    expect(() =>
+      service.add({ target: "lee", prompt: "Synthetic target", intervalMs: 1000, maxTicks: 1 }),
+    ).toThrow("unknown relay target: lee");
+  });
+
   it("persists owner-private monitors across service restarts", async () => {
     const { dir, service } = setup();
     const monitor = service.add({

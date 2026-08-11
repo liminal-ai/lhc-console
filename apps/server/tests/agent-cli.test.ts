@@ -119,6 +119,33 @@ describe("lhc-agent CLI", () => {
     });
   });
 
+  it("composes --from and --priority in either order for calls and starts", async () => {
+    for (const args of [
+      ["--from", "scribe", "--priority", "fable", "Urgent"],
+      ["--priority", "--from", "scribe", "fable", "Urgent"],
+      ["start", "--from", "scribe", "--priority", "fable", "Urgent"],
+      ["start", "--priority", "--from", "scribe", "fable", "Urgent"],
+    ]) {
+      const requests: Array<{ init?: RequestInit }> = [];
+      const state = deps(async (_input, init) => {
+        requests.push({ init });
+        return response(args[0] === "start" ? 202 : 200, {
+          id: "job-1",
+          status: args[0] === "start" ? "queued" : "completed",
+          output: "done",
+        });
+      });
+
+      expect(await runAgentCli(args, state.value)).toBe(0);
+      expect(requests[0]?.init?.body).toBe(
+        JSON.stringify({ prompt: "Urgent", jobClass: "prioritized", sender: "scribe" }),
+      );
+      expect(new Headers(requests[0]?.init?.headers).get("prefer")).toBe(
+        args[0] === "start" ? "respond-async" : null,
+      );
+    }
+  });
+
   it("rejects ambiguous --priority placement", async () => {
     let calls = 0;
     const state = deps(async () => {
@@ -175,6 +202,7 @@ describe("lhc-agent CLI", () => {
     expect(state.stdout.join("\n")).toContain("objective: Ship it");
 
     expect(await runAgentCli(["goal", "done", "goal-1"], state.value)).toBe(0);
+    expect(await runAgentCli(["goal", "complete", "goal-1"], state.value)).toBe(0);
     expect(calls.some((call) => call.url.endsWith("/complete"))).toBe(true);
   });
 

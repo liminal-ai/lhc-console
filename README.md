@@ -52,9 +52,11 @@ directories, and runtime commands remain control-plane internals. Registry
 discovery exposes only the key, display name, description, duties, and channel
 types.
 
-The server exposes a small authenticated job relay at `127.0.0.1:5959`. V1 has
-one configured target, `fable`, and serializes prompts into Fable's durable
-pi-lhc thread. Jobs remain `blocked` while another process holds that thread.
+The server exposes a small authenticated job relay at `127.0.0.1:5959`. Relay
+targets come from the owner-only `~/.lhc-console/agents.json` registry. Each
+registered agent supplies its durable host, thread, working directory, command,
+arguments, and optional environment. Jobs remain `blocked` while another
+process holds the target thread.
 
 On first server boot, an owner-only bearer token is created at
 `~/.lhc-console/relay-token` (or set `LHC_RELAY_TOKEN`). Synchronous call:
@@ -84,11 +86,11 @@ connector may pass raw participant text through `channelContext` without that
 framing. A bearer holder already has full prompt authority, so the relay does
 not attempt to re-authorize or sanitize this trusted envelope.
 
-Turn timeouts are configured per target. Fable uses
-`LHC_RELAY_FABLE_TIMEOUT_MS` (30 minutes by default). If a relay process loses
-track of a running child across restart, the job is failed as indeterminate:
-the durable agent thread is canonical and may contain a completed turn even
-when relay telemetry does not.
+Turn timeouts may be configured per registered target with `relay.timeoutMs` in
+`agents.json`; targets without one use the relay's 20-minute default. If a relay
+process loses track of a running child across restart, the job is failed as
+indeterminate: the durable agent thread is canonical and may contain a
+completed turn even when relay telemetry does not.
 
 ## Goals and monitors
 
@@ -98,7 +100,7 @@ reminder turns while ordinary peer calls remain deprioritized:
 ```bash
 lhc-agent goal start fable "Finish the current hardening wave." --every 5m
 lhc-agent goal list
-lhc-agent goal complete <id>
+lhc-agent goal done <id>
 lhc-agent goal blocked <id> "Needs an owner decision"
 lhc-agent goal cancel <id>
 ```

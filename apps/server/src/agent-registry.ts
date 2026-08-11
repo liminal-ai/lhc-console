@@ -29,6 +29,13 @@ export interface LoadedAgentRegistry {
   relayTargets: Record<string, RelayTarget>;
 }
 
+export function isRegisteredRelayTarget(
+  relayTargets: Record<string, RelayTarget>,
+  target: string,
+): boolean {
+  return Object.hasOwn(relayTargets, target);
+}
+
 interface RawRelayConfig {
   hostId?: unknown;
   threadId?: unknown;
@@ -94,7 +101,7 @@ export function loadAgentRegistry(consoleHome: string): LoadedAgentRegistry {
   return { agents, relayTargets };
 }
 
-const RESERVED_AGENT_KEYS = new Set(["help", "list", "start", "job", "lee"]);
+const RESERVED_AGENT_KEYS = new Set(["help", "list", "start", "job", "goal", "lee"]);
 
 function parseAgent(id: string, raw: RawAgentConfig, consoleHome: string): AgentRecord {
   if (!/^[a-z][a-z0-9-]*$/.test(id)) {

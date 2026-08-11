@@ -53,7 +53,7 @@ import { executeRelayTarget } from "./relay-process.ts";
 import { registerRelayRoutes } from "./relay-routes.ts";
 import { RelayQueue } from "./relay.ts";
 import { deliverRelayJob } from "./relay-delivery.ts";
-import { loadAgentRegistry } from "./agent-registry.ts";
+import { isRegisteredRelayTarget, loadAgentRegistry } from "./agent-registry.ts";
 import { PhotonConnectorManager } from "./photon-connector.ts";
 import { MonitorService } from "./monitor.ts";
 import { registerMonitorRoutes } from "./monitor-routes.ts";
@@ -121,7 +121,7 @@ const relayQueue = new RelayQueue({
 const goalService = new GoalService({
   dbPath: relayDbPath,
   relayQueue,
-  targetExists: (target) => Object.hasOwn(relayTargets, target),
+  targetExists: (target) => isRegisteredRelayTarget(agentRegistry.relayTargets, target),
 });
 const removeGoalSettledListener = relayQueue.addSettledListener((job) =>
   goalService.notifyJobSettled(job),
@@ -141,7 +141,7 @@ const monitorService = new MonitorService({
   dbPath: join(consoleHome, "monitor.sqlite"),
   enqueue: ({ target, prompt, notify }) => relayQueue.enqueue({ target, prompt, notify }),
   getJob: (id) => relayQueue.get(id),
-  targetExists: (target) => Object.hasOwn(relayTargets, target),
+  targetExists: (target) => isRegisteredRelayTarget(agentRegistry.relayTargets, target),
   lastActivityAt: (targetId) => {
     const target = relayTargets[targetId];
     if (!target) return null;

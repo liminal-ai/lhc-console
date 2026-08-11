@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import { GoalService } from "../src/goal.ts";
+import { isRegisteredRelayTarget } from "../src/agent-registry.ts";
 import { migrateLegacyGoalsOffline } from "../src/goal-migrate.ts";
 import { RelayQueue } from "../src/relay.ts";
 import type { RelayJobStatus } from "../src/relay.ts";
@@ -63,6 +64,7 @@ function makeService(
     pollMs?: number;
     now?: () => number;
     idFactory?: () => string;
+    targetExists?: (target: string) => boolean;
   } = {},
 ): GoalService {
   const service = new GoalService({
@@ -72,7 +74,7 @@ function makeService(
     defaultCadenceMs: options.cadenceMs ?? 60_000,
     now: options.now,
     idFactory: options.idFactory,
-    targetExists: (target) => target === "fable",
+    targetExists: options.targetExists ?? ((target) => target === "fable"),
   });
   services.push(service);
   return service;
@@ -116,6 +118,7 @@ function setup(
     cadenceMs?: number;
     holdJobs?: boolean;
     holdExecute?: boolean;
+    targetExists?: (target: string) => boolean;
   } = {},
 ) {
   const dir = mkdtempSync(join(tmpdir(), "lhc-console-goal-"));
@@ -139,6 +142,7 @@ function setup(
     pollMs: options.pollMs ?? 5,
     cadenceMs: options.cadenceMs ?? 60_000,
     now: () => now,
+    targetExists: options.targetExists,
   });
   wireGoalSettledListener(service, queue);
   return {
@@ -193,6 +197,16 @@ function setup(
 }
 
 describe("GoalService", () => {
+  it("rejects synthetic lee through registered-target wiring", () => {
+    const { service } = setup({
+      targetExists: (target) => isRegisteredRelayTarget({ fable: relayTarget }, target),
+    });
+
+    expect(() => service.create({ target: "lee", objective: "Synthetic target" })).toThrow(
+      "unknown relay target: lee",
+    );
+  });
+
   it("creates a goal and immediately enqueues one prioritized reminder", () => {
     const { service, queue } = setup();
     const goal = service.create({ target: "fable", objective: "Ship the feature" });

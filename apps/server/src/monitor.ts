@@ -18,11 +18,12 @@ export interface Monitor {
   lastTickAt: string | null;
   lastJobId: string | null;
   lastError: string | null;
+  quiet: boolean;
 }
 
 interface MonitorServiceOptions {
   dbPath: string;
-  enqueue: (input: { target: string; prompt: string }) => { id: string };
+  enqueue: (input: { target: string; prompt: string; notify?: "photon" }) => { id: string };
   getJob: (id: string) => { status: RelayJobStatus } | null;
   targetExists: (target: string) => boolean;
   lastActivityAt: (target: string) => Date | null;
@@ -44,11 +45,14 @@ interface MonitorRow {
   last_tick_at: string | null;
   last_job_id: string | null;
   last_error: string | null;
+  quiet: number;
 }
 
 const ACTIVE_JOB_STATUSES = new Set<RelayJobStatus>(["queued", "blocked", "running"]);
 export const DEFAULT_IDLE_FOR_MS = 180_000;
 export const MIN_MONITOR_INTERVAL_MS = 30_000;
+export const MONITOR_STATUS_FORMAT =
+  "Reply with a short plain-English status a phone reader can skim — a few sentences, phase-level, no ids or jargon. If your status needs an action or decision from Lee, start the message with: NEEDS YOU —";
 
 export class MonitorService {
   readonly #db: DatabaseSync;
@@ -89,13 +93,15 @@ export class MonitorService {
         next_tick_at TEXT NOT NULL,
         last_tick_at TEXT,
         last_job_id TEXT,
-        last_error TEXT
+        last_error TEXT,
+        quiet INTEGER NOT NULL DEFAULT 0
       );
     `);
     for (const path of [options.dbPath, `${options.dbPath}-wal`, `${options.dbPath}-shm`]) {
       if (existsSync(path)) chmodSync(path, 0o600);
     }
     this.#ensureIdleForColumn();
+    this.#ensureQuietColumn();
   }
 
   start(): void {
@@ -111,6 +117,7 @@ export class MonitorService {
     intervalMs: number;
     idleForMs?: number;
     maxTicks: number;
+    quiet?: boolean;
   }): Monitor {
     if (!this.#targetExists(input.target)) throw new Error(`unknown relay target: ${input.target}`);
     if (!input.prompt.trim()) throw new Error("prompt is required");
@@ -131,7 +138,7 @@ export class MonitorService {
     const monitor: Monitor = {
       id: randomUUID(),
       target: input.target,
-      prompt: input.prompt,
+      prompt: `${input.prompt.trim()}\n\n${MONITOR_STATUS_FORMAT}`,
       intervalMs: input.intervalMs,
       idleForMs,
       maxTicks: input.maxTicks,
@@ -142,13 +149,14 @@ export class MonitorService {
       lastTickAt: null,
       lastJobId: null,
       lastError: null,
+      quiet: input.quiet ?? false,
     };
     this.#db
       .prepare(
         `INSERT INTO monitors
          (id, target, prompt, interval_ms, idle_for_ms, max_ticks, tick_count, active, created_at,
-          next_tick_at, last_tick_at, last_job_id, last_error)
-         VALUES (?, ?, ?, ?, ?, ?, 0, 1, ?, ?, NULL, NULL, NULL)`,
+          next_tick_at, last_tick_at, last_job_id, last_error, quiet)
+         VALUES (?, ?, ?, ?, ?, ?, 0, 1, ?, ?, NULL, NULL, NULL, ?)`,
       )
       .run(
         monitor.id,
@@ -159,6 +167,7 @@ export class MonitorService {
         monitor.maxTicks,
         monitor.createdAt,
         monitor.nextTickAt,
+        monitor.quiet ? 1 : 0,
       );
     return monitor;
   }
@@ -226,7 +235,11 @@ export class MonitorService {
     if (!lastActivityAt || now.getTime() - lastActivityAt.getTime() < row.idle_for_ms) return;
 
     try {
-      const job = this.#enqueue({ target: row.target, prompt: row.prompt });
+      const job = this.#enqueue({
+        target: row.target,
+        prompt: row.prompt,
+        notify: row.quiet === 1 ? undefined : "photon",
+      });
       const tickCount = row.tick_count + 1;
       this.#db
         .prepare(
@@ -252,6 +265,15 @@ export class MonitorService {
       );
     }
   }
+
+  #ensureQuietColumn(): void {
+    const columns = this.#db.prepare("PRAGMA table_info(monitors)").all() as Array<{
+      name: string;
+    }>;
+    if (!columns.some((column) => column.name === "quiet")) {
+      this.#db.exec("ALTER TABLE monitors ADD COLUMN quiet INTEGER NOT NULL DEFAULT 0");
+    }
+  }
 }
 
 function rowToMonitor(row: MonitorRow): Monitor {
@@ -269,5 +291,6 @@ function rowToMonitor(row: MonitorRow): Monitor {
     lastTickAt: row.last_tick_at,
     lastJobId: row.last_job_id,
     lastError: row.last_error,
+    quiet: row.quiet === 1,
   };
 }

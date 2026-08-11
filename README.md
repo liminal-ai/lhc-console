@@ -70,7 +70,12 @@ They use the relay's loopback-only bearer authentication. A due monitor does
 not stack another tick while its previous relay job is still queued, blocked,
 or running. It also waits until the target thread has been idle for three
 minutes by default; `--idle-for` overrides that floor. Skipped ticks do not
-consume the maximum tick budget.
+consume the maximum tick budget. Monitor replies are delivered to Lee through
+the target's existing Photon delivery path by default, with delivery failures
+recorded on the relay job. Use `--quiet` only when a monitor is intentionally
+noisy and should not reach the phone. Every registered monitor prompt also
+ends with a standing instruction to return a short, plain-English,
+phone-skimmable phase-level status without ids or jargon.
 
 ```bash
 lhc-monitor add fable 5m --idle-for 3m --max-ticks 12 \
@@ -78,6 +83,9 @@ lhc-monitor add fable 5m --idle-for 3m --max-ticks 12 \
 lhc-monitor list
 lhc-monitor remove <id>
 ```
+
+Add `--quiet` to the `add` command to disable default reply delivery for that
+monitor.
 
 The corresponding authenticated API is `POST/GET /api/monitors` and
 `DELETE /api/monitors/:id`. Generic command targets and richer goal-based exit

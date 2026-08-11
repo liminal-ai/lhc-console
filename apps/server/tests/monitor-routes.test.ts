@@ -51,6 +51,7 @@ describe("monitor HTTP API", () => {
         interval: "5m",
         idleFor: "10m",
         maxTicks: 12,
+        quiet: true,
       },
     });
     expect(added.statusCode).toBe(201);
@@ -58,6 +59,7 @@ describe("monitor HTTP API", () => {
       target: "fable",
       intervalMs: 300_000,
       idleForMs: 600_000,
+      quiet: true,
       maxTicks: 12,
       tickCount: 0,
       active: true,

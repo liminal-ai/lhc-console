@@ -1,6 +1,9 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
 import { deliverRelayJob, type RelayDeliveryContext } from "../src/relay-delivery.ts";
-import type { RelayJob } from "../src/relay.ts";
+import { RelayQueue, type RelayJob } from "../src/relay.ts";
 
 function job(overrides: Partial<RelayJob> = {}): RelayJob {
   return {
@@ -31,5 +34,37 @@ describe("deliverRelayJob", () => {
     await expect(
       deliverRelayJob(job({ delivery: { channel: "mail", destination: { inbox: "x" } } }), context),
     ).rejects.toThrow("unsupported delivery channel: mail");
+  });
+
+  it("defaults Photon notifications to the target's latest known direct destination", async () => {
+    const consoleHome = mkdtempSync(join(tmpdir(), "lhc-delivery-default-"));
+    const queue = new RelayQueue({
+      dbPath: join(consoleHome, "relay.sqlite"),
+      targets: {
+        fable: { hostId: "pi", threadId: "th_1", cwd: consoleHome, command: "true", args: [] },
+      },
+      isBusy: () => false,
+      execute: async () => "unused",
+    });
+    queue.enqueue({
+      target: "fable",
+      prompt: "owner message",
+      delivery: { channel: "photon", destination: { spaceId: "owner-dm" } },
+    });
+    await queue.close();
+    const sent: Array<{ agentId: string; spaceId: string; text: string }> = [];
+
+    await deliverRelayJob(job({ notify: "photon", delivery: null }), {
+      agents: [],
+      consoleHome,
+      photonConnectors: {
+        send: async (agentId: string, spaceId: string, text: string) => {
+          sent.push({ agentId, spaceId, text });
+        },
+      } as RelayDeliveryContext["photonConnectors"],
+    });
+
+    expect(sent).toEqual([{ agentId: "fable", spaceId: "owner-dm", text: "reply" }]);
+    rmSync(consoleHome, { recursive: true, force: true });
   });
 });

@@ -18,12 +18,13 @@ export function registerMonitorRoutes(app: FastifyInstance, options: MonitorRout
   app.get("/api/monitors", { preHandler: authorize }, async () => options.service.list());
 
   app.post("/api/monitors", { preHandler: authorize }, async (request, reply) => {
-    const { target, prompt, interval, idleFor, maxTicks } = (request.body ?? {}) as {
+    const { target, prompt, interval, idleFor, maxTicks, quiet } = (request.body ?? {}) as {
       target?: unknown;
       prompt?: unknown;
       interval?: unknown;
       idleFor?: unknown;
       maxTicks?: unknown;
+      quiet?: unknown;
     };
     if (typeof target !== "string" || !target.trim()) {
       return reply.code(400).send({ error: "target is required" });
@@ -50,6 +51,9 @@ export function registerMonitorRoutes(app: FastifyInstance, options: MonitorRout
     if (!Number.isSafeInteger(maxTicks) || Number(maxTicks) <= 0) {
       return reply.code(400).send({ error: "maxTicks must be a positive integer" });
     }
+    if (quiet !== undefined && typeof quiet !== "boolean") {
+      return reply.code(400).send({ error: "quiet must be a boolean" });
+    }
     try {
       const monitor = options.service.add({
         target: target.trim(),
@@ -57,6 +61,7 @@ export function registerMonitorRoutes(app: FastifyInstance, options: MonitorRout
         intervalMs,
         idleForMs,
         maxTicks: Number(maxTicks),
+        quiet: quiet ?? false,
       });
       return reply.code(201).send(monitor);
     } catch (error) {

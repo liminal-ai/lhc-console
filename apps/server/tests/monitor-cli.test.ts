@@ -42,6 +42,7 @@ describe("lhc-monitor CLI", () => {
     expect(stdout.join("\n")).toContain(
       'lhc-monitor add fable 5m --idle-for 3m --max-ticks 12 --prompt "Continue the goal."',
     );
+    expect(stdout.join("\n")).toContain("--quiet");
     expect(stdout.join("\n")).toContain("lhc-monitor list");
     expect(stdout.join("\n")).toContain("lhc-monitor remove <id>");
   });
@@ -60,6 +61,7 @@ describe("lhc-monitor CLI", () => {
         "12",
         "--prompt",
         "Continue the goal.",
+        "--quiet",
       ],
       {
         fetch: async (url, init) => {
@@ -82,6 +84,7 @@ describe("lhc-monitor CLI", () => {
         idleFor: "10m",
         maxTicks: 12,
         prompt: "Continue the goal.",
+        quiet: true,
       }),
     });
     const headers = new Headers(requests[0]?.init?.headers);

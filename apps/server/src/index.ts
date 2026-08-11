@@ -106,7 +106,7 @@ relayQueue.start();
 
 const monitorService = new MonitorService({
   dbPath: join(consoleHome, "monitor.sqlite"),
-  enqueue: ({ target, prompt }) => relayQueue.enqueue({ target, prompt }),
+  enqueue: ({ target, prompt, notify }) => relayQueue.enqueue({ target, prompt, notify }),
   getJob: (id) => relayQueue.get(id),
   targetExists: (target) => Boolean(agentRegistry.relayTargets[target]),
   lastActivityAt: (targetId) => {

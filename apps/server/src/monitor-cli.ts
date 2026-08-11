@@ -26,7 +26,7 @@ interface MonitorSummary {
 const HELP = `lhc-monitor — external periodic wake for an LHC relay target
 
 Usage:
-  lhc-monitor add <target> <interval> [--idle-for <duration>] --max-ticks <n> --prompt <text>
+  lhc-monitor add <target> <interval> [--idle-for <duration>] --max-ticks <n> --prompt <text> [--quiet]
   lhc-monitor list
   lhc-monitor remove <id>
 
@@ -36,6 +36,7 @@ Examples:
   lhc-monitor remove <id>
 
 Intervals and idle floors: 30s, 5m, 2h. --idle-for defaults to 3m.
+Replies are delivered to the target's Photon channel by default; --quiet disables delivery.
 Credentials come from LHC_RELAY_TOKEN or
 ~/.lhc-console/relay-token; the API defaults to http://127.0.0.1:5959.`;
 
@@ -65,10 +66,13 @@ async function add(args: string[], deps: CliDeps): Promise<number> {
   let prompt: string | undefined;
   let idleFor = "3m";
   let maxTicks: number | undefined;
+  let quiet = false;
   for (let index = 2; index < args.length; index += 1) {
     const flag = args[index];
     const value = args[index + 1];
-    if (flag === "--prompt" && value !== undefined) {
+    if (flag === "--quiet") {
+      quiet = true;
+    } else if (flag === "--prompt" && value !== undefined) {
       prompt = value;
       index += 1;
     } else if (flag === "--max-ticks" && value !== undefined) {
@@ -88,7 +92,7 @@ async function add(args: string[], deps: CliDeps): Promise<number> {
   const result = await api(deps, "/api/monitors", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ target, interval, idleFor, maxTicks, prompt }),
+    body: JSON.stringify({ target, interval, idleFor, maxTicks, prompt, quiet }),
   });
   deps.stdout(String((result as { id: string }).id));
   return 0;

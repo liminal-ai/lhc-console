@@ -57,6 +57,7 @@ import { loadAgentRegistry } from "./agent-registry.ts";
 import { PhotonConnectorManager } from "./photon-connector.ts";
 import { MonitorService } from "./monitor.ts";
 import { registerMonitorRoutes } from "./monitor-routes.ts";
+import { registerAgentRoutes } from "./agent-routes.ts";
 
 const PORT = Number(process.env.LHC_CONSOLE_PORT ?? 5959);
 
@@ -108,7 +109,7 @@ const monitorService = new MonitorService({
   dbPath: join(consoleHome, "monitor.sqlite"),
   enqueue: ({ target, prompt, notify }) => relayQueue.enqueue({ target, prompt, notify }),
   getJob: (id) => relayQueue.get(id),
-  targetExists: (target) => Boolean(agentRegistry.relayTargets[target]),
+  targetExists: (target) => Object.hasOwn(agentRegistry.relayTargets, target),
   lastActivityAt: (targetId) => {
     const target = agentRegistry.relayTargets[targetId];
     if (!target) return null;
@@ -228,6 +229,7 @@ registerRelayRoutes(app, {
   token: relayToken,
 });
 registerMonitorRoutes(app, { service: monitorService, token: relayToken });
+registerAgentRoutes(app, { agents: agentRegistry.agents, token: relayToken });
 
 app.get("/api/hosts", async () => {
   const launchable = new Set(launchableHostIds(discoverHosts().map((h) => h.id)));

@@ -54,6 +54,572 @@ describe("RelayQueue", () => {
     }
   });
 
+  it("rejects invalid jobClass values at enqueue time", async () => {
+    const queue = createQueue({
+      dbPath: tempDb(),
+      targets: {
+        fable: {
+          hostId: "pi-lhc",
+          threadId: "th_fable",
+          cwd: "/tmp",
+          command: "unused",
+          args: [],
+        },
+      },
+      isBusy: () => false,
+      execute: async () => "ok",
+    });
+    try {
+      expect(() =>
+        queue.enqueue({
+          target: "fable",
+          prompt: "bad class",
+          jobClass: "urgent" as "prioritized",
+        }),
+      ).toThrow(/jobClass/);
+    } finally {
+      await queue.close();
+    }
+  });
+
+  it("normalizes malformed persisted job_class values during migration and read", async () => {
+    const dbPath = tempDb();
+    const seed = new DatabaseSync(dbPath);
+    seed.exec(`
+      CREATE TABLE relay_jobs (
+        id TEXT PRIMARY KEY, target TEXT NOT NULL, prompt TEXT NOT NULL,
+        status TEXT NOT NULL, output TEXT, error TEXT, created_at TEXT NOT NULL,
+        started_at TEXT, finished_at TEXT, notify TEXT, delivery_status TEXT,
+        delivery_error TEXT, owner_pid INTEGER, job_class TEXT
+      )
+    `);
+    seed
+      .prepare(
+        `INSERT INTO relay_jobs
+         (id, target, prompt, status, created_at, job_class)
+         VALUES (?, ?, ?, 'queued', ?, ?)`,
+      )
+      .run("bad-class", "fable", "legacy", "2020-01-01T00:00:00.000Z", "urgent");
+    seed
+      .prepare(
+        `INSERT INTO relay_jobs
+         (id, target, prompt, status, created_at, job_class)
+         VALUES (?, ?, ?, 'queued', ?, NULL)`,
+      )
+      .run("null-class", "fable", "legacy null", "2020-01-01T00:00:01.000Z");
+    seed.close();
+
+    const queue = createQueue({
+      dbPath,
+      targets: {
+        fable: {
+          hostId: "pi-lhc",
+          threadId: "th_fable",
+          cwd: "/tmp",
+          command: "unused",
+          args: [],
+        },
+      },
+      isBusy: () => false,
+      execute: async () => "ok",
+      busyPollMs: 5,
+    });
+    try {
+      expect(queue.get("bad-class")?.jobClass).toBe("deprioritized");
+      expect(queue.get("null-class")?.jobClass).toBe("deprioritized");
+      const db = new DatabaseSync(dbPath);
+      try {
+        const rows = db
+          .prepare("SELECT id, job_class FROM relay_jobs WHERE id IN ('bad-class', 'null-class')")
+          .all() as Array<{ id: string; job_class: string }>;
+        expect(rows).toHaveLength(2);
+        expect(rows.every((row) => row.job_class === "deprioritized")).toBe(true);
+      } finally {
+        db.close();
+      }
+    } finally {
+      await queue.close();
+    }
+  });
+
+  it("fences queued reminders with a durable cancellation tombstone", async () => {
+    const calls: string[] = [];
+    const queue = createQueue({
+      dbPath: tempDb(),
+      targets: {
+        fable: {
+          hostId: "pi-lhc",
+          threadId: "th_fable",
+          cwd: "/tmp",
+          command: "unused",
+          args: [],
+        },
+      },
+      isBusy: () => false,
+      execute: async (_target, prompt) => {
+        calls.push(prompt);
+        return `reply:${prompt}`;
+      },
+      busyPollMs: 5,
+    });
+    try {
+      const job = queue.enqueue({
+        id: "reminder-1",
+        target: "fable",
+        prompt: "nudge",
+        jobClass: "prioritized",
+      });
+      queue.cancelJob(job.id);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(calls).toEqual([]);
+      expect(queue.get(job.id)?.status).toBe("cancelled");
+      queue.cancelJob(job.id);
+      expect(queue.get(job.id)?.status).toBe("cancelled");
+    } finally {
+      await queue.close();
+    }
+  });
+
+  it("emits settlement when the scheduler applies an externally inserted tombstone", async () => {
+    const dbPath = tempDb();
+    const settled: string[] = [];
+    const queue = createQueue({
+      dbPath,
+      targets: {
+        fable: {
+          hostId: "pi-lhc",
+          threadId: "th_fable",
+          cwd: "/tmp",
+          command: "unused",
+          args: [],
+        },
+      },
+      isBusy: () => true,
+      execute: async () => "unreachable",
+      busyPollMs: 5,
+    });
+    queue.addSettledListener((job) => {
+      settled.push(job.id);
+    });
+    try {
+      const job = queue.enqueue({ target: "fable", prompt: "cancel externally" });
+      await expect.poll(() => queue.get(job.id)?.status, { timeout: 250 }).toBe("blocked");
+      const db = new DatabaseSync(dbPath);
+      db.prepare("INSERT INTO relay_cancelled_jobs (id, cancelled_at) VALUES (?, ?)").run(
+        job.id,
+        new Date().toISOString(),
+      );
+      db.close();
+      queue.pokeSchedule("fable");
+      await expect.poll(() => queue.get(job.id)?.status, { timeout: 250 }).toBe("cancelled");
+      expect(settled).toEqual([job.id]);
+    } finally {
+      await queue.close();
+    }
+  });
+
+  it("does not preempt a running turn when a reminder is cancelled", async () => {
+    let release: (() => void) | undefined;
+    const calls: string[] = [];
+    const queue = createQueue({
+      dbPath: tempDb(),
+      targets: {
+        fable: {
+          hostId: "pi-lhc",
+          threadId: "th_fable",
+          cwd: "/tmp",
+          command: "unused",
+          args: [],
+        },
+      },
+      isBusy: () => false,
+      execute: async (_target, prompt) => {
+        calls.push(prompt);
+        if (prompt === "running") {
+          await new Promise<void>((resolve) => {
+            release = resolve;
+          });
+        }
+        return `reply:${prompt}`;
+      },
+      busyPollMs: 5,
+    });
+    try {
+      const job = queue.enqueue({ target: "fable", prompt: "running" });
+      await expect.poll(() => queue.get(job.id)?.status).toBe("running");
+      queue.cancelJob(job.id);
+      expect(queue.get(job.id)?.status).toBe("running");
+      release?.();
+      await queue.wait(job.id);
+      expect(calls).toEqual(["running"]);
+      expect(queue.get(job.id)?.status).toBe("completed");
+    } finally {
+      await queue.close();
+    }
+  });
+
+  it("rejects enqueue for tombstoned reminder ids", async () => {
+    const queue = createQueue({
+      dbPath: tempDb(),
+      targets: {
+        fable: {
+          hostId: "pi-lhc",
+          threadId: "th_fable",
+          cwd: "/tmp",
+          command: "unused",
+          args: [],
+        },
+      },
+      isBusy: () => false,
+      execute: async () => "ok",
+    });
+    try {
+      queue.cancelJob("never-inserted");
+      expect(() =>
+        queue.enqueue({
+          id: "never-inserted",
+          target: "fable",
+          prompt: "too late",
+          jobClass: "prioritized",
+        }),
+      ).toThrow(/cancelled/i);
+    } finally {
+      await queue.close();
+    }
+  });
+
+  it("isolates synchronous and asynchronous settled listener failures and supports removal", async () => {
+    const calls: string[] = [];
+    const queue = createQueue({
+      dbPath: tempDb(),
+      targets: {
+        fable: {
+          hostId: "pi-lhc",
+          threadId: "th_fable",
+          cwd: "/tmp",
+          command: "unused",
+          args: [],
+        },
+      },
+      isBusy: () => false,
+      execute: async () => "ok",
+      busyPollMs: 5,
+    });
+    const removeFirst = queue.addSettledListener(() => {
+      throw new Error("listener boom");
+    });
+    const removeAsync = queue.addSettledListener(async () => {
+      await Promise.resolve();
+      throw new Error("async listener boom");
+    });
+    const removeSecond = queue.addSettledListener((job) => {
+      calls.push(job.id);
+    });
+    try {
+      const job = queue.enqueue({ target: "fable", prompt: "hello" });
+      await queue.wait(job.id);
+      expect(calls).toEqual([job.id]);
+      removeFirst();
+      removeAsync();
+      removeSecond();
+      const second = queue.enqueue({ target: "fable", prompt: "again" });
+      await queue.wait(second.id);
+      expect(calls).toEqual([job.id]);
+    } finally {
+      await queue.close();
+    }
+  });
+
+  it("defaults new jobs to deprioritized and migrates legacy rows", async () => {
+    const dbPath = tempDb();
+    const seed = new DatabaseSync(dbPath);
+    seed.exec(`
+      CREATE TABLE relay_jobs (
+        id TEXT PRIMARY KEY, target TEXT NOT NULL, prompt TEXT NOT NULL,
+        status TEXT NOT NULL, output TEXT, error TEXT, created_at TEXT NOT NULL,
+        started_at TEXT, finished_at TEXT, notify TEXT, delivery_status TEXT,
+        delivery_error TEXT, owner_pid INTEGER
+      )
+    `);
+    seed
+      .prepare(
+        `INSERT INTO relay_jobs
+         (id, target, prompt, status, created_at)
+         VALUES (?, ?, ?, 'queued', ?)`,
+      )
+      .run("legacy", "fable", "old job", "2020-01-01T00:00:00.000Z");
+    seed.close();
+
+    const queue = createQueue({
+      dbPath,
+      targets: {
+        fable: {
+          hostId: "pi-lhc",
+          threadId: "th_fable",
+          cwd: "/tmp",
+          command: "unused",
+          args: [],
+        },
+      },
+      isBusy: () => false,
+      execute: async () => "ok",
+      busyPollMs: 5,
+    });
+    try {
+      const created = queue.enqueue({ target: "fable", prompt: "new job" });
+      expect(created.jobClass).toBe("deprioritized");
+      expect(queue.get("legacy")?.jobClass).toBe("deprioritized");
+    } finally {
+      await queue.close();
+    }
+  });
+
+  it("pokes the target when an idempotent enqueue retries an existing durable id", async () => {
+    let busy = true;
+    const calls: string[] = [];
+    const queue = createQueue({
+      dbPath: tempDb(),
+      targets: {
+        fable: {
+          hostId: "pi-lhc",
+          threadId: "th_fable",
+          cwd: "/tmp",
+          command: "unused",
+          args: [],
+        },
+      },
+      isBusy: () => busy,
+      execute: async (_target, prompt) => {
+        calls.push(prompt);
+        return `reply:${prompt}`;
+      },
+      busyPollMs: 5,
+    });
+    try {
+      const first = queue.enqueue({
+        id: "stable-reminder",
+        target: "fable",
+        prompt: "continue",
+        jobClass: "prioritized",
+      });
+      await expect.poll(() => queue.get(first.id)?.status, { timeout: 500 }).toBe("blocked");
+      busy = false;
+      queue.enqueue({
+        id: "stable-reminder",
+        target: "fable",
+        prompt: "continue",
+        jobClass: "prioritized",
+      });
+      await expect.poll(() => calls, { timeout: 500 }).toEqual(["continue"]);
+      expect(queue.get(first.id)?.status).toBe("completed");
+    } finally {
+      await queue.close();
+    }
+  });
+
+  it("idempotently returns an existing job when an explicit durable id is retried", async () => {
+    const queue = createQueue({
+      dbPath: tempDb(),
+      targets: {
+        fable: {
+          hostId: "pi-lhc",
+          threadId: "th_fable",
+          cwd: "/tmp",
+          command: "unused",
+          args: [],
+        },
+      },
+      isBusy: () => true,
+      execute: async () => "unreachable",
+      busyPollMs: 5,
+    });
+    try {
+      const first = queue.enqueue({
+        id: "stable-reminder",
+        target: "fable",
+        prompt: "continue",
+        jobClass: "prioritized",
+      });
+      const retried = queue.enqueue({
+        id: "stable-reminder",
+        target: "fable",
+        prompt: "continue",
+        jobClass: "prioritized",
+      });
+      expect(retried).toEqual(first);
+      expect(queue.get("stable-reminder")).toEqual(first);
+    } finally {
+      await queue.close();
+    }
+  });
+
+  it("resolves waiters when a queued job is cancelled", async () => {
+    const queue = createQueue({
+      dbPath: tempDb(),
+      targets: {
+        fable: {
+          hostId: "pi-lhc",
+          threadId: "th_fable",
+          cwd: "/tmp",
+          command: "unused",
+          args: [],
+        },
+      },
+      isBusy: () => true,
+      execute: async () => "unreachable",
+      busyPollMs: 5,
+    });
+    try {
+      const job = queue.enqueue({ target: "fable", prompt: "cancel me" });
+      const settled = queue.wait(job.id);
+      queue.cancelJob(job.id);
+      await expect(settled).resolves.toMatchObject({ id: job.id, status: "cancelled" });
+    } finally {
+      await queue.close();
+    }
+  });
+
+  it("runs queued prioritized jobs before deprioritized jobs while preserving FIFO within each class", async () => {
+    let releaseFirst: (() => void) | undefined;
+    const calls: string[] = [];
+    const queue = createQueue({
+      dbPath: tempDb(),
+      targets: {
+        fable: {
+          hostId: "pi-lhc",
+          threadId: "th_fable",
+          cwd: "/tmp",
+          command: "unused",
+          args: [],
+        },
+      },
+      isBusy: () => false,
+      execute: async (_target, prompt) => {
+        calls.push(prompt);
+        if (prompt === "dep-a") {
+          await new Promise<void>((resolve) => {
+            releaseFirst = resolve;
+          });
+        }
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return `reply:${prompt}`;
+      },
+      busyPollMs: 5,
+    });
+
+    try {
+      const depFirst = queue.enqueue({ target: "fable", prompt: "dep-a" });
+      await expect.poll(() => queue.get(depFirst.id)?.status).toBe("running");
+      const priFirst = queue.enqueue({ target: "fable", prompt: "pri-a", jobClass: "prioritized" });
+      const depSecond = queue.enqueue({ target: "fable", prompt: "dep-b" });
+      const priSecond = queue.enqueue({
+        target: "fable",
+        prompt: "pri-b",
+        jobClass: "prioritized",
+      });
+      releaseFirst?.();
+      await Promise.all([
+        queue.wait(depFirst.id),
+        queue.wait(priFirst.id),
+        queue.wait(depSecond.id),
+        queue.wait(priSecond.id),
+      ]);
+      expect(calls).toEqual(["dep-a", "pri-a", "pri-b", "dep-b"]);
+    } finally {
+      await queue.close();
+    }
+  });
+
+  it("claims the highest-priority queued job when a prioritized job arrives during isBusy", async () => {
+    let releaseBusy: (() => void) | undefined;
+    const calls: string[] = [];
+    const queue = createQueue({
+      dbPath: tempDb(),
+      targets: {
+        fable: {
+          hostId: "pi-lhc",
+          threadId: "th_fable",
+          cwd: "/tmp",
+          command: "unused",
+          args: [],
+        },
+      },
+      isBusy: () => {
+        if (!releaseBusy) return false;
+        return new Promise<boolean>((resolve) => {
+          const gate = releaseBusy;
+          releaseBusy = undefined;
+          void new Promise<void>((done) => {
+            gate?.();
+            done();
+          }).then(() => resolve(false));
+        });
+      },
+      execute: async (_target, prompt) => {
+        calls.push(prompt);
+        return `reply:${prompt}`;
+      },
+      busyPollMs: 5,
+    });
+
+    try {
+      const dep = queue.enqueue({ target: "fable", prompt: "dep-wait" });
+      releaseBusy = () => {
+        queue.enqueue({ target: "fable", prompt: "pri-jump", jobClass: "prioritized" });
+      };
+      await expect.poll(() => calls.length, { timeout: 2000 }).toBe(2);
+      expect(calls).toEqual(["pri-jump", "dep-wait"]);
+      await queue.wait(dep.id);
+    } finally {
+      await queue.close();
+    }
+  });
+
+  it("does not preempt a running turn for a prioritized job", async () => {
+    let release: (() => void) | undefined;
+    const calls: string[] = [];
+    const queue = createQueue({
+      dbPath: tempDb(),
+      targets: {
+        fable: {
+          hostId: "pi-lhc",
+          threadId: "th_fable",
+          cwd: "/tmp",
+          command: "unused",
+          args: [],
+        },
+      },
+      isBusy: () => false,
+      execute: async (_target, prompt) => {
+        calls.push(prompt);
+        if (prompt === "running") {
+          await new Promise<void>((resolve) => {
+            release = resolve;
+          });
+        }
+        return `reply:${prompt}`;
+      },
+      busyPollMs: 5,
+    });
+
+    try {
+      const running = queue.enqueue({ target: "fable", prompt: "running" });
+      await expect.poll(() => queue.get(running.id)?.status).toBe("running");
+      const prioritized = queue.enqueue({
+        target: "fable",
+        prompt: "jump",
+        jobClass: "prioritized",
+      });
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(calls).toEqual(["running"]);
+      release?.();
+      await queue.wait(prioritized.id);
+      expect(calls).toEqual(["running", "jump"]);
+    } finally {
+      await queue.close();
+    }
+  });
+
   it("runs jobs for one thread strictly one at a time", async () => {
     let active = 0;
     let maxActive = 0;
@@ -1067,5 +1633,173 @@ describe("RelayQueue", () => {
     const after = catchUp.readWakeSnapshot("chat-guid-group")[0];
     expect(after).toBe(before);
     await restarted.close();
+  });
+});
+
+const leeTarget = {
+  hostId: "lee",
+  threadId: "lee",
+  cwd: "/tmp",
+  command: "unused",
+  args: [],
+};
+
+describe("RelayQueue outbound lee jobs", () => {
+  it("does not execute an agent turn for outbound lee jobs", async () => {
+    let executed = 0;
+    const delivered: string[] = [];
+    const queue = createQueue({
+      dbPath: tempDb(),
+      targets: { lee: leeTarget },
+      isBusy: () => false,
+      execute: async () => {
+        executed += 1;
+        return "unused";
+      },
+      deliver: async (job) => {
+        delivered.push(job.output ?? "");
+      },
+    });
+    try {
+      const submitted = queue.enqueue({
+        target: "lee",
+        prompt: "ping",
+        jobKind: "outbound",
+        sender: "fable",
+        delivery: {
+          channel: "photon",
+          destination: { spaceId: "fable-home" },
+          metadata: { kind: "outbound_lee", senderAgentId: "fable", connectorAgentId: "fable" },
+        },
+      });
+      const settled = await queue.wait(submitted.id);
+      await expect.poll(() => queue.get(submitted.id)?.deliveryStatus).toBe("delivered");
+      expect(executed).toBe(0);
+      expect(settled.status).toBe("completed");
+      expect(delivered).toEqual(["ping"]);
+    } finally {
+      await queue.close();
+    }
+  });
+
+  it("settles outbound jobs only after delivery succeeds or definitively fails", async () => {
+    let attempts = 0;
+    const queue = createQueue({
+      dbPath: tempDb(),
+      targets: { lee: leeTarget },
+      isBusy: () => false,
+      execute: async () => "unused",
+      deliver: async () => {
+        attempts += 1;
+        if (attempts < 2) throw new Error("temporary send failure");
+      },
+      busyPollMs: 5,
+    });
+    try {
+      const submitted = queue.enqueue({
+        target: "lee",
+        prompt: "retry me",
+        jobKind: "outbound",
+        sender: "fable",
+        delivery: {
+          channel: "photon",
+          destination: { spaceId: "fable-home" },
+          metadata: { kind: "outbound_lee", senderAgentId: "fable", connectorAgentId: "fable" },
+        },
+      });
+      const pending = queue.get(submitted.id);
+      expect(pending?.status).not.toBe("failed");
+      const settled = await queue.wait(submitted.id);
+      await expect
+        .poll(() => queue.get(submitted.id)?.deliveryStatus, { timeout: 2_000 })
+        .toBe("delivered");
+      expect(attempts).toBeGreaterThanOrEqual(2);
+      expect(settled.deliveryStatus).toBe("delivered");
+    } finally {
+      await queue.close();
+    }
+  });
+
+  it("retries outbound delivery after restart until delivery settles", async () => {
+    const dbPath = tempDb();
+    let attempts = 0;
+    const first = createQueue({
+      dbPath,
+      targets: { lee: leeTarget },
+      isBusy: () => false,
+      execute: async () => "unused",
+      deliver: async () => {
+        attempts += 1;
+        throw new Error("send failed");
+      },
+      busyPollMs: 5,
+    });
+    const submitted = first.enqueue({
+      target: "lee",
+      prompt: "after restart",
+      jobKind: "outbound",
+      sender: "fable",
+      delivery: {
+        channel: "photon",
+        destination: { spaceId: "fable-home" },
+        metadata: { kind: "outbound_lee", senderAgentId: "fable", connectorAgentId: "fable" },
+      },
+    });
+    await expect
+      .poll(() => first.get(submitted.id)?.deliveryStatus, { timeout: 1_000 })
+      .toBe("failed");
+    await first.close();
+
+    attempts = 0;
+    const second = createQueue({
+      dbPath,
+      targets: { lee: leeTarget },
+      isBusy: () => false,
+      execute: async () => "unused",
+      deliver: async (job) => {
+        attempts += 1;
+        expect(job.output).toBe("after restart");
+      },
+      busyPollMs: 5,
+    });
+    try {
+      const settled = await second.wait(submitted.id);
+      await expect
+        .poll(() => second.get(submitted.id)?.deliveryStatus, { timeout: 2_000 })
+        .toBe("delivered");
+      expect(attempts).toBeGreaterThanOrEqual(1);
+      expect(settled.deliveryStatus).toBe("delivered");
+    } finally {
+      await second.close();
+    }
+  });
+
+  it("keeps prioritized ordinary agent jobs ahead of deprioritized work", async () => {
+    const calls: string[] = [];
+    const queue = createQueue({
+      dbPath: tempDb(),
+      targets: {
+        fable: {
+          hostId: "pi-lhc",
+          threadId: "th_fable",
+          cwd: "/tmp",
+          command: "unused",
+          args: [],
+        },
+      },
+      isBusy: () => false,
+      execute: async (_target, prompt) => {
+        calls.push(prompt);
+        return `reply:${prompt}`;
+      },
+      busyPollMs: 5,
+    });
+    try {
+      queue.enqueue({ target: "fable", prompt: "slow", jobClass: "deprioritized" });
+      queue.enqueue({ target: "fable", prompt: "urgent", jobClass: "prioritized" });
+      await expect.poll(() => calls, { timeout: 1_000 }).toEqual(["urgent", "slow"]);
+    } finally {
+      await queue.close();
+    }
   });
 });

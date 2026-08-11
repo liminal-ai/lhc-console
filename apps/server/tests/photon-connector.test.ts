@@ -63,8 +63,7 @@ function agentRecord(): AgentRecord {
 }
 
 function relayQueue(execute: RelayExecute, sidecar: FakeSidecar, consoleHome: string): RelayQueue {
-  const dir = mkdtempSync(join(tmpdir(), "lhc-photon-relay-"));
-  dirs.push(dir);
+  mkdirSync(consoleHome, { recursive: true });
   const photonConnectors = {
     send: async (_agentId: string, spaceId: string, text: string) => {
       const response = await fetch(`${sidecar.baseUrl}/send`, {
@@ -79,7 +78,7 @@ function relayQueue(execute: RelayExecute, sidecar: FakeSidecar, consoleHome: st
     },
   } as PhotonConnectorManager;
   const queue = new RelayQueue({
-    dbPath: join(dir, "relay.sqlite"),
+    dbPath: join(consoleHome, "relay.sqlite"),
     targets: { fable: agentRecord().relay },
     isBusy: () => false,
     execute,
@@ -232,6 +231,32 @@ async function startConnector(options: {
 }
 
 describe("PhotonConnector", () => {
+  it("enqueues authorized owner DMs as prioritized relay jobs", async () => {
+    const sidecar = await startFakeSidecar();
+    const { dir, queue } = await startConnector({
+      sidecar,
+      execute: async () => "agent reply",
+    });
+    sidecar.pushInbound(dmEvent({ text: "status?" }));
+    await expect
+      .poll(
+        () => {
+          const db = new DatabaseSync(join(dir, "relay.sqlite"));
+          try {
+            const row = db.prepare("SELECT job_class FROM relay_jobs LIMIT 1").get() as
+              | { job_class: string }
+              | undefined;
+            return row?.job_class;
+          } finally {
+            db.close();
+          }
+        },
+        { timeout: 1_000 },
+      )
+      .toBe("prioritized");
+    await queue.close();
+  });
+
   it("routes authorized owner DMs through relay and replies in the originating space", async () => {
     const sidecar = await startFakeSidecar();
     const prompts: string[] = [];

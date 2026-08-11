@@ -60,4 +60,29 @@ describe("executeRelayTarget", () => {
     controller.abort();
     await expect(running).rejects.toThrow("aborted");
   });
+
+  it("injects LHC_AGENT_ID for durable agent self-identification", async () => {
+    const prompt = "probe";
+    const withAgentId = {
+      ...target,
+      args: ["-e", "process.stdout.write(process.env.LHC_AGENT_ID + ':' + process.argv[1])"],
+    };
+    await expect(
+      executeRelayTarget(withAgentId, prompt, {
+        timeoutMs: 1000,
+        env: { LHC_AGENT_ID: "fable" },
+      }),
+    ).resolves.toBe("fable:probe");
+  });
+
+  it("preserves the service environment when a target adds its own variables", async () => {
+    const withTargetEnv = {
+      ...target,
+      env: { LHC_AGENT_ID: "fable" },
+      args: ["-e", "process.stdout.write(process.env.PATH + ':' + process.env.LHC_AGENT_ID)"],
+    };
+    await expect(executeRelayTarget(withTargetEnv, "ignored", { timeoutMs: 1000 })).resolves.toBe(
+      `${process.env.PATH}:fable`,
+    );
+  });
 });

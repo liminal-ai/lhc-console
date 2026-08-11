@@ -11,6 +11,9 @@ function job(overrides: Partial<RelayJob> = {}): RelayJob {
     target: "fable",
     prompt: "hello",
     status: "completed",
+    jobClass: "deprioritized",
+    jobKind: "agent",
+    sender: null,
     output: "reply",
     error: null,
     createdAt: "2026-01-01T00:00:00.000Z",
@@ -66,5 +69,97 @@ describe("deliverRelayJob", () => {
 
     expect(sent).toEqual([{ agentId: "fable", spaceId: "owner-dm", text: "reply" }]);
     rmSync(consoleHome, { recursive: true, force: true });
+  });
+
+  it("delivers lee outbound jobs from the sender connector", async () => {
+    const sent: Array<{ agentId: string; spaceId: string; text: string }> = [];
+    await deliverRelayJob(
+      job({
+        target: "lee",
+        prompt: "ping",
+        output: "ping",
+        jobKind: "outbound",
+        delivery: {
+          channel: "photon",
+          destination: { spaceId: "fable-home" },
+          metadata: { kind: "outbound_lee", senderAgentId: "fable", connectorAgentId: "fable" },
+        },
+      }),
+      {
+        agents: [
+          {
+            id: "fable",
+            name: "Fable",
+            description: "durable agent",
+            duties: [],
+            ownerSenderIds: ["owner"],
+            mentionPatterns: [],
+            channels: {
+              photon: {
+                address: "http://127.0.0.1:1",
+                envFile: ".env",
+                notifySpaceId: "fable-home",
+              },
+            },
+            relay: {
+              hostId: "pi",
+              threadId: "th_fable",
+              cwd: "/tmp",
+              command: "true",
+              args: [],
+            },
+          },
+        ],
+        consoleHome: "/tmp",
+        photonConnectors: {
+          send: async (agentId: string, spaceId: string, text: string) => {
+            sent.push({ agentId, spaceId, text });
+          },
+        } as RelayDeliveryContext["photonConnectors"],
+      },
+    );
+    expect(sent).toEqual([{ agentId: "fable", spaceId: "fable-home", text: "ping" }]);
+  });
+
+  it("fails lee delivery without exposing secrets when no connector is usable", async () => {
+    await expect(
+      deliverRelayJob(
+        job({
+          target: "lee",
+          prompt: "ping",
+          output: "ping",
+          jobKind: "outbound",
+          delivery: {
+            channel: "photon",
+            destination: { spaceId: "missing" },
+            metadata: { kind: "outbound_lee", senderAgentId: "scribe", connectorAgentId: "scribe" },
+          },
+        }),
+        {
+          agents: [
+            {
+              id: "scribe",
+              name: "Scribe",
+              description: "durable agent",
+              duties: [],
+              ownerSenderIds: ["owner"],
+              mentionPatterns: [],
+              channels: {},
+              relay: {
+                hostId: "pi",
+                threadId: "th_scribe",
+                cwd: "/tmp",
+                command: "true",
+                args: [],
+              },
+            },
+          ],
+          consoleHome: "/tmp",
+          photonConnectors: {
+            send: async () => undefined,
+          } as unknown as RelayDeliveryContext["photonConnectors"],
+        },
+      ),
+    ).rejects.toThrow(/no photon connector is configured/i);
   });
 });

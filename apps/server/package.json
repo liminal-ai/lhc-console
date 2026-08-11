@@ -4,6 +4,7 @@
   "private": true,
   "bin": {
     "lhc-agent": "src/agent-cli.ts",
+    "lhc-console-migrate-goals": "src/migrate-goals.ts",
     "lhc-monitor": "src/monitor-cli.ts"
   },
   "type": "module",

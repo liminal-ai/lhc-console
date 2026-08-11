@@ -6,7 +6,43 @@ import { applyGroupWakeFailureFallback } from "./relay-failure-fallback.ts";
 import { processIsAlive } from "./process-alive.ts";
 import { ensureColumn, runExclusiveMigration } from "./sqlite-migrate.ts";
 
-export type RelayJobStatus = "queued" | "blocked" | "running" | "completed" | "failed";
+export type RelayJobStatus =
+  | "queued"
+  | "blocked"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled";
+export type RelayJobClass = "prioritized" | "deprioritized";
+export type RelayJobKind = "agent" | "outbound";
+
+export function parseRelayJobClass(value: unknown): RelayJobClass {
+  if (value === undefined || value === null) return "deprioritized";
+  if (value === "prioritized" || value === "deprioritized") return value;
+  throw new Error('jobClass must be "prioritized" or "deprioritized"');
+}
+
+export function normalizeRelayJobClass(value: string | null | undefined): RelayJobClass {
+  return value === "prioritized" ? "prioritized" : "deprioritized";
+}
+
+export function parseRelayJobKind(value: unknown): RelayJobKind {
+  if (value === undefined || value === null) return "agent";
+  if (value === "agent" || value === "outbound") return value;
+  throw new Error('jobKind must be "agent" or "outbound"');
+}
+
+export function normalizeRelayJobKind(value: string | null | undefined): RelayJobKind {
+  return value === "outbound" ? "outbound" : "agent";
+}
+
+export function isRelayJobWaitSettled(job: RelayJob): boolean {
+  if (job.jobKind === "outbound") {
+    if (job.status === "failed" || job.status === "cancelled") return true;
+    return job.deliveryStatus === "delivered";
+  }
+  return isSettledStatus(job.status);
+}
 
 export const DELIVERY_LEASE_MS = 60_000;
 export const DELIVERY_HEARTBEAT_MS = 15_000;
@@ -37,6 +73,9 @@ export interface RelayJob {
   target: string;
   prompt: string;
   status: RelayJobStatus;
+  jobClass: RelayJobClass;
+  jobKind: RelayJobKind;
+  sender: string | null;
   output: string | null;
   error: string | null;
   createdAt: string;
@@ -62,7 +101,7 @@ interface RelayQueueOptions {
 }
 
 type Waiter = (job: RelayJob) => void;
-type SettledListener = (job: RelayJob) => void;
+type SettledListener = (job: RelayJob) => void | Promise<void>;
 
 export class RelayQueue {
   readonly #dbPath: string;
@@ -130,6 +169,10 @@ export class RelayQueue {
         ,delivery_owner_token TEXT
         ,delivery_lease_expires_at TEXT
       );
+      CREATE TABLE IF NOT EXISTS relay_cancelled_jobs (
+        id TEXT PRIMARY KEY,
+        cancelled_at TEXT NOT NULL
+      );
     `);
     this.#ensureColumns();
     for (const path of [options.dbPath, `${options.dbPath}-wal`, `${options.dbPath}-shm`]) {
@@ -145,26 +188,84 @@ export class RelayQueue {
     for (const target of Object.keys(this.#targets)) this.#schedule(target);
   }
 
-  addSettledListener(listener: SettledListener): void {
+  /** Wake in-memory scheduling after a job was inserted outside RelayQueue.enqueue. */
+  pokeSchedule(target: string): void {
+    this.#schedule(target);
+  }
+
+  /** Wake waiters/listeners after a job was settled or cancelled outside RelayQueue. */
+  pokeJobSettled(jobId: string): void {
+    const job = this.get(jobId);
+    if (!job || !isRelayJobWaitSettled(job)) return;
+    this.#notify(jobId);
+    this.#emitSettled(jobId);
+  }
+
+  addSettledListener(listener: SettledListener): () => void {
     this.#settledListeners.push(listener);
+    return () => {
+      const index = this.#settledListeners.indexOf(listener);
+      if (index >= 0) this.#settledListeners.splice(index, 1);
+    };
+  }
+
+  cancelJob(id: string): void {
+    const cancelledAt = new Date().toISOString();
+    const changed = this.#withDb(() => {
+      this.#db
+        .prepare("INSERT OR IGNORE INTO relay_cancelled_jobs (id, cancelled_at) VALUES (?, ?)")
+        .run(id, cancelledAt);
+      return this.#db
+        .prepare(
+          `UPDATE relay_jobs
+           SET status = 'cancelled', finished_at = ?, error = NULL
+           WHERE id = ? AND status IN ('queued', 'blocked')`,
+        )
+        .run(cancelledAt, id).changes;
+    }, 0);
+    if (changed === 1) {
+      this.#notify(id);
+      this.#emitSettled(id);
+    }
+  }
+
+  #isCancelled(id: string): boolean {
+    return this.#withDb(() => {
+      const row = this.#db.prepare("SELECT 1 FROM relay_cancelled_jobs WHERE id = ?").get(id) as
+        | { 1: number }
+        | undefined;
+      return Boolean(row);
+    }, false);
   }
 
   enqueue(input: {
+    id?: string;
     target: string;
     prompt: string;
     notify?: "photon";
     delivery?: RelayDelivery;
+    jobClass?: RelayJobClass;
+    jobKind?: RelayJobKind;
+    sender?: string | null;
   }): RelayJob {
     if (!Object.hasOwn(this.#targets, input.target)) {
       throw new Error(`unknown relay target: ${input.target}`);
     }
     if (!input.prompt.trim()) throw new Error("prompt is required");
+    if (input.id && this.#isCancelled(input.id)) {
+      throw new Error(`relay job cancelled: ${input.id}`);
+    }
     const wantsDelivery = Boolean(input.delivery ?? input.notify);
+    const jobClass = parseRelayJobClass(input.jobClass);
+    const jobKind = parseRelayJobKind(input.jobKind);
     const job: RelayJob = {
-      id: randomUUID(),
+      id: input.id ?? randomUUID(),
       target: input.target,
       prompt: input.prompt,
       status: "queued",
+      jobClass,
+      jobKind,
+      sender: input.sender ?? null,
       output: null,
       error: null,
       createdAt: new Date().toISOString(),
@@ -175,13 +276,13 @@ export class RelayQueue {
       deliveryStatus: wantsDelivery ? "pending" : null,
       deliveryError: null,
     };
-    this.#db
+    const inserted = this.#db
       .prepare(
-        `INSERT INTO relay_jobs
+        `INSERT OR IGNORE INTO relay_jobs
          (id, target, prompt, status, output, error, created_at, started_at, finished_at,
           notify, delivery_status, delivery_error, delivery_channel, delivery_destination,
-          delivery_metadata)
-         VALUES (?, ?, ?, ?, NULL, NULL, ?, NULL, NULL, ?, ?, NULL, ?, ?, ?)`,
+          delivery_metadata, job_class, job_kind, sender)
+         VALUES (?, ?, ?, ?, NULL, NULL, ?, NULL, NULL, ?, ?, NULL, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         job.id,
@@ -194,7 +295,23 @@ export class RelayQueue {
         job.delivery?.channel ?? null,
         job.delivery ? JSON.stringify(job.delivery.destination) : null,
         job.delivery?.metadata ? JSON.stringify(job.delivery.metadata) : null,
+        job.jobClass,
+        job.jobKind,
+        job.sender,
       );
+    if (inserted.changes !== 1) {
+      const existing = this.get(job.id);
+      if (
+        !existing ||
+        existing.target !== job.target ||
+        existing.prompt !== job.prompt ||
+        existing.jobClass !== job.jobClass
+      ) {
+        throw new Error(`relay job id collision: ${job.id}`);
+      }
+      this.#schedule(job.target);
+      return existing;
+    }
     this.#schedule(job.target);
     return job;
   }
@@ -218,7 +335,7 @@ export class RelayQueue {
   wait(id: string): Promise<RelayJob> {
     const job = this.get(id);
     if (!job) return Promise.reject(new Error(`unknown relay job: ${id}`));
-    if (job.status === "completed" || job.status === "failed") return Promise.resolve(job);
+    if (isRelayJobWaitSettled(job)) return Promise.resolve(job);
     return new Promise((resolve) => {
       let timer: NodeJS.Timeout | undefined;
       const finish: Waiter = (completed) => {
@@ -227,7 +344,7 @@ export class RelayQueue {
       };
       const poll = () => {
         const current = this.get(id);
-        if (current && (current.status === "completed" || current.status === "failed")) {
+        if (current && isRelayJobWaitSettled(current)) {
           const waiters = this.#waiters.get(id)?.filter((waiter) => waiter !== finish) ?? [];
           if (waiters.length) this.#waiters.set(id, waiters);
           else this.#waiters.delete(id);
@@ -341,6 +458,34 @@ export class RelayQueue {
         "failure_fallback_applied",
         "ALTER TABLE relay_jobs ADD COLUMN failure_fallback_applied INTEGER NOT NULL DEFAULT 0",
       );
+      ensureColumn(
+        this.#db,
+        "relay_jobs",
+        "job_class",
+        "ALTER TABLE relay_jobs ADD COLUMN job_class TEXT NOT NULL DEFAULT 'deprioritized'",
+      );
+      ensureColumn(
+        this.#db,
+        "relay_jobs",
+        "job_kind",
+        "ALTER TABLE relay_jobs ADD COLUMN job_kind TEXT NOT NULL DEFAULT 'agent'",
+      );
+      ensureColumn(
+        this.#db,
+        "relay_jobs",
+        "sender",
+        "ALTER TABLE relay_jobs ADD COLUMN sender TEXT",
+      );
+      this.#db.exec(
+        `UPDATE relay_jobs
+         SET job_class = 'deprioritized'
+         WHERE job_class IS NULL OR job_class NOT IN ('prioritized', 'deprioritized')`,
+      );
+      this.#db.exec(
+        `UPDATE relay_jobs
+         SET job_kind = 'agent'
+         WHERE job_kind IS NULL OR job_kind NOT IN ('agent', 'outbound')`,
+      );
     });
   }
 
@@ -425,17 +570,46 @@ export class RelayQueue {
       }
       await this.#deliverPending(targetName);
       while (!this.#closed) {
-        const row = this.#db
+        const tombstoned = this.#db
           .prepare(
-            `SELECT * FROM relay_jobs
-             WHERE target = ? AND status IN ('queued', 'blocked')
-             ORDER BY created_at, rowid LIMIT 1`,
+            `SELECT r.id FROM relay_jobs AS r
+             WHERE r.target = ? AND r.status IN ('queued', 'blocked')
+               AND EXISTS (SELECT 1 FROM relay_cancelled_jobs AS c WHERE c.id = r.id)
+             ORDER BY CASE r.job_class WHEN 'prioritized' THEN 0 ELSE 1 END, r.created_at, r.rowid
+             LIMIT 1`,
           )
-          .get(targetName) as unknown as RelayRow | undefined;
-        if (!row) return;
-        const job = rowToJob(row);
+          .get(targetName) as { id: string } | undefined;
+        if (tombstoned) {
+          const cancelledAt = new Date().toISOString();
+          const cancelled = this.#db
+            .prepare(
+              `UPDATE relay_jobs
+               SET status = 'cancelled', finished_at = ?, error = NULL
+               WHERE id = ? AND status IN ('queued', 'blocked')`,
+            )
+            .run(cancelledAt, tombstoned.id);
+          if (cancelled.changes === 1) {
+            this.#notify(tombstoned.id);
+            this.#emitSettled(tombstoned.id);
+          }
+          continue;
+        }
         if (await this.#isBusy(target)) {
-          this.#db.prepare("UPDATE relay_jobs SET status = 'blocked' WHERE id = ?").run(job.id);
+          this.#db
+            .prepare(
+              `UPDATE relay_jobs
+               SET status = 'blocked'
+               WHERE id = (
+                 SELECT r.id FROM relay_jobs AS r
+                 WHERE r.target = ? AND r.status = 'queued'
+                   AND NOT EXISTS (
+                     SELECT 1 FROM relay_cancelled_jobs AS c WHERE c.id = r.id
+                   )
+                 ORDER BY CASE r.job_class WHEN 'prioritized' THEN 0 ELSE 1 END, r.created_at, r.rowid
+                 LIMIT 1
+               )`,
+            )
+            .run(targetName);
           this.#defer(targetName);
           return;
         }
@@ -444,16 +618,87 @@ export class RelayQueue {
           .prepare(
             `UPDATE relay_jobs
              SET status = 'running', started_at = ?, error = NULL, owner_pid = ?
-             WHERE id = ? AND status IN ('queued', 'blocked')
+             WHERE id = (
+               SELECT r.id FROM relay_jobs AS r
+               WHERE r.target = ? AND r.status IN ('queued', 'blocked')
+                 AND NOT EXISTS (
+                   SELECT 1 FROM relay_cancelled_jobs AS c WHERE c.id = r.id
+                 )
+               ORDER BY CASE r.job_class WHEN 'prioritized' THEN 0 ELSE 1 END, r.created_at, r.rowid
+               LIMIT 1
+             )
+               AND id = (
+                 SELECT r.id FROM relay_jobs AS r
+                 WHERE r.target = ? AND r.status IN ('queued', 'blocked')
+                   AND NOT EXISTS (
+                     SELECT 1 FROM relay_cancelled_jobs AS c WHERE c.id = r.id
+                   )
+                 ORDER BY CASE r.job_class WHEN 'prioritized' THEN 0 ELSE 1 END, r.created_at, r.rowid
+                 LIMIT 1
+               )
+               AND status IN ('queued', 'blocked')
                AND NOT EXISTS (
                  SELECT 1 FROM relay_jobs AS active
                  WHERE active.target = ? AND active.status = 'running'
                )`,
           )
-          .run(startedAt, process.pid, job.id, targetName);
+          .run(startedAt, process.pid, targetName, targetName, targetName);
         if (claim.changes !== 1) {
-          this.#defer(targetName);
-          return;
+          const activeRun = this.#db
+            .prepare(
+              "SELECT id, owner_pid FROM relay_jobs WHERE target = ? AND status = 'running' LIMIT 1",
+            )
+            .get(targetName) as { id: string; owner_pid: number | null } | undefined;
+          if (activeRun) {
+            if (activeRun.owner_pid !== null && processIsAlive(activeRun.owner_pid)) {
+              this.#defer(targetName);
+              return;
+            }
+            this.#db
+              .prepare(
+                `UPDATE relay_jobs
+                 SET status = 'failed',
+                     error = 'relay lost track of this job after restart; the turn may have completed — check the durable thread',
+                     finished_at = ?
+                 WHERE id = ? AND status = 'running'`,
+              )
+              .run(new Date().toISOString(), activeRun.id);
+            this.#notify(activeRun.id);
+            this.#emitSettled(activeRun.id);
+            continue;
+          }
+          const pending = this.#db
+            .prepare(
+              `SELECT 1 FROM relay_jobs
+               WHERE target = ? AND status IN ('queued', 'blocked')
+                 AND NOT EXISTS (
+                   SELECT 1 FROM relay_cancelled_jobs AS c WHERE c.id = relay_jobs.id
+                 )
+               LIMIT 1`,
+            )
+            .get(targetName);
+          if (!pending) return;
+          await sleep(0);
+          continue;
+        }
+        const running = this.#db
+          .prepare(
+            "SELECT * FROM relay_jobs WHERE target = ? AND status = 'running' AND owner_pid = ? LIMIT 1",
+          )
+          .get(targetName, process.pid) as unknown as RelayRow | undefined;
+        if (!running) continue;
+        const job = rowToJob(running);
+        if (job.jobKind === "outbound") {
+          const finishedAt = new Date().toISOString();
+          this.#withDb(() => {
+            this.#db
+              .prepare(
+                "UPDATE relay_jobs SET status = 'completed', output = ?, finished_at = ? WHERE id = ?",
+              )
+              .run(job.prompt, finishedAt, job.id);
+          }, undefined);
+          if (!this.#dbClosed) await this.#deliverCompleted(job.id);
+          continue;
         }
         const controller = new AbortController();
         this.#controllers.add(controller);
@@ -502,7 +747,14 @@ export class RelayQueue {
   #emitSettled(id: string): void {
     const job = this.get(id);
     if (!job) return;
-    for (const listener of this.#settledListeners) listener(job);
+    for (const listener of [...this.#settledListeners]) {
+      try {
+        const result = listener(job);
+        if (result) void result.catch(() => undefined);
+      } catch {
+        // listener failures must not affect relay execution
+      }
+    }
   }
 
   #defer(target: string): void {
@@ -657,6 +909,8 @@ export class RelayQueue {
       } finally {
         clearInterval(heartbeat);
       }
+      const current = this.get(id);
+      if (current && isRelayJobWaitSettled(current)) this.#notify(id);
       this.#emitSettled(id);
     } finally {
       this.#outstandingRuns -= 1;
@@ -770,6 +1024,13 @@ interface RelayRow {
   delivery_status: string | null;
   delivery_error: string | null;
   failure_fallback_applied: number;
+  job_class: string;
+  job_kind: string;
+  sender: string | null;
+}
+
+function isSettledStatus(status: RelayJobStatus): boolean {
+  return status === "completed" || status === "failed" || status === "cancelled";
 }
 
 function rowToJob(row: RelayRow): RelayJob {
@@ -788,6 +1049,9 @@ function rowToJob(row: RelayRow): RelayJob {
     target: row.target,
     prompt: row.prompt,
     status: row.status as RelayJobStatus,
+    jobClass: normalizeRelayJobClass(row.job_class),
+    jobKind: normalizeRelayJobKind(row.job_kind),
+    sender: row.sender ?? null,
     output: row.output,
     error: row.error,
     createdAt: row.created_at,

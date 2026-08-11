@@ -94,7 +94,7 @@ export function loadAgentRegistry(consoleHome: string): LoadedAgentRegistry {
   return { agents, relayTargets };
 }
 
-const RESERVED_AGENT_KEYS = new Set(["help", "list", "start", "job"]);
+const RESERVED_AGENT_KEYS = new Set(["help", "list", "start", "job", "lee"]);
 
 function parseAgent(id: string, raw: RawAgentConfig, consoleHome: string): AgentRecord {
   if (!/^[a-z][a-z0-9-]*$/.test(id)) {

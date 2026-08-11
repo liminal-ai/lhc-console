@@ -1267,6 +1267,23 @@ export function registerTerminalRoutes(
     return [...terminals.values()].map(publicView);
   });
 
+  app.get("/api/terminals/:id/history", async (req, reply) => {
+    await ensureBoot();
+    const gate = notReady();
+    if (gate) return reply.code(gate.code).send(gate.body);
+    const { id } = req.params as { id: string };
+    const { lines: rawLines } = (req.query ?? {}) as { lines?: string };
+    const t = terminals.get(id);
+    if (!t) return reply.code(404).send({ error: "no such terminal" });
+    const lines = Math.min(10_000, Math.max(1, Number.parseInt(rawLines ?? "10000", 10) || 10_000));
+    if (!t.sessionId) return { text: "" };
+    try {
+      return { text: await tmx.capturePaneText(t.sessionId, lines) };
+    } catch {
+      return reply.code(503).send({ error: "terminal history unavailable — try again" });
+    }
+  });
+
   app.post("/api/terminals", async (req, reply) => {
     await ensureBoot();
     const gate = notReady();

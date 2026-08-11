@@ -17,7 +17,9 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { api, type TerminalRow, type ThreadRow } from "./api.ts";
+import { copyText } from "./clipboard.ts";
 import { displayTitle, el } from "./format.ts";
+import { activateOnPress, focusedPaneForCopy, terminalBufferText } from "./terminal-ui.ts";
 // Cyclic by nature (the modal spawns through this module, this module opens
 // the modal) and safe: both directions are function references, resolved at
 // click time rather than at module evaluation.
@@ -391,6 +393,62 @@ function makeTerminal(t: Term): void {
   t.fit = fit;
 }
 
+/**
+ * TUIs commonly own the mouse, which makes native xterm selection require a
+ * modifier. This plain-text snapshot gives every pane an unambiguous,
+ * selectable and scrollable copy surface regardless of the program's mode.
+ */
+function toggleTextView(t: Term): void {
+  const open = t.pane.querySelector<HTMLElement>(".ws-copy-view");
+  if (open) {
+    open.remove();
+    t.term?.focus();
+    return;
+  }
+  if (!t.term) return;
+
+  const view = el("div", "ws-copy-view");
+  const bar = el("div", "ws-copy-bar");
+  const status = el("span", "dim", "loading scrollback…");
+  const copy = el("button", "ws-copy-button", "copy all") as HTMLButtonElement;
+  const close = el("button", "ws-copy-button", "close") as HTMLButtonElement;
+  copy.type = close.type = "button";
+  let text = terminalBufferText(t.term.buffer);
+  copy.onclick = () => {
+    void copyText(text).then((ok) => {
+      if (!ok) {
+        const selection = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(pre);
+        selection?.removeAllRanges();
+        selection?.addRange(range);
+      }
+      status.textContent = ok ? "copied" : "selected — press Ctrl-C or Cmd-C";
+      status.className = ok ? "ok" : "dim";
+    });
+  };
+  close.onclick = () => toggleTextView(t);
+  bar.append(status, copy, close);
+  const pre = el("pre", "ws-copy-text", text || "loading…");
+  view.append(bar, pre);
+  t.pane.append(view);
+  void api
+    .terminalHistory(t.info.id)
+    .then((history) => {
+      if (!view.isConnected) return;
+      if (history.text.trim()) text = history.text.replace(/\n+$/, "");
+      pre.textContent = text || "(terminal buffer is empty)";
+      status.textContent = "select any text, or copy all";
+      status.className = "dim";
+    })
+    .catch(() => {
+      if (!view.isConnected) return;
+      pre.textContent = text || "(terminal history unavailable)";
+      status.textContent = "live buffer only — history unavailable";
+      status.className = "bad";
+    });
+}
+
 function scheduleRetry(t: Term): void {
   if (t.gone || t.retryTimer !== null) return;
   const wait = t.retryMs;
@@ -627,7 +685,11 @@ function ensureTerm(info: TerminalRow): Term {
     confirmingButton("✕", () => removeTerm(info.id, true)),
   );
   pane.append(host, corner, strip);
-  pane.addEventListener("mousedown", () => focusPane(info.id));
+  pane.addEventListener("mousedown", (event) => {
+    if (!(event.target instanceof Element && event.target.closest(".ws-copy-view"))) {
+      focusPane(info.id);
+    }
+  });
   const t: Term = {
     info,
     term: null,
@@ -745,12 +807,29 @@ function paintBar(): void {
       ),
     );
     b.append(el("span", "ws-tab-label", screenLabel(s)));
-    b.onclick = () => showScreen(s.id);
+    activateOnPress(b, () => showScreen(s.id));
+    // Keyboard activation still arrives as click without a preceding pointer.
+    b.onclick = (event) => {
+      if (event.detail === 0) showScreen(s.id);
+    };
     tabsEl!.append(b);
   });
 
   controlsEl.replaceChildren();
   const s = screens.find((x) => x.id === activeScreen);
+  const focused = focusedPane ? terms.get(focusedPane) : undefined;
+  if (focused && s?.panes.includes(focused.info.id)) {
+    const copy = el("button", "ws-btn", "copy") as HTMLButtonElement;
+    copy.type = "button";
+    copy.title = "open selectable terminal scrollback";
+    copy.onclick = (event) => {
+      event.stopPropagation();
+      const currentId = focusedPaneForCopy(focusedPane, s.panes);
+      const current = currentId ? terms.get(currentId) : undefined;
+      if (current) toggleTextView(current);
+    };
+    controlsEl.append(copy);
+  }
   if (s && s.panes.length < MAX_PANES) {
     const split = el("button", "ws-btn", "split") as HTMLButtonElement;
     split.type = "button";

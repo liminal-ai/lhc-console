@@ -38,6 +38,22 @@ afterEach(() => {
 });
 
 describe("RelayQueue", () => {
+  it("rejects inherited object keys as unknown targets", async () => {
+    const queue = createQueue({
+      dbPath: tempDb(),
+      targets: {},
+      isBusy: () => false,
+      execute: async () => "unreachable",
+    });
+    try {
+      expect(() => queue.enqueue({ target: "constructor", prompt: "hello" })).toThrow(
+        /unknown relay target/,
+      );
+    } finally {
+      await queue.close();
+    }
+  });
+
   it("runs jobs for one thread strictly one at a time", async () => {
     let active = 0;
     let maxActive = 0;

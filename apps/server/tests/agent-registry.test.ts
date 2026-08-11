@@ -102,6 +102,27 @@ describe("loadAgentRegistry", () => {
     });
   });
 
+  it("rejects agent keys reserved by the CLI", () => {
+    const home = mkdtempSync(join(tmpdir(), "lhc-agents-"));
+    dirs.push(home);
+    writeRegistry(home, {
+      version: 1,
+      agents: {
+        help: {
+          ownerSenderIds: ["owner"],
+          relay: {
+            hostId: "pi-lhc",
+            threadId: "th_test",
+            cwd: "/tmp",
+            command: "pi-lhc",
+            args: ["-p"],
+          },
+        },
+      },
+    });
+    expect(() => loadAgentRegistry(home)).toThrow(/reserved agent key: help/);
+  });
+
   it("returns empty targets when no agents are configured", () => {
     const home = mkdtempSync(join(tmpdir(), "lhc-agents-"));
     dirs.push(home);

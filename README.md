@@ -19,6 +19,31 @@ and does not depend on the `lhc` SDK. Its operations live in
 
 ## One-shot relay (loopback only)
 
+### Agent CLI
+
+`lhc-agent` is the zero-configuration front door for local callers. Running it
+with no arguments lists every exposed agent key and a short description, then
+shows the compact call syntax:
+
+```bash
+lhc-agent
+lhc-agent fable "Review this design."
+printf 'Review this design.' | lhc-agent fable -
+```
+
+Long calls can detach and be checked later:
+
+```bash
+job=$(lhc-agent start fable "Take a deep look.")
+lhc-agent job "$job"
+```
+
+The command discovers the loopback endpoint and owner-only token itself. Callers
+use stable agent keys; URLs, credentials, thread IDs, phone numbers, working
+directories, and runtime commands remain control-plane internals. Registry
+discovery exposes only the key, display name, description, duties, and channel
+types.
+
 The server exposes a small authenticated job relay at `127.0.0.1:5959`. V1 has
 one configured target, `fable`, and serializes prompts into Fable's durable
 pi-lhc thread. Jobs remain `blocked` while another process holds that thread.

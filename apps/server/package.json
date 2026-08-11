@@ -3,6 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "bin": {
+    "lhc-agent": "src/agent-cli.ts",
     "lhc-monitor": "src/monitor-cli.ts"
   },
   "type": "module",

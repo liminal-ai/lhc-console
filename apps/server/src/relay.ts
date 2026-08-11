@@ -155,7 +155,9 @@ export class RelayQueue {
     notify?: "photon";
     delivery?: RelayDelivery;
   }): RelayJob {
-    if (!this.#targets[input.target]) throw new Error(`unknown relay target: ${input.target}`);
+    if (!Object.hasOwn(this.#targets, input.target)) {
+      throw new Error(`unknown relay target: ${input.target}`);
+    }
     if (!input.prompt.trim()) throw new Error("prompt is required");
     const wantsDelivery = Boolean(input.delivery ?? input.notify);
     const job: RelayJob = {

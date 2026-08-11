@@ -15,6 +15,9 @@ export interface AgentChannels {
 
 export interface AgentRecord {
   id: string;
+  name: string;
+  description: string;
+  duties: string[];
   ownerSenderIds: string[];
   mentionPatterns: string[];
   channels: AgentChannels;
@@ -47,6 +50,9 @@ interface RawChannels {
 }
 
 interface RawAgentConfig {
+  name?: unknown;
+  description?: unknown;
+  duties?: unknown;
   ownerSenderIds?: unknown;
   mentionPatterns?: unknown;
   channels?: RawChannels;
@@ -88,7 +94,16 @@ export function loadAgentRegistry(consoleHome: string): LoadedAgentRegistry {
   return { agents, relayTargets };
 }
 
+const RESERVED_AGENT_KEYS = new Set(["help", "list", "start", "job"]);
+
 function parseAgent(id: string, raw: RawAgentConfig, consoleHome: string): AgentRecord {
+  if (!/^[a-z][a-z0-9-]*$/.test(id)) {
+    throw new Error(`agent key must match [a-z][a-z0-9-]*: ${id}`);
+  }
+  if (RESERVED_AGENT_KEYS.has(id)) throw new Error(`reserved agent key: ${id}`);
+  const name = optionalString(raw.name) ?? id;
+  const description = optionalString(raw.description) ?? `${name} durable agent`;
+  const duties = raw.duties === undefined ? [] : requireStringArray(raw.duties, `${id}.duties`);
   const ownerSenderIds = requireStringArray(raw.ownerSenderIds, `${id}.ownerSenderIds`);
   if (!ownerSenderIds.length) {
     throw new Error(`${id}.ownerSenderIds must include at least one sender id`);
@@ -96,7 +111,7 @@ function parseAgent(id: string, raw: RawAgentConfig, consoleHome: string): Agent
   const mentionPatterns = parseMentionPatterns(raw.mentionPatterns);
   const channels = parseChannels(id, raw.channels, consoleHome);
   const relay = parseRelay(id, raw.relay);
-  return { id, ownerSenderIds, mentionPatterns, channels, relay };
+  return { id, name, description, duties, ownerSenderIds, mentionPatterns, channels, relay };
 }
 
 function parseChannels(
@@ -194,6 +209,10 @@ function requireString(value: unknown, label: string): string {
     throw new Error(`${label} must be a non-empty string`);
   }
   return value.trim();
+}
+
+function optionalString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
 function requireStringArray(value: unknown, label: string): string[] {

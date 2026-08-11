@@ -41,6 +41,9 @@ interface FakeSidecar {
 function agentRecord(): AgentRecord {
   return {
     id: "fable",
+    name: "Fable",
+    description: "Test agent",
+    duties: [],
     ownerSenderIds: ["+15551234567"],
     mentionPatterns: [String.raw`\bfable\b`],
     channels: {

@@ -1,11 +1,18 @@
 import { timingSafeEqual } from "node:crypto";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import type { AgentRecord } from "./agent-registry.ts";
 import type { RelayJob, RelayQueue } from "./relay.ts";
 import { renderRelayPrompt } from "./relay-prompt.ts";
+import {
+  renderSenderAttribution,
+  resolveLeePhotonRoute,
+  validateSenderAgent,
+} from "./relay-sender.ts";
 
 interface RelayRouteOptions {
   queue: RelayQueue;
   token: string;
+  agents: AgentRecord[];
   syncTimeoutMs?: number;
 }
 
@@ -19,10 +26,12 @@ export function registerRelayRoutes(app: FastifyInstance, options: RelayRouteOpt
 
   app.post("/api/relay/targets/:target/jobs", { preHandler: authorize }, async (request, reply) => {
     const { target } = request.params as { target: string };
-    const { prompt, notify, channelContext } = (request.body ?? {}) as {
+    const { prompt, notify, channelContext, jobClass, sender } = (request.body ?? {}) as {
       prompt?: unknown;
       notify?: unknown;
       channelContext?: unknown;
+      jobClass?: unknown;
+      sender?: unknown;
     };
     if (typeof prompt !== "string" || !prompt.trim()) {
       return reply.code(400).send({ error: "prompt is required" });
@@ -33,12 +42,74 @@ export function registerRelayRoutes(app: FastifyInstance, options: RelayRouteOpt
     if (channelContext !== undefined && typeof channelContext !== "string") {
       return reply.code(400).send({ error: "channelContext must be a string" });
     }
+    if (jobClass !== undefined && jobClass !== "prioritized" && jobClass !== "deprioritized") {
+      return reply.code(400).send({ error: 'jobClass must be "prioritized" or "deprioritized"' });
+    }
+    if (sender !== undefined && typeof sender !== "string") {
+      return reply.code(400).send({ error: "sender must be a string" });
+    }
+
+    if (target === "lee") {
+      if (typeof sender !== "string" || !sender.trim()) {
+        return reply.code(400).send({
+          error: "sender is required for lee (set LHC_AGENT_ID or pass sender in the request body)",
+        });
+      }
+      let validatedSender: string;
+      try {
+        validatedSender = validateSenderAgent(options.agents, sender);
+      } catch (error) {
+        return reply
+          .code(400)
+          .send({ error: error instanceof Error ? error.message : String(error) });
+      }
+      let route;
+      try {
+        route = resolveLeePhotonRoute(options.agents, validatedSender);
+      } catch (error) {
+        return reply
+          .code(400)
+          .send({ error: error instanceof Error ? error.message : String(error) });
+      }
+      const job = options.queue.enqueue({
+        target: "lee",
+        prompt: prompt.trim(),
+        jobKind: "outbound",
+        sender: validatedSender,
+        delivery: {
+          channel: "photon",
+          destination: { spaceId: route.spaceId },
+          metadata: {
+            kind: "outbound_lee",
+            senderAgentId: validatedSender,
+            connectorAgentId: route.connectorAgentId,
+          },
+        },
+      });
+      return reply.code(202).header("location", `/api/relay/jobs/${job.id}`).send(job);
+    }
+
+    let renderedPrompt = renderRelayPrompt(prompt, channelContext);
+    let declaredSender: string | null = null;
+    if (typeof sender === "string" && sender.trim()) {
+      try {
+        declaredSender = validateSenderAgent(options.agents, sender);
+        renderedPrompt = renderSenderAttribution(declaredSender, renderedPrompt);
+      } catch (error) {
+        return reply
+          .code(400)
+          .send({ error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+
     let job;
     try {
       job = options.queue.enqueue({
         target,
-        prompt: renderRelayPrompt(prompt, channelContext),
+        prompt: renderedPrompt,
         ...(notify === "photon" ? { notify } : {}),
+        ...(jobClass ? { jobClass } : {}),
+        ...(declaredSender ? { sender: declaredSender } : {}),
       });
     } catch (error) {
       return reply

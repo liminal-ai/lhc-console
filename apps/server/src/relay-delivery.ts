@@ -7,6 +7,7 @@ import {
   type GroupWakeDeliveryMetadata,
 } from "./group-catch-up.ts";
 import type { PhotonConnectorManager } from "./photon-connector.ts";
+import { resolveLeePhotonRoute } from "./relay-sender.ts";
 import type { RelayJob } from "./relay.ts";
 
 export interface RelayDeliveryContext {
@@ -20,11 +21,31 @@ export async function deliverRelayJob(job: RelayJob, context: RelayDeliveryConte
   if (!channel) return;
   switch (channel) {
     case "photon":
+      if (job.jobKind === "outbound" || job.target === "lee") {
+        await deliverOutboundLee(job, context);
+        return;
+      }
       await deliverPhoton(job, context);
       return;
     default:
       throw new Error(`unsupported delivery channel: ${channel}`);
   }
+}
+
+async function deliverOutboundLee(job: RelayJob, context: RelayDeliveryContext): Promise<void> {
+  const metadata = job.delivery?.metadata ?? {};
+  const senderAgentId =
+    (typeof metadata.senderAgentId === "string" && metadata.senderAgentId) || job.sender || null;
+  if (!senderAgentId) {
+    throw new Error("outbound lee job is missing sender attribution");
+  }
+  const route = resolveLeePhotonRoute(context.agents, senderAgentId);
+  if (!context.photonConnectors) {
+    throw new Error("photon connectors are not running");
+  }
+  const message = job.output ?? job.prompt;
+  if (!message.trim()) throw new Error("outbound lee job has no message to deliver");
+  await context.photonConnectors.send(route.connectorAgentId, route.spaceId, message);
 }
 
 async function deliverPhoton(job: RelayJob, context: RelayDeliveryContext): Promise<void> {

@@ -57,6 +57,9 @@ import { loadAgentRegistry } from "./agent-registry.ts";
 import { PhotonConnectorManager } from "./photon-connector.ts";
 import { MonitorService } from "./monitor.ts";
 import { registerMonitorRoutes } from "./monitor-routes.ts";
+import { GoalService } from "./goal.ts";
+import { assertLegacyGoalsStartupSafe } from "./goal-migrate.ts";
+import { registerGoalRoutes } from "./goal-routes.ts";
 import { registerAgentRoutes } from "./agent-routes.ts";
 
 const PORT = Number(process.env.LHC_CONSOLE_PORT ?? 5959);
@@ -64,14 +67,33 @@ const PORT = Number(process.env.LHC_CONSOLE_PORT ?? 5959);
 const app = Fastify({ logger: { level: "info" } });
 
 const consoleHome = process.env.LHC_CONSOLE_HOME ?? join(homedir(), ".lhc-console");
+assertLegacyGoalsStartupSafe(consoleHome);
 const agentRegistry = loadAgentRegistry(consoleHome);
 const relayToken = loadRelayToken(consoleHome);
 const photonRef: { current: PhotonConnectorManager | null } = { current: null };
 
+const relayDbPath = join(consoleHome, "relay.sqlite");
+const relayTargets: Record<string, import("./relay.ts").RelayTarget> = {
+  lee: {
+    hostId: "lee",
+    threadId: "lee",
+    cwd: consoleHome,
+    command: process.execPath,
+    args: ["-e", "process.exit(1)"],
+  },
+};
+for (const [id, target] of Object.entries(agentRegistry.relayTargets)) {
+  relayTargets[id] = {
+    ...target,
+    env: { ...target.env, LHC_AGENT_ID: id },
+  };
+}
+
 const relayQueue = new RelayQueue({
-  dbPath: join(consoleHome, "relay.sqlite"),
-  targets: agentRegistry.relayTargets,
+  dbPath: relayDbPath,
+  targets: relayTargets,
   isBusy: (target) => {
+    if (target.hostId === "lee") return false;
     invalidateProcessScan();
     return (
       detectAttachedOne(
@@ -96,12 +118,22 @@ const relayQueue = new RelayQueue({
   consoleHome,
 });
 
+const goalService = new GoalService({
+  dbPath: relayDbPath,
+  relayQueue,
+  targetExists: (target) => Object.hasOwn(relayTargets, target),
+});
+const removeGoalSettledListener = relayQueue.addSettledListener((job) =>
+  goalService.notifyJobSettled(job),
+);
+
 const photonConnectors = new PhotonConnectorManager({
   agents: agentRegistry.agents,
   consoleHome,
   queue: relayQueue,
 });
 photonRef.current = photonConnectors;
+
 await photonConnectors.start();
 relayQueue.start();
 
@@ -109,9 +141,9 @@ const monitorService = new MonitorService({
   dbPath: join(consoleHome, "monitor.sqlite"),
   enqueue: ({ target, prompt, notify }) => relayQueue.enqueue({ target, prompt, notify }),
   getJob: (id) => relayQueue.get(id),
-  targetExists: (target) => Object.hasOwn(agentRegistry.relayTargets, target),
+  targetExists: (target) => Object.hasOwn(relayTargets, target),
   lastActivityAt: (targetId) => {
-    const target = agentRegistry.relayTargets[targetId];
+    const target = relayTargets[targetId];
     if (!target) return null;
     const host = discoverHosts().find((candidate) => candidate.id === target.hostId);
     if (!host) return null;
@@ -124,6 +156,8 @@ const monitorService = new MonitorService({
   },
 });
 monitorService.start();
+
+goalService.start();
 
 /**
  * Quick-stats cache keyed by thread file path + mtime, so the aggregated
@@ -227,8 +261,10 @@ registerTerminalRoutes(app, lookupThread);
 registerRelayRoutes(app, {
   queue: relayQueue,
   token: relayToken,
+  agents: agentRegistry.agents,
 });
 registerMonitorRoutes(app, { service: monitorService, token: relayToken });
+registerGoalRoutes(app, { service: goalService, token: relayToken });
 registerAgentRoutes(app, { agents: agentRegistry.agents, token: relayToken });
 
 app.get("/api/hosts", async () => {
@@ -571,8 +607,11 @@ app.get("/api/threads/:hostId/:threadId/view-arrangement", async (req, reply) =>
 for (const sig of ["SIGINT", "SIGTERM"] as const) {
   process.once(sig, async () => {
     shutdownTerminals();
-    await monitorService.close();
+    await goalService.stop();
     await relayQueue.close();
+    removeGoalSettledListener();
+    await goalService.close();
+    await monitorService.close();
     await photonConnectors.stop();
     await app.close();
     process.exit(0);

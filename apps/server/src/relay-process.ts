@@ -4,6 +4,7 @@ import type { RelayTarget } from "./relay.ts";
 interface ExecuteOptions {
   timeoutMs?: number;
   signal?: AbortSignal;
+  env?: NodeJS.ProcessEnv;
 }
 
 export function executeRelayTarget(
@@ -12,13 +13,14 @@ export function executeRelayTarget(
   options: ExecuteOptions = {},
 ): Promise<string> {
   const timeoutMs = options.timeoutMs ?? target.timeoutMs ?? 20 * 60_000;
+  const env = { ...process.env, ...target.env, ...options.env };
   return new Promise((resolve, reject) => {
     const child = execFile(
       target.command,
       [...target.args, prompt],
       {
         cwd: target.cwd,
-        env: target.env ?? process.env,
+        env,
         timeout: timeoutMs,
         killSignal: "SIGTERM",
         maxBuffer: 16 * 1024 * 1024,

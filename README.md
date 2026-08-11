@@ -29,6 +29,7 @@ shows the compact call syntax:
 lhc-agent
 lhc-agent fable "Review this design."
 printf 'Review this design.' | lhc-agent fable -
+lhc-agent lee "The build is ready for review."
 ```
 
 Long calls can detach and be checked later:
@@ -37,6 +38,13 @@ Long calls can detach and be checked later:
 job=$(lhc-agent start fable "Take a deep look.")
 lhc-agent job "$job"
 ```
+
+Agent-to-agent calls that may provoke a reply must use `start` so the caller
+does not hold its own thread while waiting on the recipient; blocking mutual
+calls can deadlock until timeout. `--from <agent>` or `LHC_AGENT_ID` adds a
+compact sender envelope. The special `lee` destination is always detached and
+delivers one-way through the sending agent's Photon identity, falling back to
+Console's configured identity when needed.
 
 The command discovers the loopback endpoint and owner-only token itself. Callers
 use stable agent keys; URLs, credentials, thread IDs, phone numbers, working
@@ -82,7 +90,21 @@ track of a running child across restart, the job is failed as indeterminate:
 the durable agent thread is canonical and may contain a completed turn even
 when relay telemetry does not.
 
-## Monitors
+## Goals and monitors
+
+Goals are the minimal persistent-focus primitive. A goal emits prioritized
+reminder turns while ordinary peer calls remain deprioritized:
+
+```bash
+lhc-agent goal start fable "Finish the current hardening wave." --every 5m
+lhc-agent goal list
+lhc-agent goal complete <id>
+lhc-agent goal blocked <id> "Needs an owner decision"
+lhc-agent goal cancel <id>
+```
+
+Ordinary `lhc-agent <agent> ...` calls are deprioritized by default; add
+`--priority` only when the message belongs to the target's active focus.
 
 **Monitor** is the org verb for an external periodic wake with a prompt, until
 its exit condition is reached. Monitors live outside the target agent so work

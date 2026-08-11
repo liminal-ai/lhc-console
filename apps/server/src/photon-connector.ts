@@ -348,6 +348,7 @@ export class PhotonConnector {
     this.#queue.enqueue({
       target: this.#agent.id,
       prompt,
+      jobClass: "prioritized",
       delivery: {
         channel: "photon",
         destination: { spaceId },

@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly LIM-40 upstream reconciliation
+Documentation=file:///srv/work/lhc-console/docs/UPSTREAM_OWNER.md
+
+[Timer]
+OnCalendar=Mon *-*-* 14:00:00 UTC
+Persistent=true
+Unit=lhc-upstream-watch-weekly.service
+
+[Install]
+WantedBy=timers.target

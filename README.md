@@ -183,3 +183,16 @@ Thread ids accept unique prefixes (e.g. `th_a485`).
 1. **Search** — content search across threads (FTS index in a console-owned cache DB)
 2. **More visualizations** — token mass over time, chunk maps, lineage/fork graphs
 3. **Actions** — relaunch helpers, then edit/prune/smart-compact (via the LHC SDK, which owns mutation invariants)
+
+## Upstream owner (LIM-40)
+
+Cross-fork upstream watch/report for **codex-lhc** and **grok-build-lhc** (no auto-merge,
+no release publish from this role):
+
+- Runbook: [`docs/UPSTREAM_OWNER.md`](docs/UPSTREAM_OWNER.md)
+- Tooling: [`scripts/upstream-watch/`](scripts/upstream-watch/)
+- Schemas: `WATCH_REPORT v1` + `CANDIDATE_HANDOFF v1`
+- Timers for CTO review: [`deploy/lhc-upstream-watch*.timer`](deploy/)
+
+Release qualification remains **codex-fork-steward** for Codex promote workflows.
+

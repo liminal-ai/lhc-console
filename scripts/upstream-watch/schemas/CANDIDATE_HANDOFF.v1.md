@@ -2,8 +2,9 @@
 
 Coherent post-sync tip ready for **release qualification** (not publication).
 Produced only by the upstream owner after a completed sync drill + green tripwire.
-Consumed by **codex-fork-steward** (release qualification). Upstream owner does
-**not** publish GitHub Releases or run promote workflows.
+Consumed by **codex-fork-steward** (release qualification for **both**
+codex-lhc and grok-build-lhc). Upstream owner does **not** publish GitHub
+Releases or run promote workflows.
 
 ## Exact field block
 
@@ -37,8 +38,8 @@ not_in_scope:     release publish; smoke promote; version bump unless requested
 2. Qualify only **`candidate_sha`** exactly (no “nearby” tip).
 3. `recommended=HOLD` is still a valid handoff (document-only); do not publish.
 4. Grok vs Codex evidence stays separate files / separate report instances.
-5. Release workflows remain owned by the release qualifier (Codex steward for
-   codex-lhc promote path; Grok publication only under explicit release ownership).
+5. Release workflows remain owned by the release qualifier (**codex-fork-steward**
+   for both forks' qualify/promote lanes).
 
 ## When to emit
 

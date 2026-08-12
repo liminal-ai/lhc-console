@@ -7,8 +7,10 @@ After=network-online.target
 Type=oneshot
 WorkingDirectory=/srv/work/lhc-console
 # Daily lightweight check: fetch + WATCH_REPORT + update last-seen state.
-# No merge. Exit 2 means assess/sync_candidate attention (still success for systemd).
+# No merge. Exit 2 = assess/sync_candidate attention (SuccessExitStatus).
+# Exit 1 = tool failure.
 ExecStart=/usr/bin/python3 /srv/work/lhc-console/scripts/upstream-watch/upstream_watch.py --check-kind daily --write-reports --update-state
+SuccessExitStatus=2
 Nice=10
 
 [Install]

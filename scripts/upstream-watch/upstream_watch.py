@@ -18,7 +18,6 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -95,7 +94,6 @@ def shortstat_themes(repo: Path, old: str | None, new: str) -> str:
         return "none"
     p = run_git(repo, "diff", "--shortstat", f"{old}..{new}", check=False)
     short = (p.stdout or "").strip() or "none"
-    # Path themes: top-level path prefixes in name-status
     p2 = run_git(repo, "diff", "--name-only", f"{old}..{new}", check=False)
     names = [ln.strip() for ln in (p2.stdout or "").splitlines() if ln.strip()]
     themes: dict[str, int] = {}
@@ -107,31 +105,57 @@ def shortstat_themes(repo: Path, old: str | None, new: str) -> str:
     return f"{short}; themes={theme_s}"
 
 
-def list_new_tags(repo: Path, upstream: str, since_sha: str | None) -> list[str]:
-    """Tags on upstream/main ancestry newer than since_sha (best-effort)."""
-    p = run_git(
+def fetch_upstream_refs(repo: Path, upstream: str, up_branch: str) -> None:
+    """Fetch branch tip and all tags from upstream (required for release detection)."""
+    run_git(repo, "fetch", upstream, "--prune", f"+refs/heads/{up_branch}:refs/remotes/{upstream}/{up_branch}", check=False)
+    # Explicit tag refspec so newly published tags are available even when tip is unchanged.
+    run_git(
         repo,
-        "tag",
-        "--merged",
-        f"{upstream}/main",
-        "--sort=-creatordate",
+        "fetch",
+        upstream,
+        "--prune",
+        "+refs/tags/*:refs/tags/upstream-watch/*",
         check=False,
     )
-    tags = [t.strip() for t in (p.stdout or "").splitlines() if t.strip()]
-    if not since_sha:
-        return tags[:5]
-    new: list[str] = []
-    for tag in tags:
-        tip = rev_parse(repo, tag)
-        if not tip:
+
+
+def list_remote_tags(repo: Path, remote: str) -> dict[str, str]:
+    """Map tag name -> peeled object sha via ls-remote (authoritative remote view)."""
+    p = run_git(repo, "ls-remote", "--tags", "--refs", remote, check=False)
+    if p.returncode != 0:
+        return {}
+    out: dict[str, str] = {}
+    for line in (p.stdout or "").splitlines():
+        line = line.strip()
+        if not line or "\t" not in line:
             continue
-        # tag is "new" if not an ancestor of since_sha (tag not in old main history)
-        p = run_git(repo, "merge-base", "--is-ancestor", tip, since_sha, check=False)
-        if p.returncode != 0:
-            new.append(tag)
-        if len(new) >= 5:
-            break
-    return new
+        sha, ref = line.split("\t", 1)
+        if not ref.startswith("refs/tags/"):
+            continue
+        name = ref[len("refs/tags/") :]
+        # Prefer peeled ^{} lines when present; ls-remote --refs omits ^{}.
+        out[name] = sha
+    return out
+
+
+def detect_release_events(
+    remote_tags: dict[str, str],
+    known_tag_names: set[str] | None,
+) -> tuple[str, list[str], bool]:
+    """Return (release_event field, new_tag_names, is_first_baseline).
+
+    First baseline (known_tag_names is None): record all current tags, emit no event.
+    Later: tags in remote_tags not in known set are new official tags, independent of tip move.
+    """
+    names = sorted(remote_tags.keys())
+    if known_tag_names is None:
+        return "none", names, True
+    new = sorted(set(names) - set(known_tag_names))
+    if not new:
+        return "none", [], False
+    # Cap display; full list still used for state updates.
+    shown = new[:5]
+    return "tag:" + ",".join(shown), new, False
 
 
 def remote_url(repo: Path, remote: str) -> str:
@@ -143,6 +167,10 @@ def remote_url(repo: Path, remote: str) -> str:
 class WatchResult:
     fork_id: str
     fields: dict[str, str]
+    # Internal: for tests / state
+    new_tag_names: list[str]
+    remote_tag_names: list[str]
+    first_tag_baseline: bool
 
     def render(self) -> str:
         lines = [SCHEMA_VERSION_WATCH]
@@ -209,11 +237,15 @@ def watch_one(
     st_path = state_path(state_dir, fork_id)
     prev = load_state(st_path)
     last_seen = prev.get("last_seen_upstream_sha") or "none"
+    known_tags_raw = prev.get("known_upstream_tags")
+    if known_tags_raw is None:
+        known_tag_names: set[str] | None = None
+    else:
+        known_tag_names = set(known_tags_raw)
 
     if do_fetch:
-        # fetch only — never merge
         run_git(repo, "fetch", origin, "--prune", check=False)
-        run_git(repo, "fetch", upstream, "--prune", check=False)
+        fetch_upstream_refs(repo, upstream, up_branch)
 
     up_ref = f"{upstream}/{up_branch}"
     lhc_ref = f"{origin}/{product}"
@@ -235,15 +267,12 @@ def watch_one(
     old_for_diff = last_seen if last_seen != "none" else None
     themes = shortstat_themes(repo, old_for_diff, upstream_sha)
 
-    new_tags = list_new_tags(repo, upstream, old_for_diff if old_for_diff else None)
-    if new_tags and (old_for_diff is None or upstream_sha != old_for_diff):
-        # only claim release event when we have a prior baseline or weekly/manual
-        if old_for_diff:
-            release_event = "tag:" + ",".join(new_tags[:3])
-        else:
-            release_event = "none"
-    else:
-        release_event = "none"
+    remote_tags = list_remote_tags(repo, upstream)
+    release_event, new_or_all_tags, first_baseline = detect_release_events(
+        remote_tags, known_tag_names
+    )
+    new_tag_names = [] if first_baseline else list(new_or_all_tags)
+    remote_tag_names = sorted(remote_tags.keys())
 
     upstream_changed = last_seen == "none" or upstream_sha != last_seen
     action = decide_action(check_kind, behind, upstream_changed, release_event)
@@ -251,6 +280,10 @@ def watch_one(
     note = notes
     if last_seen == "none" and note == "none":
         note = "no prior last-seen state"
+    if first_baseline and remote_tag_names and note == "none":
+        note = f"baselined {len(remote_tag_names)} upstream tags (no event)"
+    elif first_baseline and remote_tag_names and note != "none":
+        note = f"{note}; baselined {len(remote_tag_names)} upstream tags"
 
     fields = {
         "fork": fork_id,
@@ -272,6 +305,11 @@ def watch_one(
     }
 
     if update_state:
+        # Always advance tip last-seen; for tags: baseline full set, or union new names.
+        if known_tag_names is None:
+            tags_for_state = remote_tag_names
+        else:
+            tags_for_state = sorted(set(known_tag_names) | set(remote_tag_names))
         save_state(
             st_path,
             {
@@ -284,12 +322,20 @@ def watch_one(
                 "last_check_kind": check_kind,
                 "last_behind": behind,
                 "last_action": action,
+                "last_release_event": release_event,
+                "known_upstream_tags": tags_for_state,
                 "upstream_remote_url": remote_url(repo, upstream),
             },
         )
         fields["state_path"] = str(st_path)
 
-    return WatchResult(fork_id=fork_id, fields=fields)
+    return WatchResult(
+        fork_id=fork_id,
+        fields=fields,
+        new_tag_names=new_tag_names,
+        remote_tag_names=remote_tag_names,
+        first_tag_baseline=first_baseline,
+    )
 
 
 def emit_handoff_stub(fork: dict[str, Any], *, do_fetch: bool) -> str:
@@ -301,12 +347,14 @@ def emit_handoff_stub(fork: dict[str, Any], *, do_fetch: bool) -> str:
     up_branch = fork.get("upstream_branch", "main")
     if do_fetch:
         run_git(repo, "fetch", origin, "--prune", check=False)
-        run_git(repo, "fetch", upstream, "--prune", check=False)
+        fetch_upstream_refs(repo, upstream, up_branch)
 
     candidate = rev_parse(repo, f"{origin}/{product}") or "none"
     up = rev_parse(repo, f"{upstream}/{up_branch}") or "none"
     base_file = repo / fork.get("patches_base_file", "patches/BASE")
-    patches_base = base_file.read_text(encoding="utf-8").strip() if base_file.is_file() else "none"
+    patches_base = (
+        base_file.read_text(encoding="utf-8").strip() if base_file.is_file() else "none"
+    )
 
     vendor_candidates = [
         repo / "codex-rs/lhc/vendor/long-horizon-context",
@@ -381,7 +429,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--update-state",
         action="store_true",
-        help="Write last-seen upstream SHA after a successful check",
+        help="Write last-seen upstream SHA and tag baseline after a successful check",
     )
     p.add_argument(
         "--write-reports",
@@ -411,9 +459,12 @@ def main(argv: list[str] | None = None) -> int:
         if fid not in all_forks:
             raise SystemExit(f"unknown fork {fid!r}; known: {', '.join(all_forks)}")
 
-    state_dir = expand(args.state_dir or cfg.get("state_dir_default", "~/.lhc-console/upstream-watch"))
+    state_dir = expand(
+        args.state_dir or cfg.get("state_dir_default", "~/.lhc-console/upstream-watch")
+    )
     report_dir = expand(
-        args.report_dir or cfg.get("report_dir_default", "~/.lhc-console/upstream-watch/reports")
+        args.report_dir
+        or cfg.get("report_dir_default", "~/.lhc-console/upstream-watch/reports")
     )
 
     summaries: list[dict[str, Any]] = []
@@ -452,14 +503,14 @@ def main(argv: list[str] | None = None) -> int:
             ts = result.fields["checked_at"].replace(":", "").replace("-", "")
             out = report_dir / f"WATCH_{fid}_{ts}.txt"
             out.write_text(block, encoding="utf-8")
-            # stable latest pointer
             latest = report_dir / f"WATCH_{fid}_latest.txt"
             latest.write_text(block, encoding="utf-8")
             sys.stderr.write(f"wrote {out}\n")
 
         summaries.append(dict(result.fields))
         if result.fields["action"] in ("assess", "sync_candidate"):
-            exit_code = max(exit_code, 2)  # signal attention without hard fail of tooling
+            # Attention signal; systemd units set SuccessExitStatus=2.
+            exit_code = max(exit_code, 2)
 
     if args.json_summary and summaries:
         sys.stderr.write(json.dumps({"reports": summaries}, indent=2) + "\n")

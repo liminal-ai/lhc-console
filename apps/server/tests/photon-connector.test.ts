@@ -17,7 +17,7 @@ const servers: Server[] = [];
 const queues: RelayQueue[] = [];
 const connectors: PhotonConnector[] = [];
 const PHONE_REPLY_GUIDANCE_FOR_TEST =
-  "[Response style for iMessage: write for a phone screen. Use short paragraphs, compact bullets only when they improve scanning, simple headings, and restrained bold. Keep code blocks brief. Avoid long preambles, raw IDs, and internal jargon unless needed. Use emojis sparingly—only when they convey useful status or tone; do not decorate headings or every bullet.]";
+  "[Response style for iMessage: write for a phone screen. Use controlled English inspired by ASD-STE100 as a general default, not as strict compliance. Answer first. Use short sentences and one idea per sentence. Prefer active voice, concrete words, and explicit subjects. Keep established project terms unchanged. Use short paragraphs, compact bullets only when they improve scanning, simple headings, and restrained bold. Keep code blocks brief. Avoid long preambles, raw IDs, internal jargon, narrative, reassurance, and background unless needed for the current request. For status updates, state the current state, the next action, and whether Lee must act. Use emojis sparingly and only when they add useful status or tone.]";
 
 afterEach(async () => {
   await Promise.all(connectors.splice(0).map((connector) => connector.stop()));

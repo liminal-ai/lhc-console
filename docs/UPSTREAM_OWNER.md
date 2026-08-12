@@ -23,7 +23,10 @@ Schemas (exact):
 
 - [`../scripts/upstream-watch/schemas/WATCH_REPORT.v1.md`](../scripts/upstream-watch/schemas/WATCH_REPORT.v1.md)
 - [`../scripts/upstream-watch/schemas/CANDIDATE_HANDOFF.v1.md`](../scripts/upstream-watch/schemas/CANDIDATE_HANDOFF.v1.md)
-- Grok product seams for qualification: coordinate with codex-fork-steward (Linux-only lane, default-on LHC, `SOURCE_REV` ≡ `upstream_base`)
+- Grok product seams for qualification: coordinate with codex-fork-steward
+  (Linux-only lane, default-on LHC). Identity triple: `candidate_sha` (product
+  tip), `source_rev` from file `SOURCE_REV` (xAI monorepo), `patches_base` /
+  public-git `upstream_base` — **never require monorepo ≡ public BASE**
 
 Automation: [`../scripts/upstream-watch/`](../scripts/upstream-watch/).
 
@@ -129,8 +132,9 @@ Preserve **distinct evidence** per fork (separate reports, separate handoffs).
 1. Complete FORK sync + tripwire **GREEN**.
 2. Fill every field in `CANDIDATE_HANDOFF v1` (see schema). For Grok, also
    satisfy release-qualifier product seams (Linux artifact identity,
-   default-on / Replace / `~/.grok-lhc`, `SOURCE_REV` ≡ `upstream_base`,
-   tripwire evidence URL/path).
+   default-on / Replace / `~/.grok-lhc`, tripwire evidence URL/path) and the
+   **identity triple**: `candidate_sha`, `source_rev` (`SOURCE_REV` monorepo
+   id), `patches_base` (public-git recovery base) — **separate**, not equal.
    Helper stub only (pre-sync):
    `python3 scripts/upstream-watch/upstream_watch.py --emit-handoff-stub --fork grok-build-lhc`
 3. Send the block to **codex-fork-steward** via `lhc-agent`.

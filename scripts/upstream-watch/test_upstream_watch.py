@@ -188,6 +188,8 @@ class UpstreamWatchTests(unittest.TestCase):
         self.assertIn("recommended: HOLD", text)
         self.assertIn("tripwire: RED", text)
         self.assertIn("produced_by: upstream-owner", text)
+        self.assertIn("source_rev:", text)
+        self.assertIn("patches_base:", text)
 
     def test_decide_action(self) -> None:
         self.assertEqual(uw.decide_action("daily", 0, False, "none"), "none")

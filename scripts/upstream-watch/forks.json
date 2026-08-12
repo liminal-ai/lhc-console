@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "state_dir_default": "~/.lhc-console/upstream-watch",
+  "report_dir_default": "~/.lhc-console/upstream-watch/reports",
+  "forks": {
+    "grok-build-lhc": {
+      "id": "grok-build-lhc",
+      "repo": "liminal-ai/grok-build-lhc",
+      "path": "/srv/work/grok-build",
+      "origin": "origin",
+      "upstream": "upstream",
+      "product_branch": "lhc",
+      "mirror_branch": "main",
+      "upstream_branch": "main",
+      "patches_base_file": "patches/BASE",
+      "tripwire": "scripts/check-lhc-hooks.sh",
+      "fork_doc": "FORK.md"
+    },
+    "codex-lhc": {
+      "id": "codex-lhc",
+      "repo": "liminal-ai/codex-lhc",
+      "path": "/srv/work/codex",
+      "origin": "origin",
+      "upstream": "upstream",
+      "product_branch": "lhc",
+      "mirror_branch": "main",
+      "upstream_branch": "main",
+      "patches_base_file": "patches/lhc/BASE",
+      "tripwire": "scripts/check-lhc-hooks.sh",
+      "fork_doc": "FORK.md"
+    }
+  }
+}

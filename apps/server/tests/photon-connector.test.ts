@@ -284,6 +284,25 @@ describe("PhotonConnector", () => {
     expect(sidecar.formats).toEqual(["markdown"]);
   });
 
+  it("sends URL-bearing replies as clean plain text instead of raw Markdown", async () => {
+    const sidecar = await startFakeSidecar();
+    const { connector } = await startConnector({
+      sidecar,
+      execute: async () => "unused",
+    });
+    await connector.send(
+      dmEvent().space.id,
+      "# Report\n\n**Healthy** — see [details](https://example.com).\n\n```ts\nconst ok = true;\n```",
+    );
+    expect(sidecar.sent).toEqual([
+      {
+        spaceId: dmEvent().space.id,
+        text: "Report\n\nHealthy — see details (https://example.com).\n\nconst ok = true;",
+      },
+    ]);
+    expect(sidecar.formats).toEqual(["text"]);
+  });
+
   it("deduplicates replayed owner DMs by chat and message id", async () => {
     const sidecar = await startFakeSidecar();
     let calls = 0;

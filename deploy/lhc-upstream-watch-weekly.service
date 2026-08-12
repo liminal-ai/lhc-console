@@ -6,7 +6,7 @@ After=network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory=/srv/work/lhc-console
-ExecStart=/usr/bin/python3 /srv/work/lhc-console/scripts/upstream-watch/upstream_watch.py --check-kind weekly_reconcile --write-reports --update-state
+ExecStart=/usr/bin/python3 /srv/work/lhc-console/scripts/upstream-watch/upstream_watch.py --check-kind weekly_reconcile --write-reports --update-state --dispatch
 SuccessExitStatus=2
 Nice=10
 

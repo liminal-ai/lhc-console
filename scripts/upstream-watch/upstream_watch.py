@@ -455,6 +455,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Also print machine-readable summary to stderr",
     )
+    p.add_argument(
+        "--dispatch",
+        action="store_true",
+        help=(
+            "On assess/sync_candidate, dedupe-dispatch lhc-agent start to "
+            "upstream-owner only (never release qualifier). See dispatch.py."
+        ),
+    )
+    p.add_argument(
+        "--dispatch-dry-run",
+        action="store_true",
+        help="With --dispatch: plan lhc-agent calls without invoking them",
+    )
     return p.parse_args(argv)
 
 
@@ -477,6 +490,7 @@ def main(argv: list[str] | None = None) -> int:
 
     summaries: list[dict[str, Any]] = []
     exit_code = 0
+    dispatch_fail = False
 
     for fid in selected:
         fork = all_forks[fid]
@@ -519,9 +533,35 @@ def main(argv: list[str] | None = None) -> int:
         if result.fields["action"] in ("assess", "sync_candidate"):
             # Attention signal; systemd units set SuccessExitStatus=2.
             exit_code = max(exit_code, 2)
+            if args.dispatch or args.dispatch_dry_run:
+                # Lazy import keeps hermetic tests free of lhc-agent side effects.
+                from dispatch import dispatch_watch_attention
+
+                dres = dispatch_watch_attention(
+                    result.fields,
+                    block,
+                    state_dir=state_dir,
+                    report_dir=report_dir,
+                    # --dispatch enables real send; --dispatch-dry-run alone plans only
+                    dry_run=bool(args.dispatch_dry_run) and not bool(args.dispatch),
+                    force=False,
+                )
+                sys.stderr.write(f"dispatch[{fid}]: {json.dumps(dres)}\n")
+                if dres.get("error"):
+                    dispatch_fail = True
 
     if args.json_summary and summaries:
         sys.stderr.write(json.dumps({"reports": summaries}, indent=2) + "\n")
+
+    if dispatch_fail and exit_code == 0:
+        exit_code = 1
+    elif dispatch_fail:
+        # Keep attention=2 if present; still surface failure via log file.
+        # Use exit 1 only when pure tool failure without attention.
+        if exit_code == 2:
+            pass
+        else:
+            exit_code = 1
 
     return exit_code
 

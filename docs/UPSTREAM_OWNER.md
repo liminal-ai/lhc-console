@@ -82,7 +82,14 @@ python3 scripts/upstream-watch/upstream_watch.py \
 - Reports: `~/.lhc-console/upstream-watch/reports/WATCH_<fork>_latest.txt`
 - Exit codes: `0` quiet; `2` attention (`assess` / `sync_candidate`); `1` tool failure
 - Systemd units set `SuccessExitStatus=2` so attention is not a failed service
-- **No merge.** If `action=assess`, read themes and decide whether to schedule a sync drill.
+- **`--dispatch` (enabled on installed timers):** on attention only, dedupe-dispatch
+  `lhc-agent start` to **`grok-build-fork-steward`** (upstream-owner). Durable keys in
+  `~/.lhc-console/upstream-watch/dispatched.json`. Failures append
+  `reports/DISPATCH_FAILURES.log`.
+- **Never** dispatches to **codex-fork-steward** from raw watch — release qualification
+  starts only from an explicit QUALIFY `CANDIDATE_HANDOFF` (see below).
+- **No merge.** If `action=assess`, upstream-owner assesses and, if authorized, runs
+  FORK sync drill.
 
 ### Official release / tag trigger
 
@@ -137,7 +144,15 @@ Preserve **distinct evidence** per fork (separate reports, separate handoffs).
    id), `patches_base` (public-git recovery base) — **separate**, not equal.
    Helper stub only (pre-sync):
    `python3 scripts/upstream-watch/upstream_watch.py --emit-handoff-stub --fork grok-build-lhc`
-3. Send the block to **codex-fork-steward** via `lhc-agent`.
+3. Send QUALIFY handoff to **codex-fork-steward** (deduped):
+
+   ```bash
+   python3 scripts/upstream-watch/dispatch.py handoff /path/to/CANDIDATE_HANDOFF.txt
+   ```
+
+   Only `tripwire: GREEN` + `recommended: QUALIFY` + full 40-char `candidate_sha`
+   are sent. HOLD/RED handoffs are skipped (not release work).
+
 4. Stop. Do not promote or publish.
 
 ---

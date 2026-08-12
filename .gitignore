@@ -31,3 +31,7 @@ dist-ssr
 
 # AI agent worktrees
 .claude/worktrees/
+
+# python
+scripts/**/__pycache__/
+*.py[cod]

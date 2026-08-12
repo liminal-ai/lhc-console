@@ -1,6 +1,11 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
 import type { AgentRecord } from "../src/agent-registry.ts";
+import { RelayQueue } from "../src/relay.ts";
 import {
+  latestPhotonDestination,
   renderSenderAttribution,
   resolveDeclaredSender,
   resolveLeePhotonRoute,
@@ -55,6 +60,38 @@ describe("relay sender helpers", () => {
       connectorAgentId: "fable",
       spaceId: "fable-home",
     });
+  });
+
+  it("recovers the sender connector destination from prior inbound delivery", async () => {
+    const consoleHome = mkdtempSync(join(tmpdir(), "lhc-sender-route-"));
+    const queue = new RelayQueue({
+      dbPath: join(consoleHome, "relay.sqlite"),
+      targets: { fable: agent("fable", {}).relay },
+      isBusy: () => false,
+      execute: async () => "unused",
+    });
+    queue.enqueue({
+      target: "fable",
+      prompt: "owner message",
+      delivery: { channel: "photon", destination: { spaceId: "fable-owner-dm" } },
+    });
+    queue.enqueue({
+      target: "fable",
+      prompt: "group wake",
+      delivery: {
+        channel: "photon",
+        destination: { spaceId: "fable-group" },
+        metadata: { kind: "photon_group_wake" },
+      },
+    });
+    await queue.close();
+
+    const learnedSpaceId = latestPhotonDestination(consoleHome, "fable");
+    expect(resolveLeePhotonRoute([agent("fable", {})], "fable", learnedSpaceId)).toEqual({
+      connectorAgentId: "fable",
+      spaceId: "fable-owner-dm",
+    });
+    rmSync(consoleHome, { recursive: true, force: true });
   });
 
   it("falls back to the console connector when the sender has no usable photon route", () => {

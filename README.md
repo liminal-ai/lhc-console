@@ -50,7 +50,10 @@ The command discovers the loopback endpoint and owner-only token itself. Callers
 use stable agent keys; URLs, credentials, thread IDs, phone numbers, working
 directories, and runtime commands remain control-plane internals. Registry
 discovery exposes only the key, display name, description, duties, and channel
-types.
+types. Photon replies use native Markdown by default and are shaped for compact
+phone reading; set `LHC_PHOTON_MARKDOWN=false` to use plain text. Replies over
+8,000 characters are shortened only for iMessage—the full output remains on the
+relay job.
 
 The server exposes a small authenticated job relay at `127.0.0.1:5959`. Relay
 targets come from the owner-only `~/.lhc-console/agents.json` registry. Each

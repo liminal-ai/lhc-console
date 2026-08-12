@@ -26,7 +26,7 @@ const STOP_TIMEOUT_MS = 2_000;
 const INBOUND_SETTLE_TIMEOUT_MS = STOP_TIMEOUT_MS;
 const INBOUND_RECONNECT_MS = 250;
 const PHONE_REPLY_GUIDANCE =
-  "[Response style: write for a phone reader using short paragraphs, compact bullets, and plain-English headings; avoid IDs and internal jargon unless needed.]";
+  "[Response style for iMessage: write for a phone screen. Use short paragraphs, compact bullets only when they improve scanning, simple headings, and restrained bold. Keep code blocks brief. Avoid long preambles, raw IDs, and internal jargon unless needed. Use emojis sparingly—only when they convey useful status or tone; do not decorate headings or every bullet.]";
 
 interface SidecarBinding {
   baseUrl: string;

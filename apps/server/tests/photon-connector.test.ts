@@ -17,7 +17,7 @@ const servers: Server[] = [];
 const queues: RelayQueue[] = [];
 const connectors: PhotonConnector[] = [];
 const PHONE_REPLY_GUIDANCE_FOR_TEST =
-  "[Response style: write for a phone reader using short paragraphs, compact bullets, and plain-English headings; avoid IDs and internal jargon unless needed.]";
+  "[Response style for iMessage: write for a phone screen. Use short paragraphs, compact bullets only when they improve scanning, simple headings, and restrained bold. Keep code blocks brief. Avoid long preambles, raw IDs, and internal jargon unless needed. Use emojis sparingly—only when they convey useful status or tone; do not decorate headings or every bullet.]";
 
 afterEach(async () => {
   await Promise.all(connectors.splice(0).map((connector) => connector.stop()));

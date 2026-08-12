@@ -27,6 +27,23 @@ const INBOUND_SETTLE_TIMEOUT_MS = STOP_TIMEOUT_MS;
 const INBOUND_RECONNECT_MS = 250;
 const PHONE_REPLY_GUIDANCE =
   "[Response style for iMessage: write for a phone screen. Use short paragraphs, compact bullets only when they improve scanning, simple headings, and restrained bold. Keep code blocks brief. Avoid long preambles, raw IDs, and internal jargon unless needed. Use emojis sparingly—only when they convey useful status or tone; do not decorate headings or every bullet.]";
+const URL_PATTERN = /https?:\/\/\S+/i;
+
+function plainTextForPhoton(markdown: string): string {
+  return markdown
+    .replace(/\[([^\]]+)]\((https?:\/\/[^)]+)\)/gi, "$1 ($2)")
+    .replace(/^```[^\n]*\n?/gm, "")
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/^>\s?/gm, "")
+    .replace(/\*\*(.+?)\*\*/gs, "$1")
+    .replace(/__(.+?)__/gs, "$1")
+    .replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, "$1")
+    .replace(/(?<!_)_([^_\n]+)_(?!_)/g, "$1")
+    .replace(/`([^`\n]+)`/g, "$1")
+    .replace(/^\s*---+\s*$/gm, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
 
 interface SidecarBinding {
   baseUrl: string;
@@ -156,10 +173,11 @@ export class PhotonConnector {
   async send(spaceId: string, text: string): Promise<void> {
     const sidecar = this.#sidecar;
     if (!sidecar) throw new Error(`photon connector for ${this.agentId} is not running`);
+    const markdown = photonMarkdownEnabled() && !URL_PATTERN.test(text);
     await this.#post(sidecar, "/send", {
       spaceId,
-      text,
-      format: photonMarkdownEnabled() ? "markdown" : "text",
+      text: markdown ? text : plainTextForPhoton(text),
+      format: markdown ? "markdown" : "text",
     });
   }
 

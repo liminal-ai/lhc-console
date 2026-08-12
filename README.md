@@ -192,7 +192,11 @@ no release publish from this role):
 - Runbook: [`docs/UPSTREAM_OWNER.md`](docs/UPSTREAM_OWNER.md)
 - Tooling: [`scripts/upstream-watch/`](scripts/upstream-watch/)
 - Schemas: `WATCH_REPORT v1` + `CANDIDATE_HANDOFF v1`
-- Timers for CTO review: [`deploy/lhc-upstream-watch*.timer`](deploy/)
+- Timers for CTO review (all four units):
+  `deploy/lhc-upstream-watch.service`,
+  `deploy/lhc-upstream-watch.timer`,
+  `deploy/lhc-upstream-watch-weekly.service`,
+  `deploy/lhc-upstream-watch-weekly.timer`
 
-Release qualification remains **codex-fork-steward** for Codex promote workflows.
+Release qualification for **both** forks: **codex-fork-steward**.
 

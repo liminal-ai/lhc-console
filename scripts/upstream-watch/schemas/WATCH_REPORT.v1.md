@@ -36,7 +36,17 @@ produced_by:            upstream-owner
 | `action=none` | No change vs last-seen, or behind=0 and no release event |
 | `action=assess` | New upstream tip and/or official release/tag event; human/agent should read themes |
 | `action=sync_candidate` | Weekly reconcile or policy threshold: fork should run sync drill (still **no auto-merge**) |
-| `upstream_release_event` | Best-effort detection of new tags on upstream since last-seen |
+| `upstream_release_event` | New upstream **tag names** vs durable `known_upstream_tags` baseline (independent of tip movement). First baseline of historical tags emits `none`. |
+
+## Durable state (per fork)
+
+In `~/.lhc-console/upstream-watch/<fork>.json` (when `--update-state`):
+
+- `last_seen_upstream_sha` — last observed upstream branch tip
+- `known_upstream_tags` — tag **names** already seen on the upstream remote
+
+Fetch must obtain tags (explicit tag refspec in `fetch_upstream_refs`) and
+`ls-remote --tags` is used for the remote tag set.
 
 ## Policy
 
@@ -45,3 +55,5 @@ produced_by:            upstream-owner
 - Default watch writes reports; state update is explicit to avoid silent drift
   during dry runs.
 - Never merge upstream from a WATCH_REPORT alone.
+- Exit code `2` means attention (`assess` / `sync_candidate`); systemd units
+  mark it successful via `SuccessExitStatus=2`.

@@ -16,6 +16,8 @@ const dirs: string[] = [];
 const servers: Server[] = [];
 const queues: RelayQueue[] = [];
 const connectors: PhotonConnector[] = [];
+const PHONE_REPLY_GUIDANCE_FOR_TEST =
+  "[Response style: write for a phone reader using short paragraphs, compact bullets, and plain-English headings; avoid IDs and internal jargon unless needed.]";
 
 afterEach(async () => {
   await Promise.all(connectors.splice(0).map((connector) => connector.stop()));
@@ -36,6 +38,7 @@ interface FakeSidecar {
   token: string;
   pushInbound(event: unknown): void;
   sent: Array<{ spaceId: string; text: string }>;
+  formats: string[];
 }
 
 function agentRecord(): AgentRecord {
@@ -72,7 +75,7 @@ function relayQueue(execute: RelayExecute, sidecar: FakeSidecar, consoleHome: st
           "content-type": "application/json",
           "X-Hermes-Sidecar-Token": sidecar.token,
         },
-        body: JSON.stringify({ spaceId, text, format: "text" }),
+        body: JSON.stringify({ spaceId, text, format: "markdown" }),
       });
       if (!response.ok) throw new Error(`send failed with ${response.status}`);
     },
@@ -99,6 +102,7 @@ function relayQueue(execute: RelayExecute, sidecar: FakeSidecar, consoleHome: st
 function startFakeSidecar(): Promise<FakeSidecar> {
   const token = "sidecar-test-token";
   const sent: Array<{ spaceId: string; text: string }> = [];
+  const formats: string[] = [];
   let inboundRes: ServerResponse | null = null;
   const pendingLines: string[] = [];
 
@@ -129,8 +133,10 @@ function startFakeSidecar(): Promise<FakeSidecar> {
       const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
         spaceId: string;
         text: string;
+        format?: string;
       };
       sent.push({ spaceId: body.spaceId, text: body.text });
+      formats.push(body.format ?? "text");
       res.setHeader("content-type", "application/json");
       res.end(JSON.stringify({ ok: true, messageId: "out-1" }));
       return;
@@ -157,6 +163,7 @@ function startFakeSidecar(): Promise<FakeSidecar> {
         baseUrl: `http://127.0.0.1:${address.port}`,
         token,
         sent,
+        formats,
         pushInbound(event: unknown) {
           const line = JSON.stringify(event);
           if (inboundRes) inboundRes.write(`${line}\n`);
@@ -268,10 +275,13 @@ describe("PhotonConnector", () => {
       },
     });
     sidecar.pushInbound(dmEvent({ text: "status?" }));
-    await expect.poll(() => prompts, { timeout: 1_000 }).toEqual(["status?"]);
+    await expect
+      .poll(() => prompts, { timeout: 1_000 })
+      .toEqual([`status?\n\n${PHONE_REPLY_GUIDANCE_FOR_TEST}`]);
     await expect
       .poll(() => sidecar.sent, { timeout: 1_000 })
-      .toEqual([{ spaceId: "+15559876543", text: "agent reply" }]);
+      .toEqual([{ spaceId: dmEvent().space.id, text: "agent reply" }]);
+    expect(sidecar.formats).toEqual(["markdown"]);
   });
 
   it("deduplicates replayed owner DMs by chat and message id", async () => {
@@ -290,7 +300,12 @@ describe("PhotonConnector", () => {
     await expect.poll(() => calls, { timeout: 1_000 }).toBe(1);
     await expect
       .poll(() => sidecar.sent, { timeout: 1_000 })
-      .toEqual([{ spaceId: "+15559876543", text: "reply:once" }]);
+      .toEqual([
+        {
+          spaceId: dmEvent().space.id,
+          text: `reply:once\n\n${PHONE_REPLY_GUIDANCE_FOR_TEST}`,
+        },
+      ]);
   });
 
   it("reclaims an inbound DM after a crash before durable enqueue", async () => {
@@ -436,7 +451,7 @@ describe("PhotonConnector", () => {
             "content-type": "application/json",
             "X-Hermes-Sidecar-Token": sidecar.token,
           },
-          body: JSON.stringify({ spaceId, text, format: "text" }),
+          body: JSON.stringify({ spaceId, text, format: "markdown" }),
         });
         if (!response.ok) throw new Error(`send failed with ${response.status}`);
       },

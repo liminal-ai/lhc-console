@@ -1,3 +1,5 @@
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import type { AgentRecord } from "./agent-registry.ts";
 
 export function listAgentIds(agents: AgentRecord[]): string[] {
@@ -36,13 +38,14 @@ export interface LeePhotonRoute {
 export function resolveLeePhotonRoute(
   agents: AgentRecord[],
   senderAgentId: string,
+  senderSpaceId?: string | null,
 ): LeePhotonRoute {
   const sender = agents.find((agent) => agent.id === senderAgentId);
   if (!sender) throw new Error(`unknown sender agent: ${senderAgentId}`);
 
-  const senderSpaceId = sender.channels.photon?.notifySpaceId;
-  if (sender.channels.photon && senderSpaceId) {
-    return { connectorAgentId: sender.id, spaceId: senderSpaceId };
+  const senderDestination = sender.channels.photon?.notifySpaceId ?? senderSpaceId;
+  if (sender.channels.photon && senderDestination) {
+    return { connectorAgentId: sender.id, spaceId: senderDestination };
   }
 
   const consoleAgent = agents.find((agent) => agent.id === "console");
@@ -59,4 +62,31 @@ export function resolveLeePhotonRoute(
   }
 
   throw new Error("no photon connector is configured to deliver messages to Lee");
+}
+
+export function latestPhotonDestination(consoleHome: string, target: string): string | null {
+  const db = new DatabaseSync(join(consoleHome, "relay.sqlite"), { readOnly: true });
+  try {
+    const row = db
+      .prepare(
+        `SELECT delivery_destination
+         FROM relay_jobs
+         WHERE target = ?
+           AND delivery_channel = 'photon'
+           AND delivery_destination IS NOT NULL
+           AND (delivery_metadata IS NULL OR json_extract(delivery_metadata, '$.kind') != 'photon_group_wake')
+         ORDER BY created_at DESC, rowid DESC
+         LIMIT 1`,
+      )
+      .get(target) as { delivery_destination: string } | undefined;
+    if (!row) return null;
+    const destination = JSON.parse(row.delivery_destination) as Record<string, unknown>;
+    return typeof destination.spaceId === "string" && destination.spaceId
+      ? destination.spaceId
+      : null;
+  } catch {
+    return null;
+  } finally {
+    db.close();
+  }
 }

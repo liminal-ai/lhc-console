@@ -25,6 +25,8 @@ const MAX_SIDECAR_BACKOFF_MS = 30_000;
 const STOP_TIMEOUT_MS = 2_000;
 const INBOUND_SETTLE_TIMEOUT_MS = STOP_TIMEOUT_MS;
 const INBOUND_RECONNECT_MS = 250;
+const PHONE_REPLY_GUIDANCE =
+  "[Response style: write for a phone reader using short paragraphs, compact bullets, and plain-English headings; avoid IDs and internal jargon unless needed.]";
 
 interface SidecarBinding {
   baseUrl: string;
@@ -154,7 +156,11 @@ export class PhotonConnector {
   async send(spaceId: string, text: string): Promise<void> {
     const sidecar = this.#sidecar;
     if (!sidecar) throw new Error(`photon connector for ${this.agentId} is not running`);
-    await this.#post(sidecar, "/send", { spaceId, text, format: "text" });
+    await this.#post(sidecar, "/send", {
+      spaceId,
+      text,
+      format: photonMarkdownEnabled() ? "markdown" : "text",
+    });
   }
 
   #schedule(task: () => Promise<void>): void {
@@ -347,7 +353,7 @@ export class PhotonConnector {
   #enqueueRelay(spaceId: string, prompt: string, groupWake?: GroupWakeMetadata): void {
     this.#queue.enqueue({
       target: this.#agent.id,
-      prompt,
+      prompt: `${prompt}\n\n${PHONE_REPLY_GUIDANCE}`,
       jobClass: "prioritized",
       delivery: {
         channel: "photon",
@@ -360,7 +366,11 @@ export class PhotonConnector {
   async #send(spaceId: string, text: string): Promise<void> {
     const sidecar = this.#sidecar;
     if (!sidecar || this.#stopped) return;
-    await this.#post(sidecar, "/send", { spaceId, text, format: "text" });
+    await this.#post(sidecar, "/send", {
+      spaceId,
+      text,
+      format: photonMarkdownEnabled() ? "markdown" : "text",
+    });
   }
 
   #isOwner(senderId: string | null): boolean {
@@ -553,6 +563,11 @@ function scrubSecrets(message: string): string {
   return message
     .replace(/PHOTON_PROJECT_SECRET=\S+/gi, "PHOTON_PROJECT_SECRET=[redacted]")
     .replace(/PHOTON_SIDECAR_TOKEN=\S+/gi, "PHOTON_SIDECAR_TOKEN=[redacted]");
+}
+
+function photonMarkdownEnabled(): boolean {
+  const value = process.env.LHC_PHOTON_MARKDOWN ?? process.env.PHOTON_MARKDOWN ?? "true";
+  return !["false", "0", "no"].includes(value.trim().toLowerCase());
 }
 
 function sleep(ms: number): Promise<void> {

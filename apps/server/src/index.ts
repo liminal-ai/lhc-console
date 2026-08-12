@@ -262,6 +262,7 @@ registerRelayRoutes(app, {
   queue: relayQueue,
   token: relayToken,
   agents: agentRegistry.agents,
+  consoleHome,
 });
 registerMonitorRoutes(app, { service: monitorService, token: relayToken });
 registerGoalRoutes(app, { service: goalService, token: relayToken });

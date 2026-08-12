@@ -162,4 +162,21 @@ describe("deliverRelayJob", () => {
       ),
     ).rejects.toThrow(/no photon connector is configured/i);
   });
+
+  it("bounds long Photon replies while retaining the relay job reference", async () => {
+    const sent: string[] = [];
+    await deliverRelayJob(job({ id: "job-long", output: "x".repeat(9_000) }), {
+      agents: [],
+      consoleHome: "/tmp",
+      photonConnectors: {
+        send: async (_agentId: string, _spaceId: string, text: string) => {
+          sent.push(text);
+        },
+      } as RelayDeliveryContext["photonConnectors"],
+    });
+
+    expect(sent[0]?.length).toBeLessThanOrEqual(8_000);
+    expect(sent[0]).toContain("job-long");
+    expect(sent[0]).toContain("truncated for iMessage");
+  });
 });

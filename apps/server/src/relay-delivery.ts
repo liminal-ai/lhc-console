@@ -1,5 +1,4 @@
 import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
 import type { LoadedAgentRegistry } from "./agent-registry.ts";
 import {
   GroupCatchUpStore,
@@ -7,8 +6,10 @@ import {
   type GroupWakeDeliveryMetadata,
 } from "./group-catch-up.ts";
 import type { PhotonConnectorManager } from "./photon-connector.ts";
-import { resolveLeePhotonRoute } from "./relay-sender.ts";
+import { latestPhotonDestination, resolveLeePhotonRoute } from "./relay-sender.ts";
 import type { RelayJob } from "./relay.ts";
+
+const MAX_PHOTON_MESSAGE_LENGTH = 8_000;
 
 export interface RelayDeliveryContext {
   agents: LoadedAgentRegistry["agents"];
@@ -39,11 +40,14 @@ async function deliverOutboundLee(job: RelayJob, context: RelayDeliveryContext):
   if (!senderAgentId) {
     throw new Error("outbound lee job is missing sender attribution");
   }
-  const route = resolveLeePhotonRoute(context.agents, senderAgentId);
+  const learnedSpaceId =
+    job.delivery?.destination.spaceId ??
+    latestPhotonDestination(context.consoleHome, senderAgentId);
+  const route = resolveLeePhotonRoute(context.agents, senderAgentId, learnedSpaceId);
   if (!context.photonConnectors) {
     throw new Error("photon connectors are not running");
   }
-  const message = job.output ?? job.prompt;
+  const message = formatPhotonMessage(job.output ?? job.prompt, job.id);
   if (!message.trim()) throw new Error("outbound lee job has no message to deliver");
   await context.photonConnectors.send(route.connectorAgentId, route.spaceId, message);
 }
@@ -60,7 +64,7 @@ async function deliverPhoton(job: RelayJob, context: RelayDeliveryContext): Prom
   if (!context.photonConnectors) {
     throw new Error("photon connectors are not running");
   }
-  const message = job.output ?? "(empty reply)";
+  const message = formatPhotonMessage(job.output ?? "(empty reply)", job.id);
   await context.photonConnectors.send(job.target, spaceId, message);
   const metadata = job.delivery?.metadata as GroupWakeDeliveryMetadata | undefined;
   if (metadata?.kind === "photon_group_wake") {
@@ -72,26 +76,8 @@ async function deliverPhoton(job: RelayJob, context: RelayDeliveryContext): Prom
   }
 }
 
-function latestPhotonDestination(consoleHome: string, target: string): string | null {
-  const db = new DatabaseSync(join(consoleHome, "relay.sqlite"), { readOnly: true });
-  try {
-    const row = db
-      .prepare(
-        `SELECT delivery_destination
-         FROM relay_jobs
-         WHERE target = ? AND delivery_channel = 'photon' AND delivery_destination IS NOT NULL
-         ORDER BY created_at DESC
-         LIMIT 1`,
-      )
-      .get(target) as { delivery_destination: string } | undefined;
-    if (!row) return null;
-    const destination = JSON.parse(row.delivery_destination) as Record<string, unknown>;
-    return typeof destination.spaceId === "string" && destination.spaceId
-      ? destination.spaceId
-      : null;
-  } catch {
-    return null;
-  } finally {
-    db.close();
-  }
+function formatPhotonMessage(message: string, jobId: string): string {
+  if (message.length <= MAX_PHOTON_MESSAGE_LENGTH) return message;
+  const suffix = `\n\n[Reply truncated for iMessage; full output remains in relay job ${jobId}.]`;
+  return `${message.slice(0, MAX_PHOTON_MESSAGE_LENGTH - suffix.length)}${suffix}`;
 }

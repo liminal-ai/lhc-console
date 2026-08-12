@@ -4,6 +4,7 @@ import type { AgentRecord } from "./agent-registry.ts";
 import type { RelayJob, RelayQueue } from "./relay.ts";
 import { renderRelayPrompt } from "./relay-prompt.ts";
 import {
+  latestPhotonDestination,
   renderSenderAttribution,
   resolveLeePhotonRoute,
   validateSenderAgent,
@@ -13,6 +14,7 @@ interface RelayRouteOptions {
   queue: RelayQueue;
   token: string;
   agents: AgentRecord[];
+  consoleHome?: string;
   syncTimeoutMs?: number;
 }
 
@@ -65,7 +67,10 @@ export function registerRelayRoutes(app: FastifyInstance, options: RelayRouteOpt
       }
       let route;
       try {
-        route = resolveLeePhotonRoute(options.agents, validatedSender);
+        const learnedSpaceId = options.consoleHome
+          ? latestPhotonDestination(options.consoleHome, validatedSender)
+          : null;
+        route = resolveLeePhotonRoute(options.agents, validatedSender, learnedSpaceId);
       } catch (error) {
         return reply
           .code(400)

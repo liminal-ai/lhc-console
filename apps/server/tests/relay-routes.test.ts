@@ -160,6 +160,7 @@ function setupWithLee(
   execute: ConstructorParameters<typeof RelayQueue>[0]["execute"] = async (_target, prompt) =>
     `reply:${prompt}`,
   deliver?: ConstructorParameters<typeof RelayQueue>[0]["deliver"],
+  notifySpaceId: string | null = "fable-home",
 ) {
   const dir = mkdtempSync(join(tmpdir(), "lhc-console-relay-api-"));
   dirs.push(dir);
@@ -193,6 +194,7 @@ function setupWithLee(
     queue,
     token: "test-secret",
     syncTimeoutMs: 500,
+    consoleHome: dir,
     agents: [
       {
         id: "fable",
@@ -205,7 +207,7 @@ function setupWithLee(
           photon: {
             address: "http://127.0.0.1:1",
             envFile: ".env",
-            notifySpaceId: "fable-home",
+            ...(notifySpaceId ? { notifySpaceId } : {}),
           },
         },
         relay: {
@@ -261,6 +263,28 @@ describe("relay HTTP API sender attribution", () => {
       .toBe("delivered");
 
     expect(delivered).toEqual([{ connector: "fable", spaceId: "fable-home", text: "heads up" }]);
+  });
+
+  it("bootstraps lee delivery from the sender's latest inbound destination", async () => {
+    const { app, queue } = setupWithLee(undefined, undefined, null);
+    queue.enqueue({
+      target: "fable",
+      prompt: "owner message",
+      delivery: { channel: "photon", destination: { spaceId: "learned-owner-dm" } },
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/relay/targets/lee/jobs",
+      headers: { authorization: "Bearer test-secret" },
+      payload: { prompt: "heads up", sender: "fable" },
+    });
+
+    expect(response.statusCode).toBe(202);
+    expect(response.json().delivery).toMatchObject({
+      destination: { spaceId: "learned-owner-dm" },
+      metadata: { connectorAgentId: "fable" },
+    });
   });
 
   it("rejects unknown senders at the trust boundary", async () => {

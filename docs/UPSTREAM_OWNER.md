@@ -4,20 +4,52 @@
 assess changes, merge when authorized, repair compatibility, hand off coherent
 candidates).
 
-**Not owned here:** GitHub Release publication, candidate smoke, or promote
-workflows. **Release qualification for both codex-lhc and grok-build-lhc** is
-owned by **codex-fork-steward** (immutable candidate → manifest/SHA256 → smoke →
-Lee/CTO promote of those exact bytes). Upstream owner stops at
-**CANDIDATE_HANDOFF**.
+**Not owned here:** GitHub promote/publish execution. **Release qualification
+for both forks** is owned by **codex-fork-steward**. Upstream owner stops at
+**CANDIDATE_HANDOFF** (and may help record PROMOTION_READY).
 
-**Policy (Lee / CTO):**
+## Approval model (Lee / CTO)
 
-| Cadence | Action |
-| --- | --- |
-| **Daily** | Lightweight check: fetch + `WATCH_REPORT` (no merge) |
-| **Official upstream release/tag** | Assessment `WATCH_REPORT` (`check_kind=release_event` or daily with tag baseline) |
-| **Weekly** | Reconciliation: `WATCH_REPORT` with `check_kind=weekly_reconcile`; if `behind>0` → `action=sync_candidate` |
-| **Never automatic** | Merge, tag, publish, promote |
+| May continue **without** Lee | Requires **stop / escalate** | Requires **explicit Lee or CTO approval** |
+| --- | --- | --- |
+| Routine watch, assessment | Consequential **product** decisions | **Promotion** of a qualified exact artifact |
+| Compatible upstream sync + repair | Unsafe **history** changes (reset) | |
+| Handoff, candidate build, Linux smoke | Material **cost/risk** | |
+| | **Failed gates** (tripwire/smoke/qualify) | |
+
+**Never automatic:** tag/publish/promote without the approval path below.
+Routine merge of compatible upstream is **not** blocked on Lee.
+
+### Promotion coordination (durable)
+
+1. Qualifier finishes exact-artifact Linux smoke → records **PROMOTION_READY v1**
+   (`promotion_ready.py record`) with fork, version, `source_sha`, run ids, digests.
+2. Package is stored under `~/.lhc-console/upstream-watch/promotion_ready.json`
+   with stable **`approval_id`** (hash of exact identity).
+3. **CTO** is notified (`lhc-agent start cto`). CTO may **async** notify Lee
+   (`lhc-agent lee "…"` with the same block) — Lee need not be in the qualify loop.
+4. Approval:
+   `python3 scripts/upstream-watch/promotion_ready.py approve <approval_id> --by cto|lee`
+   Optional `--expect-source-sha` / `--expect-*-digest` **refuse** if bytes differ.
+5. On approve, **codex-fork-steward** is notified with the **same** digests/run ids
+   so promote can resume **without rebuild**.
+6. Duplicate/late approval cannot retarget different bytes (identity is keyed by
+   digests; mismatch → hard fail).
+
+Schema: [`../scripts/upstream-watch/schemas/PROMOTION_READY.v1.md`](../scripts/upstream-watch/schemas/PROMOTION_READY.v1.md).
+
+### Residual (do not fake)
+
+Console/relay **does not** bind `approval_id` into GitHub Actions
+`environment: production` gates. Promote workflows still take
+`version` + `candidate_run_id` + `smoke_run_id` (and re-verify digests in-job).
+**Human/agent discipline:** only dispatch promote with inputs from an
+**approved** package in `promotion_ready.json`.
+
+**Smallest follow-up (not this change):** optional promote workflow input
+`approval_id` + job step that loads the store (or a checked-in attestation)
+and asserts digests match artifacts before publish — coordinate with console
++ qualifier.
 
 Schemas (exact):
 
@@ -42,8 +74,10 @@ Fork product drills remain authoritative per tree:
 | Role | Agent key | Responsibility |
 | --- | --- | --- |
 | Upstream owner | `grok-build-fork-steward` (interim host seat; duties cross-fork) | Watch, assess, sync drill, tripwire, **CANDIDATE_HANDOFF** for both forks |
-| Release qualifier | `codex-fork-steward` | **Qualify both forks**: consume handoff; build/smoke/promote release path; Grok Linux-first lane |
-| Control plane | `console` | Relay/monitors that may schedule watch; not merge authority |
+| Release qualifier | `codex-fork-steward` | **Qualify both forks**: handoff → candidate → smoke; record **PROMOTION_READY**; promote **only** after correlated approval |
+| Portfolio CTO | `cto` | Receives PROMOTION_READY; may async Lee; records approve/reject |
+| Lee | `lhc-agent lee` | Async one-way; may approve via operator running `promotion_ready.py approve --by lee` |
+| Control plane | `console` | Relay/monitors; not merge/promote authority |
 
 Registry live file: `~/.lhc-console/agents.json` (owner-only). Documented duty
 strings should match this split — see §Registry wording.

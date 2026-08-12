@@ -51,6 +51,29 @@ Console/relay **does not** bind `approval_id` into GitHub Actions
 and asserts digests match artifacts before publish — coordinate with console
 + qualifier.
 
+### After promote succeeds (Lee one-off)
+
+**Only after** CTO-approved promotion **and** public release verification
+pass, the release qualifier sends Lee **exactly one** concise notification:
+
+```bash
+python3 scripts/upstream-watch/release_notify.py lee-success \
+  --fork grok-build-lhc \
+  --version 0.2.1 \
+  --product "Grok Build LHC" \
+  --summary "Long-horizon context on by default with Replace compact." \
+  --platforms "Linux x86_64" \
+  --limitations "Windows and macOS not published in this cut."
+```
+
+| Rule | Detail |
+| --- | --- |
+| Timing | **After** public verify success — never before, never on PROMOTION_READY alone |
+| Content | Product/version; plain what-changed; published platform(s); material limitation/action if any |
+| Omit | Raw run IDs, digests, internal process (success path) |
+| Dedupe | Exact **fork + tag** in `dispatched.json` (`lee_release_success:…`) — retries do not double-message |
+| Failure verify | Optional `lee-failure` only if public verification failed |
+
 Schemas (exact):
 
 - [`../scripts/upstream-watch/schemas/WATCH_REPORT.v1.md`](../scripts/upstream-watch/schemas/WATCH_REPORT.v1.md)

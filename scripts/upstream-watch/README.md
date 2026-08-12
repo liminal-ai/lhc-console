@@ -7,7 +7,8 @@ Cross-fork **upstream owner** tooling for `codex-lhc` and `grok-build-lhc`.
 - CLI: `upstream_watch.py` (`--dispatch` for attention → upstream-owner)
 - Dispatch: `dispatch.py` (watch attention vs QUALIFY handoff; durable dedupe)
 - Promotion: `promotion_ready.py` (PROMOTION_READY record, CTO notify, approve/reject correlation)
-- Tests: `python3 test_upstream_watch.py && python3 test_dispatch.py && python3 test_promotion_ready.py`
+- Post-verify Lee: `release_notify.py lee-success` (one-off; dedupe fork+tag)
+- Tests: `python3 test_upstream_watch.py && python3 test_dispatch.py && python3 test_promotion_ready.py && python3 test_release_notify.py`
 - Runbook: `../../docs/UPSTREAM_OWNER.md`
 - Timers: `../../deploy/lhc-upstream-watch*.timer` (services use `--dispatch`)
 

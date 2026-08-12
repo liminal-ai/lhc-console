@@ -355,6 +355,13 @@ def emit_handoff_stub(fork: dict[str, Any], *, do_fetch: bool) -> str:
     patches_base = (
         base_file.read_text(encoding="utf-8").strip() if base_file.is_file() else "none"
     )
+    # Grok: SOURCE_REV is xAI monorepo id — distinct from patches/BASE (public git).
+    source_rev_file = repo / "SOURCE_REV"
+    source_rev = (
+        source_rev_file.read_text(encoding="utf-8").strip()
+        if source_rev_file.is_file()
+        else "none"
+    )
 
     vendor_candidates = [
         repo / "codex-rs/lhc/vendor/long-horizon-context",
@@ -379,6 +386,7 @@ def emit_handoff_stub(fork: dict[str, Any], *, do_fetch: bool) -> str:
         "upstream_range: FILL_AFTER_SYNC",
         "merge_commit: none",
         f"patches_base: {patches_base}",
+        f"source_rev: {source_rev}",
         f"lhc_sdk_pin: {pin}",
         "tripwire: RED",
         "tripwire_summary: stub only — run FORK sync drill + tripwire before QUALIFY",

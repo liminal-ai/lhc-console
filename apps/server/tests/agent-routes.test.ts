@@ -17,6 +17,10 @@ function agent(): AgentRecord {
     duties: ["architecture", "durable project work"],
     ownerSenderIds: ["owner-secret"],
     mentionPatterns: ["fable"],
+    health: {
+      hostId: "pi-lhc",
+      threadId: "canonical-health-thread",
+    },
     channels: {
       photon: {
         address: "+15555550123",
@@ -64,7 +68,14 @@ describe("agent discovery API", () => {
       },
     ]);
     const serialized = response.body;
-    for (const secret of ["owner-secret", "secret-thread", "/secret", "+1555", "secret-space"]) {
+    for (const secret of [
+      "owner-secret",
+      "secret-thread",
+      "canonical-health-thread",
+      "/secret",
+      "+1555",
+      "secret-space",
+    ]) {
       expect(serialized).not.toContain(secret);
     }
   });

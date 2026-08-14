@@ -59,8 +59,12 @@ describe("loadAgentRegistry", () => {
       version: 1,
       agents: {
         fable: {
-          ownerSenderIds: ["+15551234567"],
+          ownerSenderIds: ["+155****4567"],
           mentionPatterns: ["\\bfable\\b"],
+          health: {
+            hostId: "pi-lhc",
+            threadId: "th_canonical_fable",
+          },
           channels: {
             photon: {
               address: "+15550001111",
@@ -84,8 +88,12 @@ describe("loadAgentRegistry", () => {
     expect(loaded.agents).toHaveLength(1);
     expect(loaded.agents[0]).toMatchObject({
       id: "fable",
-      ownerSenderIds: ["+15551234567"],
+      ownerSenderIds: ["+155****4567"],
       mentionPatterns: ["\\bfable\\b"],
+      health: {
+        hostId: "pi-lhc",
+        threadId: "th_canonical_fable",
+      },
       channels: {
         photon: {
           address: "+15550001111",
@@ -100,6 +108,29 @@ describe("loadAgentRegistry", () => {
       command: "pi-lhc",
       timeoutMs: 1_800_000,
     });
+  });
+
+  it("rejects an incomplete canonical health reference", () => {
+    const home = mkdtempSync(join(tmpdir(), "lhc-agents-"));
+    dirs.push(home);
+    writeRegistry(home, {
+      version: 1,
+      agents: {
+        fable: {
+          ownerSenderIds: ["owner"],
+          health: { hostId: "pi-lhc" },
+          relay: {
+            hostId: "pi-lhc",
+            threadId: "runtime-session-id",
+            cwd: "/tmp",
+            command: "pi-lhc",
+            args: ["-p"],
+          },
+        },
+      },
+    });
+
+    expect(() => loadAgentRegistry(home)).toThrow(/health\.threadId/);
   });
 
   it("rejects agent keys reserved by the CLI", () => {

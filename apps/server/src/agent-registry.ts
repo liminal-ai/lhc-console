@@ -13,6 +13,11 @@ export interface AgentChannels {
   photon?: PhotonChannelConfig;
 }
 
+export interface AgentHealthRef {
+  hostId: string;
+  threadId: string;
+}
+
 export interface AgentRecord {
   id: string;
   name: string;
@@ -20,6 +25,7 @@ export interface AgentRecord {
   duties: string[];
   ownerSenderIds: string[];
   mentionPatterns: string[];
+  health?: AgentHealthRef;
   channels: AgentChannels;
   relay: RelayTarget;
 }
@@ -56,12 +62,18 @@ interface RawChannels {
   photon?: RawPhotonChannel;
 }
 
+interface RawHealthRef {
+  hostId?: unknown;
+  threadId?: unknown;
+}
+
 interface RawAgentConfig {
   name?: unknown;
   description?: unknown;
   duties?: unknown;
   ownerSenderIds?: unknown;
   mentionPatterns?: unknown;
+  health?: RawHealthRef;
   channels?: RawChannels;
   relay?: RawRelayConfig;
 }
@@ -116,9 +128,29 @@ function parseAgent(id: string, raw: RawAgentConfig, consoleHome: string): Agent
     throw new Error(`${id}.ownerSenderIds must include at least one sender id`);
   }
   const mentionPatterns = parseMentionPatterns(raw.mentionPatterns);
+  const health = parseHealth(id, raw.health);
   const channels = parseChannels(id, raw.channels, consoleHome);
   const relay = parseRelay(id, raw.relay);
-  return { id, name, description, duties, ownerSenderIds, mentionPatterns, channels, relay };
+  return {
+    id,
+    name,
+    description,
+    duties,
+    ownerSenderIds,
+    mentionPatterns,
+    health,
+    channels,
+    relay,
+  };
+}
+
+function parseHealth(id: string, raw: RawHealthRef | undefined): AgentHealthRef | undefined {
+  if (raw === undefined) return undefined;
+  if (!raw || typeof raw !== "object") throw new Error(`${id}.health must be an object`);
+  return {
+    hostId: requireString(raw.hostId, `${id}.health.hostId`),
+    threadId: requireString(raw.threadId, `${id}.health.threadId`),
+  };
 }
 
 function parseChannels(

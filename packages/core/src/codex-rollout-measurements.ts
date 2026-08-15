@@ -1,6 +1,4 @@
-import { closeSync, openSync, readSync, statSync } from "node:fs";
-
-const ROLLOUT_TAIL_BYTES = 2 * 1024 * 1024;
+import { readFileSync, statSync } from "node:fs";
 
 export interface CodexRolloutMeasurements {
   latestProviderInputTokens: number | null;
@@ -38,8 +36,7 @@ export function parseCodexRolloutMeasurements(text: string): CodexRolloutMeasure
     }
     const timestamp = typeof event.timestamp === "string" ? event.timestamp : null;
     if (event.type === "compacted" && timestamp) {
-      latestNativeCompactAt = timestamp;
-      latestNativeCompactViewId = null;
+      let validLhcReceipt = false;
       if (typeof event.payload === "object" && event.payload) {
         const message = (event.payload as Record<string, unknown>).message;
         if (typeof message === "string") {
@@ -47,12 +44,16 @@ export function parseCodexRolloutMeasurements(text: string): CodexRolloutMeasure
           if (match) {
             try {
               const receipt = JSON.parse(match[1]) as Record<string, unknown>;
-              if (typeof receipt.viewId === "string") latestNativeCompactViewId = receipt.viewId;
+              validLhcReceipt = typeof receipt.viewId === "string";
             } catch {
-              // A native compact without a valid LHC receipt remains a native compact.
+              // A compact with a malformed receipt is not attributable to LHC.
             }
           }
         }
+      }
+      if (!validLhcReceipt) {
+        latestNativeCompactAt = timestamp;
+        latestNativeCompactViewId = null;
       }
     }
     if (event.type !== "event_msg" || typeof event.payload !== "object" || !event.payload) continue;
@@ -81,6 +82,7 @@ export function parseCodexRolloutMeasurements(text: string): CodexRolloutMeasure
 
 export interface MeasurementAlarmInput {
   projectedViewTokens: number;
+  projectedViewIsUpperBound: boolean;
   modelContextWindow: number | null;
   currentViewId: string | null;
   currentViewCreatedAt: string | null;
@@ -90,7 +92,11 @@ export interface MeasurementAlarmInput {
 
 export function measurementAlarms(input: MeasurementAlarmInput): string[] {
   const alarms: string[] = [];
-  if (input.modelContextWindow != null && input.projectedViewTokens > input.modelContextWindow) {
+  if (
+    !input.projectedViewIsUpperBound &&
+    input.modelContextWindow != null &&
+    input.projectedViewTokens > input.modelContextWindow
+  ) {
     alarms.push("projected LHC view exceeds the provider-reported model window");
   }
   if (
@@ -104,25 +110,47 @@ export function measurementAlarms(input: MeasurementAlarmInput): string[] {
   return alarms;
 }
 
+function hasRecognizedMeasurementEvent(text: string): boolean {
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const event = JSON.parse(line) as CodexEvent;
+      if (event.type === "compacted") return true;
+      if (event.type !== "event_msg" || typeof event.payload !== "object" || !event.payload)
+        continue;
+      if ((event.payload as Record<string, unknown>).type === "token_count") return true;
+    } catch {
+      // Ignore malformed lines while looking for a usable rollout artifact.
+    }
+  }
+  return false;
+}
+
 export function readCodexRolloutMeasurements(path: string): CodexRolloutMeasurements | null {
-  let fd: number;
-  let size: number;
   try {
-    size = statSync(path).size;
-    fd = openSync(path, "r");
+    const text = readFileSync(path, "utf8");
+    return hasRecognizedMeasurementEvent(text) ? parseCodexRolloutMeasurements(text) : null;
   } catch {
     return null;
   }
-  try {
-    const start = Math.max(0, size - ROLLOUT_TAIL_BYTES);
-    const buffer = Buffer.alloc(size - start);
-    readSync(fd, buffer, 0, buffer.length, start);
-    let text = buffer.toString("utf8");
-    if (start > 0) text = text.slice(text.indexOf("\n") + 1);
-    return parseCodexRolloutMeasurements(text);
-  } catch {
-    return null;
-  } finally {
-    closeSync(fd);
+}
+
+/** Read the newest valid artifact, independent of filesystem/glob ordering. */
+export function readNewestCodexRolloutMeasurements(
+  paths: string[],
+): CodexRolloutMeasurements | null {
+  const newestFirst = paths
+    .flatMap((path) => {
+      try {
+        return [{ path, mtimeMs: statSync(path).mtimeMs }];
+      } catch {
+        return [];
+      }
+    })
+    .sort((a, b) => b.mtimeMs - a.mtimeMs || a.path.localeCompare(b.path));
+  for (const { path } of newestFirst) {
+    const measurements = readCodexRolloutMeasurements(path);
+    if (measurements) return measurements;
   }
+  return null;
 }

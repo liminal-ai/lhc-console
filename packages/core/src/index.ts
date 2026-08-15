@@ -7,6 +7,7 @@ export {
   measurementAlarms,
   parseCodexRolloutMeasurements,
   readCodexRolloutMeasurements,
+  readNewestCodexRolloutMeasurements,
 } from "./codex-rollout-measurements.ts";
 export type {
   CodexRolloutMeasurements,

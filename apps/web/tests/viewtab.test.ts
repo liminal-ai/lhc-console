@@ -40,6 +40,7 @@ function arrangement(): ViewArrangement {
     archivedHistoryTokens: 1000,
     retainedArchiveTokens: 1100,
     projectedViewTokens: 75,
+    projectedViewIsUpperBound: false,
     turnsSinceView: 1,
     turnCount: 3,
   };

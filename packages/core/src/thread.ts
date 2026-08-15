@@ -11,6 +11,8 @@ export interface ThreadQuickStats {
   retainedArchiveTokenEstimate: number;
   /** Stored current-view bands plus estimated tokens after the compact point. */
   projectedViewTokenEstimate: number;
+  /** True when visibility pruning can make the served request smaller than this estimate. */
+  projectedViewIsUpperBound: boolean;
   /** Latest provider-reported request input, or null when the host did not record it. */
   latestProviderInputTokens: number | null;
   lastEventAt: string | null;
@@ -104,6 +106,9 @@ export function threadQuickStats(filePath: string): ThreadQuickStats {
     const viewRow = db
       .prepare("select view_id, compact_point from thread_view where singleton = 1")
       .get() as unknown as { view_id: string; compact_point: number } | undefined;
+    const visibilityBoundary = db
+      .prepare("select position from view_boundary where singleton = 1")
+      .get() as unknown as { position: number } | undefined;
 
     let projectedViewTokens = totalTokens;
     if (viewRow) {
@@ -134,6 +139,7 @@ export function threadQuickStats(filePath: string): ThreadQuickStats {
       closedTurnCount: turns.closed ?? 0,
       retainedArchiveTokenEstimate: totalTokens,
       projectedViewTokenEstimate: projectedViewTokens,
+      projectedViewIsUpperBound: visibilityBoundary != null,
       latestProviderInputTokens: providerInputTokens(latestUsage?.usage),
       lastEventAt: events.last,
       lastCompactAt: view.last,
@@ -708,6 +714,8 @@ export interface ThreadViewArrangement {
   retainedArchiveTokens: number;
   /** Stored current-view band tokens plus the true live tail. */
   projectedViewTokens: number;
+  /** True when visibility pruning can make the served request smaller than this estimate. */
+  projectedViewIsUpperBound: boolean;
   turnsSinceView: number;
   turnCount: number;
 }
@@ -818,6 +826,10 @@ export function threadViewArrangement(filePath: string): ThreadViewArrangement {
       };
     };
 
+    const visibilityBoundary = db
+      .prepare("select position from view_boundary where singleton = 1")
+      .get() as unknown as { position: number } | undefined;
+
     // Never compacted: the whole thread is live.
     if (!viewRow) {
       const liveTail = turnRows.map(measuredTurn);
@@ -831,6 +843,7 @@ export function threadViewArrangement(filePath: string): ThreadViewArrangement {
         archivedHistoryTokens: 0,
         retainedArchiveTokens: 0,
         projectedViewTokens: liveTailTokens,
+        projectedViewIsUpperBound: visibilityBoundary != null,
         turnsSinceView: liveTail.length,
         turnCount: turnRows.length,
       };
@@ -946,6 +959,7 @@ export function threadViewArrangement(filePath: string): ThreadViewArrangement {
       archivedHistoryTokens,
       retainedArchiveTokens,
       projectedViewTokens: bandTokens + liveTailTokens,
+      projectedViewIsUpperBound: visibilityBoundary != null,
       turnsSinceView: liveTail.length,
       turnCount: turnRows.length,
     };

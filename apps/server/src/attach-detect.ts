@@ -15,6 +15,7 @@
  */
 
 import { execFileSync } from "node:child_process";
+import { readdirSync, readFileSync, statSync } from "node:fs";
 import { writerPolicyFor, type LaunchRecipe, type WriterPolicy } from "@lhc-console/core";
 
 /** One live process (or console terminal) holding a thread's session. */
@@ -62,6 +63,11 @@ let cache: { at: number; procs: Proc[] } | null = null;
 function scanProcesses(): Proc[] {
   const now = Date.now();
   if (cache && now - cache.at < SCAN_TTL_MS) return cache.procs;
+  const procfs = scanProcfs();
+  if (procfs) {
+    cache = { at: now, procs: procfs };
+    return cache.procs;
+  }
   let out = "";
   try {
     out = execFileSync("ps", ["-eo", "pid,ppid,lstart,args"], {
@@ -87,6 +93,51 @@ function scanProcesses(): Proc[] {
   }
   cache = { at: now, procs };
   return procs;
+}
+
+/**
+ * Linux fast path. `execFileSync("ps")` blocks Node's event loop while the
+ * child is forked and waited for; under the relay's busy polling that made the
+ * whole HTTP/WebSocket server pause for seconds at a time. Procfs is the same
+ * process snapshot without a synchronous child process.
+ */
+function scanProcfs(): Proc[] | null {
+  let entries: string[];
+  try {
+    entries = readdirSync("/proc").filter((entry) => /^\d+$/.test(entry));
+  } catch {
+    return null;
+  }
+  const procs: Proc[] = [];
+  for (const entry of entries) {
+    try {
+      const pid = Number(entry);
+      const stat = readFileSync(`/proc/${entry}/stat`, "utf8");
+      const close = stat.lastIndexOf(")");
+      if (close < 0) continue;
+      const fields = stat.slice(close + 2).split(" ");
+      const ppid = Number(fields[1]);
+      if (!Number.isInteger(ppid)) continue;
+      const commandLine = readFileSync(`/proc/${entry}/cmdline`);
+      const args = commandLine.toString("utf8").replaceAll("\0", " ").trim();
+      if (!args) continue;
+      procs.push({
+        pid,
+        ppid,
+        startedAt: statSync(`/proc/${entry}`).birthtime.toISOString(),
+        args,
+      });
+    } catch {
+      // Processes can exit between readdir and reads; omit that row.
+    }
+  }
+  return procs;
+}
+
+/** Test seam for the real process source, without exposing the cache itself. */
+export function processSnapshotForTest(): Array<{ pid: number; args: string }> {
+  invalidateProcessScan();
+  return scanProcesses().map(({ pid, args }) => ({ pid, args }));
 }
 
 /** Drop the cached scan — used by tests and right after we spawn a terminal. */

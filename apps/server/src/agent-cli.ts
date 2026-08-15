@@ -105,10 +105,10 @@ async function call(args: string[], deps: CliDeps, detached: boolean): Promise<n
   if (!target) throw new Error(`usage: lhc-agent ${detached ? "start " : ""}<agent> <message|->`);
   const promptArgs = rest.slice(1);
   if (!promptArgs.length) throw new Error("prompt is required");
-  const prompt =
-    promptArgs.length === 1 && promptArgs[0] === "-"
-      ? await deps.readStdin()
-      : promptArgs.join(" ");
+  const fromStdin = promptArgs.length === 1 && promptArgs[0] === "-";
+  const prompt = fromStdin
+    ? await deps.readStdin()
+    : normalizeInlineLeeMessage(target, promptArgs.join(" "));
   if (!prompt.trim()) throw new Error("prompt is required");
 
   const sender = from ?? deps.agentId;
@@ -135,6 +135,11 @@ async function call(args: string[], deps: CliDeps, detached: boolean): Promise<n
     return 0;
   }
   return printSettled(result, deps);
+}
+
+function normalizeInlineLeeMessage(target: string, prompt: string): string {
+  if (target !== "lee") return prompt;
+  return prompt.replace(/\\r\\n|\\n/g, "\n");
 }
 
 async function job(args: string[], deps: CliDeps): Promise<number> {

@@ -107,7 +107,7 @@ export function threadQuickStats(filePath: string): ThreadQuickStats {
       .prepare("select view_id, compact_point from thread_view where singleton = 1")
       .get() as unknown as { view_id: string; compact_point: number } | undefined;
     const visibilityBoundary = db
-      .prepare("select position from view_boundary where singleton = 1")
+      .prepare("select position from view_boundary where thread_singleton = 1")
       .get() as unknown as { position: number } | undefined;
 
     let projectedViewTokens = totalTokens;
@@ -827,7 +827,7 @@ export function threadViewArrangement(filePath: string): ThreadViewArrangement {
     };
 
     const visibilityBoundary = db
-      .prepare("select position from view_boundary where singleton = 1")
+      .prepare("select position from view_boundary where thread_singleton = 1")
       .get() as unknown as { position: number } | undefined;
 
     // Never compacted: the whole thread is live.

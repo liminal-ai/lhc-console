@@ -17,7 +17,7 @@ import {
   listThreads,
   listTurns,
   measurementAlarms,
-  readCodexRolloutMeasurements,
+  readNewestCodexRolloutMeasurements,
   resolveThread,
   threadOverview,
   threadQuickStats,
@@ -186,10 +186,10 @@ function cachedQuickStats(t: ThreadSummary): ThreadQuickStats | null {
 
 function codexMeasurements(sessionRef: string | null) {
   if (!sessionRef) return null;
-  const path = globSync(
+  const paths = globSync(
     join(homedir(), ".codex", "sessions", "*", "*", "*", `*${sessionRef}.jsonl`),
-  )[0];
-  return path ? readCodexRolloutMeasurements(path) : null;
+  );
+  return readNewestCodexRolloutMeasurements(paths);
 }
 
 /**
@@ -495,6 +495,7 @@ app.get("/api/threads/:hostId/:threadId", async (req, reply) => {
   }
   const alarms = measurementAlarms({
     projectedViewTokens: overview.stats.projectedViewTokenEstimate,
+    projectedViewIsUpperBound: overview.stats.projectedViewIsUpperBound,
     modelContextWindow: rollout?.modelContextWindow ?? null,
     currentViewId: overview.view?.viewId ?? null,
     currentViewCreatedAt: overview.view?.createdAt ?? null,

@@ -412,7 +412,10 @@ function threadHeader(
     ["turns", fmtCount(s.turnCount)],
     ["messages", fmtCount(s.messageCount)],
     ["archive estimate", fmtTokens(s.retainedArchiveTokenEstimate)],
-    ["projected LHC view", fmtTokens(s.projectedViewTokenEstimate)],
+    [
+      s.projectedViewIsUpperBound ? "projected LHC view upper estimate" : "projected LHC view",
+      fmtTokens(s.projectedViewTokenEstimate),
+    ],
     ["latest provider input", fmtTokens(s.latestProviderInputTokens)],
     ["size", fmtBytes(thread.fileSizeBytes)],
   ];
@@ -584,7 +587,14 @@ function overviewPanel(st: ThreadState): HTMLElement {
   volume.append(
     kv("retained archive estimate", `${fmtTokens(s.retainedArchiveTokenEstimate)} tok`),
   );
-  volume.append(kv("projected LHC view", `${fmtTokens(s.projectedViewTokenEstimate)} tok`));
+  volume.append(
+    kv(
+      s.projectedViewIsUpperBound ? "projected LHC view upper estimate" : "projected LHC view",
+      `${fmtTokens(s.projectedViewTokenEstimate)} tok${
+        s.projectedViewIsUpperBound ? " · before visibility pruning" : ""
+      }`,
+    ),
+  );
   volume.append(
     kv(
       "latest provider input",

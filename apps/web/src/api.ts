@@ -5,6 +5,7 @@ export interface QuickStats {
   closedTurnCount: number;
   retainedArchiveTokenEstimate: number;
   projectedViewTokenEstimate: number;
+  projectedViewIsUpperBound: boolean;
   latestProviderInputTokens: number | null;
   lastEventAt: string | null;
   lastCompactAt: string | null;
@@ -248,6 +249,7 @@ export interface ViewArrangement {
   archivedHistoryTokens: number;
   retainedArchiveTokens: number;
   projectedViewTokens: number;
+  projectedViewIsUpperBound: boolean;
   turnsSinceView: number;
   turnCount: number;
 }

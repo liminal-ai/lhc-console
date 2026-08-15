@@ -27,7 +27,7 @@ const COLUMNS: Column[] = [
   { key: "host", label: "host", cls: "col-host" },
   { key: "dir", label: "directory", cls: "col-dir" },
   { key: "turns", label: "turns", cls: "num", numeric: true },
-  { key: "view", label: "projected view", cls: "num", numeric: true },
+  { key: "view", label: "view estimate", cls: "num", numeric: true },
   { key: "created", label: "created", cls: "col-when", numeric: true },
   { key: "activity", label: "active", cls: "col-when", numeric: true },
 ];
@@ -359,7 +359,10 @@ export async function renderList(app: HTMLElement): Promise<void> {
       rows.length === pool.length
         ? `${pool.length} threads`
         : `${rows.length} of ${pool.length} threads`;
-    countText.textContent = `${shown} · ${fmtTokens(projected)} projected LHC view tokens`;
+    const hasUpperBound = rows.some((thread) => thread.stats?.projectedViewIsUpperBound);
+    countText.textContent = `${shown} · ${fmtTokens(projected)} ${
+      hasUpperBound ? "projected view upper-estimate" : "projected LHC view"
+    } tokens`;
     paintFreshness();
   }
 
@@ -562,7 +565,11 @@ function threadItem(t: ThreadRow, actions: RowActions): HTMLElement {
   tr.append(dir);
 
   tr.append(el("td", "num", t.stats ? String(t.stats.turnCount) : "—"));
-  tr.append(el("td", "num", fmtTokens(t.stats?.projectedViewTokenEstimate)));
+  const projected = el("td", "num", fmtTokens(t.stats?.projectedViewTokenEstimate));
+  if (t.stats?.projectedViewIsUpperBound) {
+    projected.title = "upper estimate before visibility pruning";
+  }
+  tr.append(projected);
   tr.append(el("td", "col-when dim", fmtStamp(t.createdAt)));
   const activity = el("td", "col-when", fmtAgo(lastActivity(t)));
   activity.title = new Date(lastActivity(t)).toLocaleString();

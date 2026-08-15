@@ -1,6 +1,10 @@
 import { spawn } from "node:child_process";
 import { afterEach, describe, expect, it } from "vite-plus/test";
-import { detectAttachedOne, invalidateProcessScan } from "../src/attach-detect.ts";
+import {
+  detectAttachedOne,
+  invalidateProcessScan,
+  processSnapshotForTest,
+} from "../src/attach-detect.ts";
 
 const children: ReturnType<typeof spawn>[] = [];
 afterEach(() => {
@@ -9,6 +13,13 @@ afterEach(() => {
 });
 
 describe("relay busy detection", () => {
+  it("reads the process table without spawning a blocking ps child on Linux", () => {
+    const snapshot = processSnapshotForTest();
+    const current = snapshot.find((row) => row.pid === process.pid);
+    expect(current).toBeDefined();
+    expect(current?.args).toContain("node");
+  });
+
   it("sees a matching writer launched by this server process", async () => {
     const child = spawn(process.execPath, [
       "-e",

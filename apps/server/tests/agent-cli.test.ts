@@ -262,6 +262,25 @@ describe("lhc-agent CLI", () => {
     });
   });
 
+  it("turns escaped line breaks in inline lee messages into real paragraphs", async () => {
+    const requests: Array<{ init?: RequestInit }> = [];
+    const state = deps(async (_input, init) => {
+      requests.push({ init });
+      return response(202, { id: "lee-job-2", status: "queued", jobKind: "outbound" });
+    });
+
+    expect(
+      await runAgentCli(
+        ["--from", "cto", "lee", String.raw`Current state:\n\n• Ready\n• Healthy`],
+        state.value,
+      ),
+    ).toBe(0);
+    expect(JSON.parse(String(requests[0]?.init?.body))).toEqual({
+      prompt: "Current state:\n\n• Ready\n• Healthy",
+      sender: "cto",
+    });
+  });
+
   it("auto-detects sender from LHC_AGENT_ID for lee", async () => {
     const requests: Array<{ init?: RequestInit }> = [];
     const state = deps(

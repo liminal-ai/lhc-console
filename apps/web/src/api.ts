@@ -199,6 +199,20 @@ export interface OverviewResponse {
   };
 }
 
+const unavailableHostMeasurements: OverviewResponse["overview"]["hostMeasurements"] = {
+  activeContextTokens: null,
+  modelContextWindow: null,
+  latestProviderUsageAt: null,
+  latestNativeCompactAt: null,
+  alarms: [],
+};
+
+/** Keep a newly built UI compatible with a server awaiting its coordinated restart. */
+export function normalizeOverviewResponse(response: OverviewResponse): OverviewResponse {
+  response.overview.hostMeasurements ??= unavailableHostMeasurements;
+  return response;
+}
+
 export interface ViewEntryTurn {
   turnId: string;
   turnOrder: number | null;
@@ -369,7 +383,7 @@ export const api = {
       },
     ),
   overview: (hostId: string, threadId: string) =>
-    get<OverviewResponse>(`/api/threads/${hostId}/${threadId}`),
+    get<OverviewResponse>(`/api/threads/${hostId}/${threadId}`).then(normalizeOverviewResponse),
   turns: (hostId: string, threadId: string) =>
     get<TurnRow[]>(`/api/threads/${hostId}/${threadId}/turns`),
   turnKinds: (hostId: string, threadId: string) =>

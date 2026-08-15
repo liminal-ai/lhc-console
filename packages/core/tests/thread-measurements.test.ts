@@ -72,7 +72,7 @@ function fixture(options: { withView?: boolean } = {}): string {
     );
     CREATE TABLE chunk (chunk_id TEXT PRIMARY KEY, chunk_order INTEGER NOT NULL);
     CREATE TABLE work_item (work_item_id TEXT PRIMARY KEY, status TEXT NOT NULL);
-    CREATE TABLE view_boundary (singleton INTEGER PRIMARY KEY, position INTEGER NOT NULL);
+    CREATE TABLE view_boundary (thread_singleton INTEGER PRIMARY KEY, position INTEGER NOT NULL);
 
     INSERT INTO turns VALUES
       ('old-selected', 1, 'closed', 10, NULL),
@@ -155,9 +155,10 @@ describe("thread view measurements", () => {
   it("marks the projection as an upper bound when visibility pruning applies", () => {
     const path = fixture();
     const db = new DatabaseSync(path);
-    db.exec("INSERT INTO view_boundary VALUES (1, 50)");
+    db.exec("INSERT INTO view_boundary(thread_singleton, position) VALUES (1, 50)");
     db.close();
 
     expect(threadQuickStats(path).projectedViewIsUpperBound).toBe(true);
+    expect(threadViewArrangement(path).projectedViewIsUpperBound).toBe(true);
   });
 });

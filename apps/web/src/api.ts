@@ -3,12 +3,13 @@ export interface QuickStats {
   messageCount: number;
   turnCount: number;
   closedTurnCount: number;
-  totalTokenEstimate: number;
-  contextTokens: number;
+  retainedArchiveTokenEstimate: number;
+  projectedViewTokenEstimate: number;
+  latestProviderInputTokens: number | null;
   lastEventAt: string | null;
   lastCompactAt: string | null;
-  pendingWork: number;
-  failedDerivations: number;
+  activeWorkItems: number;
+  historicalFailedDerivations: number;
   summary: string | null;
 }
 
@@ -185,6 +186,13 @@ export interface OverviewResponse {
     chunkCount: number;
     view: ViewInfo | null;
     visibilityBoundary: number | null;
+    hostMeasurements: {
+      activeContextTokens: number | null;
+      modelContextWindow: number | null;
+      latestProviderUsageAt: string | null;
+      latestNativeCompactAt: string | null;
+      alarms: string[];
+    };
     /** Readable summary paragraph; longer form of `stats.summary`. */
     summary: string | null;
   };
@@ -220,7 +228,6 @@ export interface ViewTailTurn {
   messageCount: number;
   tokenEstimate: number;
   firstEventOrder: number | null;
-  afterCompact: boolean;
   promptExcerpt: string | null;
 }
 
@@ -235,8 +242,12 @@ export interface ViewArrangement {
     gaps: unknown[];
   } | null;
   entries: ViewEntry[];
-  tail: ViewTailTurn[];
-  tailTokens: number;
+  liveTail: ViewTailTurn[];
+  liveTailTokens: number;
+  archivedHistory: ViewTailTurn[];
+  archivedHistoryTokens: number;
+  retainedArchiveTokens: number;
+  projectedViewTokens: number;
   turnsSinceView: number;
   turnCount: number;
 }

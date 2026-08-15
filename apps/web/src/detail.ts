@@ -411,8 +411,9 @@ function threadHeader(
   const bits: [string, string][] = [
     ["turns", fmtCount(s.turnCount)],
     ["messages", fmtCount(s.messageCount)],
-    ["tokens", fmtTokens(s.totalTokenEstimate)],
-    ["context", fmtTokens(s.contextTokens)],
+    ["archive estimate", fmtTokens(s.retainedArchiveTokenEstimate)],
+    ["projected LHC view", fmtTokens(s.projectedViewTokenEstimate)],
+    ["latest provider input", fmtTokens(s.latestProviderInputTokens)],
     ["size", fmtBytes(thread.fileSizeBytes)],
   ];
   for (const [k, v] of bits) {
@@ -580,8 +581,37 @@ function overviewPanel(st: ThreadState): HTMLElement {
     ),
   );
   volume.append(kv("chunks", fmtCount(overview.chunkCount)));
-  volume.append(kv("total tokens", fmtTokens(s.totalTokenEstimate)));
-  volume.append(kv("context tokens", fmtTokens(s.contextTokens)));
+  volume.append(
+    kv("retained archive estimate", `${fmtTokens(s.retainedArchiveTokenEstimate)} tok`),
+  );
+  volume.append(kv("projected LHC view", `${fmtTokens(s.projectedViewTokenEstimate)} tok`));
+  volume.append(
+    kv(
+      "latest provider input",
+      s.latestProviderInputTokens == null
+        ? "unavailable"
+        : `${fmtTokens(s.latestProviderInputTokens)} tok`,
+      s.latestProviderInputTokens == null ? "dim" : undefined,
+    ),
+  );
+  volume.append(
+    kv(
+      "active host context",
+      overview.hostMeasurements.activeContextTokens == null
+        ? "unavailable"
+        : `${fmtTokens(overview.hostMeasurements.activeContextTokens)} tok`,
+      overview.hostMeasurements.activeContextTokens == null ? "dim" : undefined,
+    ),
+  );
+  volume.append(
+    kv(
+      "provider model window",
+      overview.hostMeasurements.modelContextWindow == null
+        ? "unavailable"
+        : `${fmtTokens(overview.hostMeasurements.modelContextWindow)} tok`,
+      overview.hostMeasurements.modelContextWindow == null ? "dim" : undefined,
+    ),
+  );
   volume.append(kv("file size", fmtBytes(thread.fileSizeBytes)));
   grid.append(volume);
 
@@ -591,7 +621,7 @@ function overviewPanel(st: ThreadState): HTMLElement {
     view.append(kv("profile", v.profileName ?? "unnamed"));
     view.append(kv("created", `${fmtStamp(v.createdAt)} (${fmtAgo(v.createdAt)})`));
     view.append(kv("compact point", `event ${fmtCount(v.compactPoint)}`));
-    view.append(kv("covered from", `event ${fmtCount(v.coveredFrom)}`));
+    view.append(kv("current view starts", `event ${fmtCount(v.coveredFrom)}`));
     const viewHref = `#${threadPath(st, "view")}`;
     const bands = el("div", "kv-sub");
     for (const b of v.bands) {
@@ -612,7 +642,7 @@ function overviewPanel(st: ThreadState): HTMLElement {
   for (const state of ["ready", "pending", "failed", "blocked"]) {
     const n = states[state];
     if (n == null) continue;
-    const cls = state === "failed" || state === "blocked" ? "bad" : state === "ready" ? "dim" : "";
+    const cls = state === "ready" || state === "failed" || state === "blocked" ? "dim" : "";
     health.append(kv(`derivations ${state}`, fmtCount(n), cls));
   }
   if (Object.keys(states).length === 0) {
@@ -620,13 +650,33 @@ function overviewPanel(st: ThreadState): HTMLElement {
   } else if (allReady) {
     health.append(el("div", "kv-note dim", "all derivations ready"));
   }
-  health.append(kv("queued work", fmtCount(s.pendingWork), s.pendingWork > 0 ? "" : "dim"));
+  health.append(kv("active work", fmtCount(s.activeWorkItems), s.activeWorkItems > 0 ? "" : "dim"));
   health.append(
     kv(
-      "visibility boundary",
+      "historical failed/blocked rows",
+      fmtCount(s.historicalFailedDerivations),
+      s.historicalFailedDerivations > 0 ? "" : "dim",
+    ),
+  );
+  health.append(
+    kv(
+      "latest visibility boundary",
       overview.visibilityBoundary == null ? "—" : `event ${fmtCount(overview.visibilityBoundary)}`,
     ),
   );
+  if (overview.hostMeasurements.latestNativeCompactAt) {
+    health.append(
+      kv(
+        "latest native host compact",
+        `${fmtStamp(overview.hostMeasurements.latestNativeCompactAt)} (${fmtAgo(
+          overview.hostMeasurements.latestNativeCompactAt,
+        )})`,
+      ),
+    );
+  }
+  for (const alarm of overview.hostMeasurements.alarms) {
+    health.append(el("div", "kv-note bad", `measurement alarm: ${alarm}`));
+  }
   grid.append(health);
 
   const summaryText = overview.summary ?? s.summary;
@@ -676,7 +726,7 @@ function turnsPanel(st: ThreadState): HTMLElement {
     if (card && scroll) card.scrollIntoView({ block: "nearest" });
 
     mini.className = "msg-mini";
-    mini.textContent = `turn #${turn.turnOrder} · ${turn.messageCount} msgs · ${fmtTokens(turn.tokenEstimate)} tokens`;
+    mini.textContent = `turn #${turn.turnOrder} · ${turn.messageCount} msgs · ${fmtTokens(turn.tokenEstimate)} estimated tokens`;
     history.replaceState(null, "", `#${threadPath(st, "turns", order)}`);
 
     // Bumped for cached turns too, so an in-flight chunked render is abandoned.
@@ -693,7 +743,7 @@ function turnsPanel(st: ThreadState): HTMLElement {
         "div",
         "hint msg-pending",
         `${fmtCount(turn.messageCount)} message${turn.messageCount === 1 ? "" : "s"} · ` +
-          `${fmtTokens(turn.tokenEstimate)} tokens · loading…`,
+          `${fmtTokens(turn.tokenEstimate)} estimated tokens · loading…`,
       ),
     );
     api

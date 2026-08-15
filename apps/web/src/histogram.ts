@@ -120,8 +120,8 @@ export function histogramPanel(args: HistogramArgs): {
   const grand = rows.reduce((s, r) => s + r.totalTokens, 0);
   const largest = rows.reduce((a, b) => (b.totalTokens > a.totalTokens ? b : a));
   caption.textContent =
-    `${fmtCount(rows.length)} turn${rows.length === 1 ? "" : "s"} · ${fmtTokens(grand)} tokens` +
-    ` · largest turn #${largest.turnOrder} (${fmtTokens(largest.totalTokens)} tokens)` +
+    `${fmtCount(rows.length)} turn${rows.length === 1 ? "" : "s"} · ${fmtTokens(grand)} estimated tokens` +
+    ` · largest turn #${largest.turnOrder} (${fmtTokens(largest.totalTokens)} estimated tokens)` +
     ` · click a bar to open the turn`;
 
   // First turn whose messages land after the compact point: the live tail.

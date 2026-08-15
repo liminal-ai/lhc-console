@@ -11,7 +11,7 @@ import {
   workspaceContains,
 } from "./workspace.ts";
 
-type SortKey = "host" | "title" | "dir" | "turns" | "context" | "created" | "activity";
+type SortKey = "host" | "title" | "dir" | "turns" | "view" | "created" | "activity";
 
 interface Column {
   key: SortKey;
@@ -27,7 +27,7 @@ const COLUMNS: Column[] = [
   { key: "host", label: "host", cls: "col-host" },
   { key: "dir", label: "directory", cls: "col-dir" },
   { key: "turns", label: "turns", cls: "num", numeric: true },
-  { key: "context", label: "context", cls: "num", numeric: true },
+  { key: "view", label: "projected view", cls: "num", numeric: true },
   { key: "created", label: "created", cls: "col-when", numeric: true },
   { key: "activity", label: "active", cls: "col-when", numeric: true },
 ];
@@ -75,8 +75,8 @@ function sortValue(t: ThreadRow, key: SortKey): string | number {
       return (dirBucket(t)?.label ?? "￿").toLowerCase();
     case "turns":
       return t.stats?.turnCount ?? -1;
-    case "context":
-      return t.stats?.contextTokens ?? -1;
+    case "view":
+      return t.stats?.projectedViewTokenEstimate ?? -1;
     case "created":
       return Date.parse(t.createdAt) || 0;
     case "activity":
@@ -352,12 +352,14 @@ export async function renderList(app: HTMLElement): Promise<void> {
     table.replaceChildren(thead, ...rows.map((t) => threadItem(t, rowActions)));
     if (scrollY > 0 && window.scrollY !== scrollY) window.scrollTo({ top: scrollY });
 
-    const ctx = rows.reduce((s, t) => s + (t.stats?.contextTokens ?? 0), 0);
+    const projected = rows.reduce((sum, thread) => {
+      return sum + (thread.stats?.projectedViewTokenEstimate ?? 0);
+    }, 0);
     const shown =
       rows.length === pool.length
         ? `${pool.length} threads`
         : `${rows.length} of ${pool.length} threads`;
-    countText.textContent = `${shown} · ${fmtTokens(ctx)} context tokens`;
+    countText.textContent = `${shown} · ${fmtTokens(projected)} projected LHC view tokens`;
     paintFreshness();
   }
 
@@ -461,18 +463,20 @@ export async function renderList(app: HTMLElement): Promise<void> {
    */
 }
 
-/** Health dot: failed derivations are bad, queued work is a warning. */
+/** Health dot: active work warns; historical failures are informational. */
 function healthDot(t: ThreadRow): HTMLElement | null {
   const s = t.stats;
   if (!s) return null;
-  if (s.failedDerivations > 0) {
-    const dot = el("span", "health-dot bad");
-    dot.title = `${s.failedDerivations} failed derivation${s.failedDerivations === 1 ? "" : "s"}`;
+  if (s.activeWorkItems > 0) {
+    const dot = el("span", "health-dot warn");
+    dot.title = `${s.activeWorkItems} active work item${s.activeWorkItems === 1 ? "" : "s"}`;
     return dot;
   }
-  if (s.pendingWork > 0) {
-    const dot = el("span", "health-dot warn");
-    dot.title = `${s.pendingWork} queued work item${s.pendingWork === 1 ? "" : "s"}`;
+  if (s.historicalFailedDerivations > 0) {
+    const dot = el("span", "health-dot historical");
+    dot.title = `${s.historicalFailedDerivations} retained failed/blocked derivation row${
+      s.historicalFailedDerivations === 1 ? "" : "s"
+    }; historical, not necessarily actionable`;
     return dot;
   }
   return null;
@@ -558,7 +562,7 @@ function threadItem(t: ThreadRow, actions: RowActions): HTMLElement {
   tr.append(dir);
 
   tr.append(el("td", "num", t.stats ? String(t.stats.turnCount) : "—"));
-  tr.append(el("td", "num", fmtTokens(t.stats?.contextTokens)));
+  tr.append(el("td", "num", fmtTokens(t.stats?.projectedViewTokenEstimate)));
   tr.append(el("td", "col-when dim", fmtStamp(t.createdAt)));
   const activity = el("td", "col-when", fmtAgo(lastActivity(t)));
   activity.title = new Date(lastActivity(t)).toLocaleString();

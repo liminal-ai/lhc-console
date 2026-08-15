@@ -207,10 +207,34 @@ const unavailableHostMeasurements: OverviewResponse["overview"]["hostMeasurement
   alarms: [],
 };
 
+function normalizeQuickStats(stats: QuickStats): QuickStats {
+  const legacy = stats as QuickStats & {
+    totalTokenEstimate?: number;
+    contextTokens?: number;
+    pendingWork?: number;
+    failedDerivations?: number;
+  };
+  stats.retainedArchiveTokenEstimate ??= legacy.totalTokenEstimate ?? 0;
+  stats.projectedViewTokenEstimate ??= legacy.contextTokens ?? 0;
+  stats.projectedViewIsUpperBound ??= false;
+  stats.latestProviderInputTokens ??= null;
+  stats.activeWorkItems ??= legacy.pendingWork ?? 0;
+  stats.historicalFailedDerivations ??= legacy.failedDerivations ?? 0;
+  return stats;
+}
+
 /** Keep a newly built UI compatible with a server awaiting its coordinated restart. */
 export function normalizeOverviewResponse(response: OverviewResponse): OverviewResponse {
+  normalizeQuickStats(response.overview.stats);
   response.overview.hostMeasurements ??= unavailableHostMeasurements;
   return response;
+}
+
+export function normalizeThreadRows(rows: ThreadRow[]): ThreadRow[] {
+  for (const row of rows) {
+    if (row.stats) normalizeQuickStats(row.stats);
+  }
+  return rows;
 }
 
 export interface ViewEntryTurn {
@@ -266,6 +290,31 @@ export interface ViewArrangement {
   projectedViewIsUpperBound: boolean;
   turnsSinceView: number;
   turnCount: number;
+}
+
+/** Translate the pre-measurement-audit view contract while the old server is still live. */
+export function normalizeViewArrangement(data: ViewArrangement): ViewArrangement {
+  const legacy = data as ViewArrangement & {
+    tail?: (ViewTailTurn & { afterCompact?: boolean })[];
+    tailTokens?: number;
+  };
+  if (!data.liveTail) {
+    const tail = legacy.tail ?? [];
+    data.liveTail = data.view ? tail.filter((turn) => turn.afterCompact !== false) : tail;
+    data.archivedHistory = data.view ? tail.filter((turn) => turn.afterCompact === false) : [];
+  }
+  data.archivedHistory ??= [];
+  data.liveTailTokens ??= data.liveTail.reduce((sum, turn) => sum + turn.tokenEstimate, 0);
+  data.archivedHistoryTokens ??= data.archivedHistory.reduce(
+    (sum, turn) => sum + turn.tokenEstimate,
+    0,
+  );
+  data.retainedArchiveTokens ??=
+    legacy.tailTokens ?? data.liveTailTokens + data.archivedHistoryTokens;
+  data.projectedViewTokens ??=
+    (data.view?.bands.reduce((sum, band) => sum + band.tokenCount, 0) ?? 0) + data.liveTailTokens;
+  data.projectedViewIsUpperBound ??= false;
+  return data;
 }
 
 export interface TerminalRow {
@@ -359,7 +408,7 @@ export const api = {
     if (params.q) qs.set("q", params.q);
     if (params.includeHidden !== false) qs.set("includeHidden", "1");
     const suffix = qs.size ? `?${qs}` : "";
-    return get<ThreadRow[]>(`/api/threads${suffix}`);
+    return get<ThreadRow[]>(`/api/threads${suffix}`).then(normalizeThreadRows);
   },
   hideThread: (hostId: string, threadId: string, hidden: boolean) =>
     send<{ hidden: number; threadId: string }>(`/api/threads/${hostId}/${threadId}/hide`, {
@@ -389,7 +438,9 @@ export const api = {
   turnKinds: (hostId: string, threadId: string) =>
     get<TurnKindRow[]>(`/api/threads/${hostId}/${threadId}/turn-kinds`),
   viewArrangement: (hostId: string, threadId: string) =>
-    get<ViewArrangement>(`/api/threads/${hostId}/${threadId}/view-arrangement`),
+    get<ViewArrangement>(`/api/threads/${hostId}/${threadId}/view-arrangement`).then(
+      normalizeViewArrangement,
+    ),
   terminals: () => get<TerminalRow[]>("/api/terminals"),
   /** Relaunch an idle terminal's thread in place (fresh recipe, one-writer scan). */
   resumeTerminal: (id: string, force = false) =>

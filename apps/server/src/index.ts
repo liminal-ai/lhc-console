@@ -1,5 +1,6 @@
 import Fastify from "fastify";
 import websocket from "@fastify/websocket";
+import { globSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
@@ -15,6 +16,8 @@ import {
   listMessages,
   listThreads,
   listTurns,
+  measurementAlarms,
+  readCodexRolloutMeasurements,
   resolveThread,
   threadOverview,
   threadQuickStats,
@@ -179,6 +182,14 @@ function cachedQuickStats(t: ThreadSummary): ThreadQuickStats | null {
   } catch {
     return null;
   }
+}
+
+function codexMeasurements(sessionRef: string | null) {
+  if (!sessionRef) return null;
+  const path = globSync(
+    join(homedir(), ".codex", "sessions", "*", "*", "*", `*${sessionRef}.jsonl`),
+  )[0];
+  return path ? readCodexRolloutMeasurements(path) : null;
 }
 
 /**
@@ -477,6 +488,19 @@ app.get("/api/threads/:hostId/:threadId", async (req, reply) => {
   if ("error" in found) return reply.code(found.code).send({ error: found.error });
   const { thread } = found;
   const recipe = launchRecipe(thread);
+  const overview = threadOverview(thread.filePath);
+  const rollout = hostId === "codex-lhc" ? codexMeasurements(recipe?.sessionRef ?? null) : null;
+  if (rollout?.latestProviderInputTokens != null) {
+    overview.stats.latestProviderInputTokens = rollout.latestProviderInputTokens;
+  }
+  const alarms = measurementAlarms({
+    projectedViewTokens: overview.stats.projectedViewTokenEstimate,
+    modelContextWindow: rollout?.modelContextWindow ?? null,
+    currentViewId: overview.view?.viewId ?? null,
+    currentViewCreatedAt: overview.view?.createdAt ?? null,
+    latestNativeCompactAt: rollout?.latestNativeCompactAt ?? null,
+    latestNativeCompactViewId: rollout?.latestNativeCompactViewId ?? null,
+  });
   const key = `${thread.hostId}/${thread.threadId}`;
   const attach = detectAttached(
     [{ hostId: thread.hostId, threadId: thread.threadId, recipe }],
@@ -487,7 +511,16 @@ app.get("/api/threads/:hostId/:threadId", async (req, reply) => {
     hidden: isHidden(thread.hostId, thread.threadId),
     custom: customName(thread.hostId, thread.threadId),
     launch: withAttach(thread.hostId, recipe, attach),
-    overview: threadOverview(thread.filePath),
+    overview: {
+      ...overview,
+      hostMeasurements: {
+        activeContextTokens: null,
+        modelContextWindow: rollout?.modelContextWindow ?? null,
+        latestProviderUsageAt: rollout?.latestProviderUsageAt ?? null,
+        latestNativeCompactAt: rollout?.latestNativeCompactAt ?? null,
+        alarms,
+      },
+    },
   };
 });
 

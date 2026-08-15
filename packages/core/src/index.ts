@@ -4,6 +4,15 @@ export { browseDirs, isExistingDir, splitBrowsePath, BROWSE_LIMIT } from "./brow
 export type { BrowseEntry, BrowseResult, BrowseSplit } from "./browse.ts";
 export { encodeProjectDir, recoverRolloutSessionId } from "./cc-rollout.ts";
 export {
+  measurementAlarms,
+  parseCodexRolloutMeasurements,
+  readCodexRolloutMeasurements,
+} from "./codex-rollout-measurements.ts";
+export type {
+  CodexRolloutMeasurements,
+  MeasurementAlarmInput,
+} from "./codex-rollout-measurements.ts";
+export {
   capField,
   mergeName,
   nameKey,

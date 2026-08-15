@@ -95,16 +95,16 @@ function entryCard(e: ViewEntry, clamps: Clamp[]): HTMLElement {
   return card;
 }
 
-function tailCard(t: ViewTailTurn, href: string): HTMLElement {
+function turnCard(t: ViewTailTurn, href: string, archived = false): HTMLElement {
   const card = el("a", `vt-tail${t.status === "open" ? " open" : ""}`) as HTMLAnchorElement;
   card.href = href;
 
   const top = el("div", "vt-tail-top");
   top.append(el("span", "vt-tail-order", `turn ${t.turnOrder}`));
   if (t.status === "open") top.append(el("span", "badge warn", "open"));
-  if (!t.afterCompact) {
-    const badge = el("span", "badge bad", "not in view");
-    badge.title = "starts before the compact point but the projection does not cover it";
+  if (archived) {
+    const badge = el("span", "badge", "archived");
+    badge.title = "retained history omitted from the current view";
     top.append(badge);
   }
   top.append(el("span", "vt-spacer"));
@@ -131,7 +131,7 @@ function ribbon(segments: { band: string; tokens: number }[]): HTMLElement {
     const seg = el("div", `vt-seg ${bandClass(s.band)}`);
     // Percentage share, floored so a tiny band stays visible rather than vanishing.
     seg.style.flex = `${Math.max(s.tokens, total / 200)} 0 0`;
-    seg.title = `${s.band} · ${fmtCount(s.tokens)} tokens`;
+    seg.title = `${s.band} · ${fmtCount(s.tokens)} stored view tokens`;
     bar.append(seg);
   }
   wrap.append(bar);
@@ -157,8 +157,27 @@ export interface ViewTabArgs {
   turnHref: (turnOrder: number) => string;
 }
 
+export function viewMeasurementLabels(data: ViewArrangement): {
+  liveTail: string;
+  archivedHistory: string | null;
+} {
+  return {
+    liveTail: `live tail · ${fmtCount(data.liveTail.length)} turn${
+      data.liveTail.length === 1 ? "" : "s"
+    } · ${fmtTokens(data.liveTailTokens)} estimated tokens${data.view ? " after compact" : ""}`,
+    archivedHistory: data.view
+      ? `archived history omitted from current view · ${fmtCount(
+          data.archivedHistory.length,
+        )} turn${data.archivedHistory.length === 1 ? "" : "s"} · ${fmtTokens(
+          data.archivedHistoryTokens,
+        )} estimated tokens`
+      : null,
+  };
+}
+
 export function viewTabPanel(args: ViewTabArgs): HTMLElement {
   const { data, turnHref } = args;
+  const labels = viewMeasurementLabels(data);
   const panel = el("div", "vt-panel");
   const clamps: Clamp[] = [];
 
@@ -170,7 +189,7 @@ export function viewTabPanel(args: ViewTabArgs): HTMLElement {
     meta.append(el("span", "vt-profile", v.profileName ?? "unnamed profile"));
     meta.append(el("span", "dim", `compacted ${fmtStamp(v.createdAt)} (${fmtAgo(v.createdAt)})`));
     meta.append(el("span", "dim", `compact point event ${fmtCount(v.compactPoint)}`));
-    meta.append(el("span", "dim", `covered from event ${fmtCount(v.coveredFrom)}`));
+    meta.append(el("span", "dim", `current view starts at event ${fmtCount(v.coveredFrom)}`));
     meta.append(
       el(
         "span",
@@ -184,12 +203,12 @@ export function viewTabPanel(args: ViewTabArgs): HTMLElement {
     strip.append(meta);
 
     const segments = v.bands.map((b) => ({ band: b.band, tokens: b.tokenCount }));
-    segments.push({ band: "live", tokens: data.tailTokens });
+    segments.push({ band: "live", tokens: data.liveTailTokens });
     strip.append(ribbon(segments));
   } else {
     strip.append(
       el("div", "vt-meta", "never compacted — whole thread is live"),
-      ribbon([{ band: "live", tokens: data.tailTokens }]),
+      ribbon([{ band: "live", tokens: data.liveTailTokens }]),
     );
   }
   // Expand-all sits with the meta, but only matters once something is clamped.
@@ -213,21 +232,34 @@ export function viewTabPanel(args: ViewTabArgs): HTMLElement {
   for (const e of data.entries) list.append(entryCard(e, clamps));
   expandAll.hidden = clamps.length === 0;
 
-  const tailLabel = `live tail · ${fmtCount(data.tail.length)} turn${
-    data.tail.length === 1 ? "" : "s"
-  } · ${fmtTokens(data.tailTokens)} tokens${data.view ? " since compact" : ""}`;
   const divider = el("div", "vt-divider");
   divider.append(
     el("span", "vt-rule"),
-    el("span", "vt-divider-label", tailLabel),
+    el("span", "vt-divider-label", labels.liveTail),
     el("span", "vt-rule"),
   );
   list.append(divider);
 
-  if (data.tail.length === 0) {
+  if (data.liveTail.length === 0) {
     list.append(el("div", "hint", "no turns after the compact point — the view is current"));
   }
-  for (const t of data.tail) list.append(tailCard(t, turnHref(t.turnOrder)));
+  for (const turn of data.liveTail) list.append(turnCard(turn, turnHref(turn.turnOrder)));
+
+  if (data.view) {
+    const historyDivider = el("div", "vt-divider");
+    historyDivider.append(
+      el("span", "vt-rule"),
+      el("span", "vt-divider-label", labels.archivedHistory ?? "archived history"),
+      el("span", "vt-rule"),
+    );
+    list.append(historyDivider);
+    if (data.archivedHistory.length === 0) {
+      list.append(el("div", "hint", "all retained history is represented in the current view"));
+    }
+    for (const turn of data.archivedHistory) {
+      list.append(turnCard(turn, turnHref(turn.turnOrder), true));
+    }
+  }
 
   panel.append(list);
   return panel;

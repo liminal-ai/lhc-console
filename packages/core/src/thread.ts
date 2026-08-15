@@ -7,16 +7,18 @@ export interface ThreadQuickStats {
   messageCount: number;
   turnCount: number;
   closedTurnCount: number;
-  totalTokenEstimate: number;
-  /**
-   * What a resume would serve: stored band token counts plus the live tail
-   * after the compact point. With no view, every non-deleted message counts.
-   */
-  contextTokens: number;
+  /** Estimated tokens in all non-deleted canonical messages retained on disk. */
+  retainedArchiveTokenEstimate: number;
+  /** Stored current-view bands plus estimated tokens after the compact point. */
+  projectedViewTokenEstimate: number;
+  /** Latest provider-reported request input, or null when the host did not record it. */
+  latestProviderInputTokens: number | null;
   lastEventAt: string | null;
   lastCompactAt: string | null;
-  pendingWork: number;
-  failedDerivations: number;
+  /** Queued or claimed derivation work that can still require action. */
+  activeWorkItems: number;
+  /** Durable failed/blocked derivation rows; historical, not necessarily actionable. */
+  historicalFailedDerivations: number;
   /**
    * Non-deleted `user_prompt` messages. Zero on a thread that has other
    * messages marks an agent-spawned sub-session (codex review swarms get
@@ -38,6 +40,41 @@ function tidySummary(text: string, cap = SUMMARY_CAP): string {
   return flat.length > cap ? `${flat.slice(0, cap - 1).trimEnd()}…` : flat;
 }
 
+function providerInputTokens(raw: string | undefined): number | null {
+  if (!raw) return null;
+  try {
+    const usage = JSON.parse(raw) as Record<string, unknown>;
+    const piParts = [usage.input, usage.cacheRead, usage.cacheWrite];
+    if (piParts.some((value) => typeof value === "number")) {
+      return piParts.reduce<number>(
+        (sum, value) => sum + (typeof value === "number" && Number.isFinite(value) ? value : 0),
+        0,
+      );
+    }
+    // Claude separates fresh, cache-read, and cache-write input. Together they
+    // are the provider-reported request input; showing only the tiny fresh part
+    // would materially understate the active request.
+    const claudeParts = [
+      usage.input_tokens,
+      usage.cache_read_input_tokens,
+      usage.cache_creation_input_tokens,
+    ];
+    if (claudeParts.some((value) => typeof value === "number")) {
+      return claudeParts.reduce<number>(
+        (sum, value) => sum + (typeof value === "number" && Number.isFinite(value) ? value : 0),
+        0,
+      );
+    }
+    const direct = [usage.input_tokens, usage.prompt_tokens, usage.input];
+    for (const value of direct) {
+      if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
+    }
+  } catch {
+    // Provider usage is optional host data; malformed receipts are unavailable.
+  }
+  return null;
+}
+
 export function threadQuickStats(filePath: string): ThreadQuickStats {
   return withDb(filePath, (db) => {
     const one = <T>(sql: string): T => db.prepare(sql).get() as unknown as T;
@@ -55,7 +92,9 @@ export function threadQuickStats(filePath: string): ThreadQuickStats {
       "select count(*) c from message where deleted_at is null and kind = 'user_prompt'",
     );
     const view = one<{ last: string | null }>("select max(created_at) last from thread_view");
-    const work = one<{ c: number }>("select count(*) c from work_item");
+    const work = one<{ c: number }>(
+      "select count(*) c from work_item where status in ('queued','claimed')",
+    );
     const failed = one<{ c: number }>(
       "select count(*) c from derivation where state in ('failed','blocked')",
     );
@@ -66,7 +105,7 @@ export function threadQuickStats(filePath: string): ThreadQuickStats {
       .prepare("select view_id, compact_point from thread_view where singleton = 1")
       .get() as unknown as { view_id: string; compact_point: number } | undefined;
 
-    let contextTokens = totalTokens;
+    let projectedViewTokens = totalTokens;
     if (viewRow) {
       const bands = db
         .prepare("select coalesce(sum(token_count), 0) t from thread_view_band where view_id = ?")
@@ -77,20 +116,29 @@ export function threadQuickStats(filePath: string): ThreadQuickStats {
            where deleted_at is null and source_event_order > ?`,
         )
         .get(viewRow.compact_point) as unknown as { t: number };
-      contextTokens = bands.t + tail.t;
+      projectedViewTokens = bands.t + tail.t;
     }
+
+    const latestUsage = db
+      .prepare(
+        `select provider_usage usage from message
+         where deleted_at is null and provider_usage is not null
+         order by source_event_order desc limit 1`,
+      )
+      .get() as unknown as { usage: string } | undefined;
 
     return {
       eventCount: events.c,
       messageCount: messages.c,
       turnCount: turns.c,
       closedTurnCount: turns.closed ?? 0,
-      totalTokenEstimate: totalTokens,
-      contextTokens,
+      retainedArchiveTokenEstimate: totalTokens,
+      projectedViewTokenEstimate: projectedViewTokens,
+      latestProviderInputTokens: providerInputTokens(latestUsage?.usage),
       lastEventAt: events.last,
       lastCompactAt: view.last,
-      pendingWork: work.c,
-      failedDerivations: failed.c,
+      activeWorkItems: work.c,
+      historicalFailedDerivations: failed.c,
       userPromptCount: userPrompts.c,
       summary: threadSummaryText(db),
     };
@@ -144,6 +192,13 @@ export interface ThreadOverview {
   chunkCount: number;
   view: ThreadViewInfo | null;
   visibilityBoundary: number | null;
+  hostMeasurements?: {
+    activeContextTokens: number | null;
+    modelContextWindow: number | null;
+    latestProviderUsageAt: string | null;
+    latestNativeCompactAt: string | null;
+    alarms: string[];
+  };
   /** Readable summary paragraph (same source as `stats.summary`, less truncated). */
   summary: string | null;
 }
@@ -617,7 +672,7 @@ export interface ViewArrangementEntry {
   contentLength: number;
 }
 
-/** One live-tail turn — the same shape the turn list shows, plus placement. */
+/** One turn measured outside the stored current-view bands. */
 export interface ViewTailTurn {
   turnId: string;
   turnOrder: number;
@@ -625,8 +680,6 @@ export interface ViewTailTurn {
   messageCount: number;
   tokenEstimate: number;
   firstEventOrder: number | null;
-  /** False for a turn the projection skipped rather than one that arrived after. */
-  afterCompact: boolean;
   promptExcerpt: string | null;
 }
 
@@ -642,12 +695,19 @@ export interface ViewArrangementMeta {
 }
 
 export interface ThreadViewArrangement {
-  /** Null when the thread has never been compacted; then every turn is tail. */
+  /** Null when the thread has never been compacted; then every turn is live. */
   view: ViewArrangementMeta | null;
   entries: ViewArrangementEntry[];
-  tail: ViewTailTurn[];
-  tailTokens: number;
-  /** Tail turns that begin at or after the compact point. */
+  /** Turns whose first event is strictly after the current view's compact point. */
+  liveTail: ViewTailTurn[];
+  liveTailTokens: number;
+  /** Retained pre-compact turns omitted from the current view arrangement. */
+  archivedHistory: ViewTailTurn[];
+  archivedHistoryTokens: number;
+  /** All retained pre-compact turn tokens, whether selected into the view or omitted. */
+  retainedArchiveTokens: number;
+  /** Stored current-view band tokens plus the true live tail. */
+  projectedViewTokens: number;
   turnsSinceView: number;
   turnCount: number;
 }
@@ -710,13 +770,8 @@ function asString(v: unknown): string | null {
 /**
  * The latest thread-view projection, entry by entry, in thread order — each
  * arrangement entry resolved to the turns it covers and to the derivation
- * content the compact actually used — followed by the live tail.
- *
- * The tail is every non-deleted turn the arrangement does not cover, so
- * `entries ∪ tail` is exactly the thread's turns: nothing can fall between the
- * two. Turns that start at or after the compact point are the ones that truly
- * arrived since (`afterCompact`); a tail turn before it is one the projection
- * left out, and says so rather than being quietly dropped.
+ * content the compact actually used, the true post-compact live tail, and the
+ * retained pre-compact history the arrangement omitted.
  */
 export function threadViewArrangement(filePath: string): ThreadViewArrangement {
   return withDb(filePath, (db) => {
@@ -748,7 +803,7 @@ export function threadViewArrangement(filePath: string): ThreadViewArrangement {
        order by m.source_event_order, mb.block_index limit 1`,
     );
 
-    const tailTurn = (t: ViewTurnRow, compactPoint: number | null): ViewTailTurn => {
+    const measuredTurn = (t: ViewTurnRow): ViewTailTurn => {
       const prompt = promptStmt.get(t.turnId) as unknown as { content: string } | undefined;
       return {
         turnId: t.turnId,
@@ -757,8 +812,6 @@ export function threadViewArrangement(filePath: string): ThreadViewArrangement {
         messageCount: t.messageCount,
         tokenEstimate: t.tokenEstimate,
         firstEventOrder: t.firstEventOrder,
-        afterCompact:
-          compactPoint == null || (t.firstEventOrder != null && t.firstEventOrder >= compactPoint),
         promptExcerpt: prompt
           ? decodeBlockContent("text", prompt.content).text.slice(0, 200)
           : null,
@@ -767,13 +820,18 @@ export function threadViewArrangement(filePath: string): ThreadViewArrangement {
 
     // Never compacted: the whole thread is live.
     if (!viewRow) {
-      const tail = turnRows.map((t) => tailTurn(t, null));
+      const liveTail = turnRows.map(measuredTurn);
+      const liveTailTokens = liveTail.reduce((sum, turn) => sum + turn.tokenEstimate, 0);
       return {
         view: null,
         entries: [],
-        tail,
-        tailTokens: tail.reduce((s, t) => s + t.tokenEstimate, 0),
-        turnsSinceView: tail.length,
+        liveTail,
+        liveTailTokens,
+        archivedHistory: [],
+        archivedHistoryTokens: 0,
+        retainedArchiveTokens: 0,
+        projectedViewTokens: liveTailTokens,
+        turnsSinceView: liveTail.length,
         turnCount: turnRows.length,
       };
     }
@@ -839,9 +897,18 @@ export function threadViewArrangement(filePath: string): ThreadViewArrangement {
       });
     }
 
-    const tail = turnRows
-      .filter((t) => !covered.has(t.turnId))
-      .map((t) => tailTurn(t, viewRow.compact_point));
+    const liveTail = turnRows
+      .filter(
+        (turn) => turn.firstEventOrder != null && turn.firstEventOrder > viewRow.compact_point,
+      )
+      .map(measuredTurn);
+    const archivedHistory = turnRows
+      .filter(
+        (turn) =>
+          !covered.has(turn.turnId) &&
+          (turn.firstEventOrder == null || turn.firstEventOrder <= viewRow.compact_point),
+      )
+      .map(measuredTurn);
 
     const bands = db
       .prepare(
@@ -849,6 +916,18 @@ export function threadViewArrangement(filePath: string): ThreadViewArrangement {
          order by case band when 'brief' then 0 when 'detailed' then 1 else 2 end`,
       )
       .all(viewRow.view_id) as unknown as { band: string; token_count: number }[];
+
+    const bandTokens = bands.reduce((sum, band) => sum + band.token_count, 0);
+    const liveTailTokens = liveTail.reduce((sum, turn) => sum + turn.tokenEstimate, 0);
+    const archivedHistoryTokens = archivedHistory.reduce(
+      (sum, turn) => sum + turn.tokenEstimate,
+      0,
+    );
+    const retainedArchiveTokens = turnRows
+      .filter(
+        (turn) => turn.firstEventOrder == null || turn.firstEventOrder <= viewRow.compact_point,
+      )
+      .reduce((sum, turn) => sum + turn.tokenEstimate, 0);
 
     return {
       view: {
@@ -861,9 +940,13 @@ export function threadViewArrangement(filePath: string): ThreadViewArrangement {
         gaps: parseJsonArray(viewRow.gaps_json),
       },
       entries,
-      tail,
-      tailTokens: tail.reduce((s, t) => s + t.tokenEstimate, 0),
-      turnsSinceView: tail.filter((t) => t.afterCompact).length,
+      liveTail,
+      liveTailTokens,
+      archivedHistory,
+      archivedHistoryTokens,
+      retainedArchiveTokens,
+      projectedViewTokens: bandTokens + liveTailTokens,
+      turnsSinceView: liveTail.length,
       turnCount: turnRows.length,
     };
   });

@@ -465,6 +465,49 @@ describe("Photon typing lifecycle", () => {
     expect(calls.map((call) => call.state)).toEqual(["start", "stop"]);
   });
 
+  it("does not let an unresolved refresh complete after the job has stopped", async () => {
+    vi.useFakeTimers();
+    let finishRefresh: (() => void) | undefined;
+    let starts = 0;
+    const calls: TypingCall[] = [];
+    const manager = {
+      typing: vi.fn(async (agentId: string, spaceId: string, state: "start" | "stop") => {
+        calls.push({ agentId, spaceId, state });
+        if (state === "start" && ++starts === 2) {
+          await new Promise<void>((resolve) => {
+            finishRefresh = resolve;
+          });
+        }
+      }),
+    };
+    const coordinator = new PhotonTypingCoordinator(manager);
+    const job = {
+      ...photonJob(),
+      id: "late-refresh",
+      status: "running" as const,
+      jobKind: "agent" as const,
+      sender: null,
+      output: null,
+      error: null,
+      createdAt: new Date().toISOString(),
+      startedAt: new Date().toISOString(),
+      finishedAt: null,
+      notify: null,
+      deliveryStatus: "pending" as const,
+      deliveryError: null,
+    };
+    coordinator.onRunning(job);
+    coordinator.onSpawn(job);
+    await vi.advanceTimersByTimeAsync(PHOTON_TYPING_REFRESH_MS);
+    expect(calls.map((call) => call.state)).toEqual(["start", "start"]);
+    const stopped = coordinator.onFinished(job);
+    await Promise.resolve();
+    expect(calls.map((call) => call.state)).toEqual(["start", "start"]);
+    finishRefresh?.();
+    await stopped;
+    expect(calls.map((call) => call.state)).toEqual(["start", "start", "stop"]);
+  });
+
   it("reconciles orphan running photon jobs with stop only and never restarts typing", async () => {
     const { manager, calls } = createTypingManager();
     const coordinator = new PhotonTypingCoordinator(manager);

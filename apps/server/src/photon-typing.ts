@@ -87,7 +87,10 @@ export class PhotonTypingCoordinator {
       session.startInFlight = null;
     });
     session.refreshTimer = setInterval(() => {
-      void this.#sendStart(session);
+      if (session.startInFlight || session.stopping) return;
+      session.startInFlight = this.#sendStart(session).finally(() => {
+        session.startInFlight = null;
+      });
     }, PHOTON_TYPING_REFRESH_MS);
   }
 

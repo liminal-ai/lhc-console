@@ -250,6 +250,39 @@ describe("Photon typing lifecycle", () => {
     }
   });
 
+  it("stops typing before final delivery begins", async () => {
+    const events: string[] = [];
+    const manager = {
+      typing: vi.fn(async (_agentId: string, _spaceId: string, state: "start" | "stop") => {
+        events.push(`typing:${state}`);
+      }),
+    };
+    const coordinator = new PhotonTypingCoordinator(manager);
+    const consoleHome = tempDir();
+    const target = relayTarget("process.stdout.write(process.argv[1])");
+    const queue = new RelayQueue({
+      dbPath: join(consoleHome, "relay.sqlite"),
+      targets: { fable: target },
+      isBusy: () => false,
+      execute: (targetArg, prompt, signal, lifecycle) =>
+        executeRelayTarget(targetArg, prompt, { signal, onSpawn: lifecycle?.onSpawn }),
+      deliver: async () => {
+        events.push("delivery");
+      },
+      jobLifecycle: coordinator.lifecycle(),
+      consoleHome,
+    });
+    queues.push(queue);
+    queue.start();
+
+    const submitted = queue.enqueue(photonJob());
+    await queue.wait(submitted.id);
+
+    expect(events).toEqual(["typing:start", "typing:stop", "delivery"]);
+    expect(queue.get(submitted.id)?.deliveryStatus).toBe("delivered");
+    expect(queue.get(submitted.id)?.deliveryError).toBeNull();
+  });
+
   it("uses the shared delivery route for notify-only Photon jobs", async () => {
     const { manager, calls } = createTypingManager();
     const coordinator = new PhotonTypingCoordinator(manager, (job) => ({

@@ -73,7 +73,7 @@ async function deliverPhoton(job: RelayJob, context: RelayDeliveryContext): Prom
   if (!context.photonConnectors) {
     throw new Error("photon connectors are not running");
   }
-  const message = formatPhotonMessage(job.output ?? "(empty reply)", job.id);
+  const message = formatPhotonMessage(job.output?.trim() ? job.output : "(empty reply)", job.id);
   await context.photonConnectors.send(route.agentId, route.spaceId, message);
   const metadata = job.delivery?.metadata as GroupWakeDeliveryMetadata | undefined;
   if (metadata?.kind === "photon_group_wake") {

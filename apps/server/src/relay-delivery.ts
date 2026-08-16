@@ -17,6 +17,19 @@ export interface RelayDeliveryContext {
   photonConnectors: PhotonConnectorManager | null;
 }
 
+export function resolvePhotonDeliveryRoute(
+  job: RelayJob,
+  context: Pick<RelayDeliveryContext, "agents" | "consoleHome">,
+): { agentId: string; spaceId: string } | null {
+  if (job.jobKind === "outbound" || job.target === "lee") return null;
+  const agent = context.agents.find((entry) => entry.id === job.target);
+  const spaceId =
+    job.delivery?.destination.spaceId ??
+    agent?.channels.photon?.notifySpaceId ??
+    latestPhotonDestination(context.consoleHome, job.target);
+  return spaceId ? { agentId: job.target, spaceId } : null;
+}
+
 export async function deliverRelayJob(job: RelayJob, context: RelayDeliveryContext): Promise<void> {
   const channel = job.delivery?.channel ?? (job.notify === "photon" ? "photon" : null);
   if (!channel) return;
@@ -53,19 +66,15 @@ async function deliverOutboundLee(job: RelayJob, context: RelayDeliveryContext):
 }
 
 async function deliverPhoton(job: RelayJob, context: RelayDeliveryContext): Promise<void> {
-  const agent = context.agents.find((entry) => entry.id === job.target);
-  const spaceId =
-    job.delivery?.destination.spaceId ??
-    agent?.channels.photon?.notifySpaceId ??
-    latestPhotonDestination(context.consoleHome, job.target);
-  if (!spaceId) {
+  const route = resolvePhotonDeliveryRoute(job, context);
+  if (!route) {
     throw new Error(`agent ${job.target} has no delivery destination configured`);
   }
   if (!context.photonConnectors) {
     throw new Error("photon connectors are not running");
   }
   const message = formatPhotonMessage(job.output ?? "(empty reply)", job.id);
-  await context.photonConnectors.send(job.target, spaceId, message);
+  await context.photonConnectors.send(route.agentId, route.spaceId, message);
   const metadata = job.delivery?.metadata as GroupWakeDeliveryMetadata | undefined;
   if (metadata?.kind === "photon_group_wake") {
     const store = new GroupCatchUpStore(

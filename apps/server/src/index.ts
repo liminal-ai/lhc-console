@@ -55,9 +55,10 @@ import { loadRelayToken } from "./relay-config.ts";
 import { executeRelayTarget } from "./relay-process.ts";
 import { registerRelayRoutes } from "./relay-routes.ts";
 import { RelayQueue } from "./relay.ts";
-import { deliverRelayJob } from "./relay-delivery.ts";
+import { deliverRelayJob, resolvePhotonDeliveryRoute } from "./relay-delivery.ts";
 import { isRegisteredRelayTarget, loadAgentRegistry } from "./agent-registry.ts";
 import { PhotonConnectorManager } from "./photon-connector.ts";
+import { PhotonTypingCoordinator } from "./photon-typing.ts";
 import { MonitorService } from "./monitor.ts";
 import { registerMonitorRoutes } from "./monitor-routes.ts";
 import { GoalService } from "./goal.ts";
@@ -74,6 +75,7 @@ assertLegacyGoalsStartupSafe(consoleHome);
 const agentRegistry = loadAgentRegistry(consoleHome);
 const relayToken = loadRelayToken(consoleHome);
 const photonRef: { current: PhotonConnectorManager | null } = { current: null };
+const photonTypingRef: { current: PhotonTypingCoordinator | null } = { current: null };
 
 const relayDbPath = join(consoleHome, "relay.sqlite");
 const relayTargets: Record<string, import("./relay.ts").RelayTarget> = {
@@ -110,13 +112,21 @@ const relayQueue = new RelayQueue({
       ).attached.length > 0
     );
   },
-  execute: (target, prompt, signal) => executeRelayTarget(target, prompt, { signal }),
+  execute: (target, prompt, signal, lifecycle) =>
+    executeRelayTarget(target, prompt, { signal, onSpawn: lifecycle?.onSpawn }),
   deliver: async (job) => {
     await deliverRelayJob(job, {
       agents: agentRegistry.agents,
       consoleHome,
       photonConnectors: photonRef.current,
     });
+  },
+  jobLifecycle: {
+    onRunning: (job) => photonTypingRef.current?.onRunning(job),
+    onSpawn: (job) => photonTypingRef.current?.onSpawn(job),
+    onFinished: (job) => photonTypingRef.current?.onFinished(job),
+    onCancellationIntent: (job) => photonTypingRef.current?.onFinished(job),
+    onClose: () => photonTypingRef.current?.close(),
   },
   consoleHome,
 });
@@ -136,8 +146,12 @@ const photonConnectors = new PhotonConnectorManager({
   queue: relayQueue,
 });
 photonRef.current = photonConnectors;
+photonTypingRef.current = new PhotonTypingCoordinator(photonConnectors, (job) =>
+  resolvePhotonDeliveryRoute(job, { agents: agentRegistry.agents, consoleHome }),
+);
 
 await photonConnectors.start();
+photonTypingRef.current.reconcileInterruptedJobs(relayQueue.listRunningJobs());
 relayQueue.start();
 
 const monitorService = new MonitorService({

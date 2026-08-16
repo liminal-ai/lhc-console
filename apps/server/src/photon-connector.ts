@@ -181,6 +181,12 @@ export class PhotonConnector {
     });
   }
 
+  async typing(spaceId: string, state: "start" | "stop"): Promise<void> {
+    const sidecar = this.#sidecar;
+    if (!sidecar) throw new Error(`photon connector for ${this.agentId} is not running`);
+    await this.#post(sidecar, "/typing", { spaceId, state });
+  }
+
   #schedule(task: () => Promise<void>): void {
     this.#processing = this.#processing.then(task).catch((error) => {
       this.#reportProcessingError(error);
@@ -569,6 +575,12 @@ export class PhotonConnectorManager {
     const connector = this.#connectors.get(agentId);
     if (!connector) throw new Error(`no photon connector for agent: ${agentId}`);
     await connector.send(spaceId, text);
+  }
+
+  async typing(agentId: string, spaceId: string, state: "start" | "stop"): Promise<void> {
+    const connector = this.#connectors.get(agentId);
+    if (!connector) throw new Error(`no photon connector for agent: ${agentId}`);
+    await connector.typing(spaceId, state);
   }
 }
 

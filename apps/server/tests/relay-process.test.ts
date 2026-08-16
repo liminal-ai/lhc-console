@@ -15,6 +15,27 @@ describe("executeRelayTarget", () => {
     await expect(executeRelayTarget(target, prompt, { timeoutMs: 1000 })).resolves.toBe(prompt);
   });
 
+  it("invokes onSpawn once when the child process spawns", async () => {
+    const spawned: string[] = [];
+    await executeRelayTarget(target, "ok", {
+      timeoutMs: 1000,
+      onSpawn: () => spawned.push("spawned"),
+    });
+    expect(spawned).toEqual(["spawned"]);
+  });
+
+  it("does not invoke onSpawn when spawn fails", async () => {
+    const spawned: string[] = [];
+    await expect(
+      executeRelayTarget(
+        { ...target, command: "/definitely-missing-binary", args: [] },
+        "ignored",
+        { timeoutMs: 1000, onSpawn: () => spawned.push("spawned") },
+      ),
+    ).rejects.toThrow();
+    expect(spawned).toEqual([]);
+  });
+
   it("closes stdin so print-mode targets can observe EOF", async () => {
     const waitsForEof = {
       ...target,

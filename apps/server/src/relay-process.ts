@@ -1,10 +1,12 @@
 import { execFile } from "node:child_process";
+import type { EventEmitter } from "node:events";
 import type { RelayTarget } from "./relay.ts";
 
 interface ExecuteOptions {
   timeoutMs?: number;
   signal?: AbortSignal;
   env?: NodeJS.ProcessEnv;
+  onSpawn?: () => void;
 }
 
 export function executeRelayTarget(
@@ -39,6 +41,14 @@ export function executeRelayTarget(
         reject(new Error(stderr.trim() || error.message));
       },
     );
+    if (options.onSpawn) {
+      let spawned = false;
+      (child as unknown as EventEmitter).once("spawn", () => {
+        if (spawned) return;
+        spawned = true;
+        options.onSpawn?.();
+      });
+    }
     // Print-mode CLIs commonly read piped stdin before starting their turn.
     // No relay payload is sent there, so close it immediately to deliver EOF.
     child.stdin?.end();

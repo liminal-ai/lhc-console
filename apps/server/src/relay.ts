@@ -761,6 +761,8 @@ export class RelayQueue {
               )
               .run(output, finishedAt, job.id);
           }, undefined);
+          const finished = this.#jobLifecycle?.onFinished?.(job);
+          if (finished) await finished.catch(() => undefined);
           if (!this.#dbClosed) await this.#deliverCompleted(job.id);
         } catch (error) {
           const finishedAt = new Date().toISOString();
@@ -774,8 +776,10 @@ export class RelayQueue {
           }, undefined);
           this.#applyFailureFallback(job.id);
         } finally {
-          const finished = this.#jobLifecycle?.onFinished?.(job);
-          if (finished) await finished.catch(() => undefined);
+          if (this.get(job.id)?.status !== "completed") {
+            const finished = this.#jobLifecycle?.onFinished?.(job);
+            if (finished) await finished.catch(() => undefined);
+          }
           this.#controllers.delete(controller);
         }
         this.#notify(job.id);

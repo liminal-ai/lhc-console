@@ -179,4 +179,19 @@ describe("deliverRelayJob", () => {
     expect(sent[0]).toContain("job-long");
     expect(sent[0]).toContain("truncated for iMessage");
   });
+
+  it("does not send an empty Markdown payload when an agent returns an empty string", async () => {
+    const sent: string[] = [];
+    await deliverRelayJob(job({ output: "" }), {
+      agents: [],
+      consoleHome: "/tmp",
+      photonConnectors: {
+        send: async (_agentId: string, _spaceId: string, text: string) => {
+          sent.push(text);
+        },
+      } as RelayDeliveryContext["photonConnectors"],
+    });
+
+    expect(sent).toEqual(["(empty reply)"]);
+  });
 });

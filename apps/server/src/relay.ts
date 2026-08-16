@@ -87,12 +87,30 @@ export interface RelayJob {
   deliveryError: string | null;
 }
 
+export interface RelayExecuteLifecycle {
+  onSpawn?: () => void;
+}
+
+export interface RelayJobLifecycle {
+  onRunning?: (job: RelayJob) => void;
+  onSpawn?: (job: RelayJob) => void;
+  onFinished?: (job: RelayJob) => void | Promise<void>;
+  onCancellationIntent?: (job: RelayJob) => void | Promise<void>;
+  onClose?: () => void | Promise<void>;
+}
+
 interface RelayQueueOptions {
   dbPath: string;
   targets: Record<string, RelayTarget>;
   isBusy: (target: RelayTarget) => boolean | Promise<boolean>;
-  execute: (target: RelayTarget, prompt: string, signal: AbortSignal) => Promise<string>;
+  execute: (
+    target: RelayTarget,
+    prompt: string,
+    signal: AbortSignal,
+    lifecycle?: RelayExecuteLifecycle,
+  ) => Promise<string>;
   deliver?: (job: RelayJob) => Promise<void>;
+  jobLifecycle?: RelayJobLifecycle;
   busyPollMs?: number;
   deliveryLeaseMs?: number;
   deliveryHeartbeatMs?: number;
@@ -110,6 +128,7 @@ export class RelayQueue {
   readonly #isBusy: RelayQueueOptions["isBusy"];
   readonly #execute: RelayQueueOptions["execute"];
   readonly #deliver: RelayQueueOptions["deliver"];
+  readonly #jobLifecycle: RelayQueueOptions["jobLifecycle"];
   readonly #busyPollMs: number;
   readonly #deliveryLeaseMs: number;
   readonly #deliveryHeartbeatMs: number;
@@ -140,6 +159,7 @@ export class RelayQueue {
     this.#isBusy = options.isBusy;
     this.#execute = options.execute;
     this.#deliver = options.deliver;
+    this.#jobLifecycle = options.jobLifecycle;
     this.#busyPollMs = options.busyPollMs ?? 2000;
     this.#deliveryLeaseMs = options.deliveryLeaseMs ?? DELIVERY_LEASE_MS;
     this.#deliveryHeartbeatMs = options.deliveryHeartbeatMs ?? DELIVERY_HEARTBEAT_MS;
@@ -211,6 +231,12 @@ export class RelayQueue {
 
   cancelJob(id: string): void {
     const cancelledAt = new Date().toISOString();
+    const runningJob = this.#withDb(() => {
+      const row = this.#db.prepare("SELECT status FROM relay_jobs WHERE id = ?").get(id) as
+        | { status: string }
+        | undefined;
+      return row?.status === "running" ? this.get(id) : null;
+    }, null);
     const changed = this.#withDb(() => {
       this.#db
         .prepare("INSERT OR IGNORE INTO relay_cancelled_jobs (id, cancelled_at) VALUES (?, ?)")
@@ -223,6 +249,9 @@ export class RelayQueue {
         )
         .run(cancelledAt, id).changes;
     }, 0);
+    if (runningJob) {
+      this.#invokeJobLifecycle("onCancellationIntent", runningJob);
+    }
     if (changed === 1) {
       this.#notify(id);
       this.#emitSettled(id);
@@ -332,6 +361,15 @@ export class RelayQueue {
     }
   }
 
+  listRunningJobs(): RelayJob[] {
+    return this.#withDb(() => {
+      const rows = this.#db
+        .prepare("SELECT * FROM relay_jobs WHERE status = 'running'")
+        .all() as unknown as RelayRow[];
+      return rows.map((row) => rowToJob(row));
+    }, []);
+  }
+
   wait(id: string): Promise<RelayJob> {
     const job = this.get(id);
     if (!job) return Promise.reject(new Error(`unknown relay job: ${id}`));
@@ -362,6 +400,8 @@ export class RelayQueue {
 
   async close(): Promise<void> {
     this.#closed = true;
+    const closed = this.#jobLifecycle?.onClose?.();
+    if (closed) await closed.catch(() => undefined);
     for (const timer of this.#timers.values()) clearTimeout(timer);
     this.#timers.clear();
     for (const controller of this.#controllers) controller.abort();
@@ -702,8 +742,17 @@ export class RelayQueue {
         }
         const controller = new AbortController();
         this.#controllers.add(controller);
+        this.#invokeJobLifecycle("onRunning", job);
+        const executeLifecycle: RelayExecuteLifecycle = {
+          onSpawn: () => this.#invokeJobLifecycle("onSpawn", job),
+        };
         try {
-          const output = await this.#execute(target, job.prompt, controller.signal);
+          const output = await this.#execute(
+            target,
+            job.prompt,
+            controller.signal,
+            executeLifecycle,
+          );
           const finishedAt = new Date().toISOString();
           this.#withDb(() => {
             this.#db
@@ -725,6 +774,8 @@ export class RelayQueue {
           }, undefined);
           this.#applyFailureFallback(job.id);
         } finally {
+          const finished = this.#jobLifecycle?.onFinished?.(job);
+          if (finished) await finished.catch(() => undefined);
           this.#controllers.delete(controller);
         }
         this.#notify(job.id);
@@ -754,6 +805,26 @@ export class RelayQueue {
       } catch {
         // listener failures must not affect relay execution
       }
+    }
+  }
+
+  #invokeJobLifecycle(event: "onClose"): void;
+  #invokeJobLifecycle(event: Exclude<keyof RelayJobLifecycle, "onClose">, job: RelayJob): void;
+  #invokeJobLifecycle(event: keyof RelayJobLifecycle, job?: RelayJob): void {
+    if (!this.#jobLifecycle) return;
+    try {
+      if (event === "onClose") {
+        const result = this.#jobLifecycle.onClose?.();
+        if (result) void result.catch(() => undefined);
+        return;
+      }
+      if (!job) return;
+      const handler = this.#jobLifecycle[event];
+      if (!handler) return;
+      const result = handler(job);
+      if (result) void result.catch(() => undefined);
+    } catch {
+      // lifecycle failures must not affect relay execution
     }
   }
 

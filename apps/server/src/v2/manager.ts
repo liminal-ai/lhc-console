@@ -11,6 +11,7 @@ import {
   mintTurnId,
   type V2CommandKind,
   type V2Event,
+  type V2Provider,
   type V2Receipt,
   type V2RejectReason,
   type V2StopMode,
@@ -65,7 +66,7 @@ export interface V2CanonicalInspector {
 }
 
 export interface AdapterFactory {
-  (provider: "codex-lhc" | "pi-lhc", target: string): ProviderAdapter;
+  (provider: V2Provider, target: string): ProviderAdapter;
 }
 
 export interface RuntimeManagerOptions {

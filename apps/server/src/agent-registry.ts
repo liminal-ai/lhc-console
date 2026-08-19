@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { assertOwnerOnlyFile } from "./env-file.ts";
 import type { RelayTarget } from "./relay.ts";
-import { isV2Provider, type V2Provider } from "./v2/contract.ts";
+import { isV2Provider, V2_PROVIDERS, type V2Provider } from "./v2/contract.ts";
 
 export interface PhotonChannelConfig {
   address: string;
@@ -263,7 +263,7 @@ function parseV2(
   const provider =
     raw.provider === undefined ? relay.hostId : requireString(raw.provider, `${id}.v2.provider`);
   if (!isV2Provider(provider)) {
-    throw new Error(`${id}.v2.provider must be codex-lhc or pi-lhc`);
+    throw new Error(`${id}.v2.provider must be one of ${V2_PROVIDERS.join(", ")}`);
   }
   if (provider !== relay.hostId) {
     throw new Error(`${id}.v2.provider must match ${id}.relay.hostId (${relay.hostId})`);

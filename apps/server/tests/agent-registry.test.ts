@@ -165,6 +165,60 @@ describe("loadAgentRegistry", () => {
     expect(loaded.relayTargets.fable.command).toBe("pi-lhc");
   });
 
+  it("loads a hermes v2 block with the disposable-home env it will start under", () => {
+    const home = mkdtempSync(join(tmpdir(), "lhc-agents-"));
+    dirs.push(home);
+    writeRegistry(home, {
+      version: 1,
+      agents: {
+        courier: {
+          ownerSenderIds: ["owner"],
+          health: { hostId: "hermes", threadId: "th_hermes_canonical" },
+          relay: {
+            hostId: "hermes",
+            threadId: "20260819_000000_abc123",
+            cwd: "/tmp",
+            command: "hermes",
+            args: [],
+          },
+          v2: {
+            provider: "hermes",
+            env: { HERMES_HOME: "/tmp/hermes-disposable" },
+          },
+        },
+      },
+    });
+    const loaded = loadAgentRegistry(home);
+    expect(loaded.agents[0]?.v2).toMatchObject({
+      provider: "hermes",
+      env: { HERMES_HOME: "/tmp/hermes-disposable" },
+    });
+  });
+
+  it("rejects an unknown v2 provider with the full provider list", () => {
+    const home = mkdtempSync(join(tmpdir(), "lhc-agents-"));
+    dirs.push(home);
+    writeRegistry(home, {
+      version: 1,
+      agents: {
+        fable: {
+          ownerSenderIds: ["owner"],
+          relay: {
+            hostId: "mystery",
+            threadId: "th_test",
+            cwd: "/tmp",
+            command: "mystery",
+            args: ["-p"],
+          },
+          v2: { provider: "mystery" },
+        },
+      },
+    });
+    expect(() => loadAgentRegistry(home)).toThrow(
+      /v2\.provider must be one of codex-lhc, pi-lhc, hermes/,
+    );
+  });
+
   it("rejects a v2 provider that does not match relay.hostId", () => {
     const home = mkdtempSync(join(tmpdir(), "lhc-agents-"));
     dirs.push(home);

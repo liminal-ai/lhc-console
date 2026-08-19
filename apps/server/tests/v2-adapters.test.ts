@@ -590,3 +590,92 @@ describe("Pi-LHC RPC fixture", () => {
     expect(adapter.pid()).toBeNull();
   });
 });
+
+describe("adapter child-process failure containment", () => {
+  const startInput = {
+    hostThreadId: "sess-none",
+    canonicalThreadId: "th_none",
+    cwd: "/tmp",
+    approvalPolicy: "bypass-at-spawn" as const,
+  };
+
+  async function withUncaughtCapture<T>(run: () => Promise<T>): Promise<{
+    result: T;
+    uncaught: unknown[];
+  }> {
+    const uncaught: unknown[] = [];
+    const handler = (error: unknown) => uncaught.push(error);
+    process.on("uncaughtException", handler);
+    try {
+      const result = await run();
+      // Let any stray child "error"/stream events flush before we look.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      return { result, uncaught };
+    } finally {
+      process.off("uncaughtException", handler);
+    }
+  }
+
+  it("codex-lhc rejects start for a nonexistent executable without crashing or hanging", async () => {
+    const adapter = new CodexLhcAdapter({
+      command: "/nonexistent/lhc-codex-binary",
+      args: ["app-server"],
+    });
+    const { result: outcome, uncaught } = await withUncaughtCapture(async () => {
+      await expect(adapter.start(startInput)).rejects.toThrow(
+        /codex-lhc child process failed: .*ENOENT/,
+      );
+      // Manager cleanup path: stop("kill") must resolve even though the
+      // child never spawned and will never emit "exit".
+      return adapter.stop("kill");
+    });
+    // Node either never emits "exit" for a failed spawn (older) or emits it
+    // with a negative errno code (newer); both must resolve without a signal.
+    expect(outcome.signal).toBeNull();
+    expect(outcome.code === null || outcome.code < 0).toBe(true);
+    expect(adapter.pid()).toBeNull();
+    expect(uncaught).toEqual([]);
+  });
+
+  it("pi-lhc rejects start for a nonexistent executable without crashing or hanging", async () => {
+    const adapter = new PiLhcAdapter({
+      command: "/nonexistent/lhc-pi-binary",
+      args: ["--mode", "rpc"],
+    });
+    const { result: outcome, uncaught } = await withUncaughtCapture(async () => {
+      await expect(adapter.start(startInput)).rejects.toThrow(
+        /pi-lhc child process failed: .*ENOENT/,
+      );
+      return adapter.stop("kill");
+    });
+    // Node either never emits "exit" for a failed spawn (older) or emits it
+    // with a negative errno code (newer); both must resolve without a signal.
+    expect(outcome.signal).toBeNull();
+    expect(outcome.code === null || outcome.code < 0).toBe(true);
+    expect(adapter.pid()).toBeNull();
+    expect(uncaught).toEqual([]);
+  });
+
+  it("pi-lhc drains a large stderr producer and surfaces a bounded tail as evidence", async () => {
+    // 1 MiB of stderr far exceeds the ~64 KiB pipe buffer: without a drain
+    // the child blocks on write and never exits, and this test times out.
+    const script = "process.stderr.write(Buffer.alloc(1024 * 1024, 'x')); process.exit(0);";
+    const adapter = new PiLhcAdapter({
+      command: process.execPath,
+      args: ["-e", script, "rpc"],
+    });
+    const { result: error, uncaught } = await withUncaughtCapture(async () => {
+      const failure = await adapter.start(startInput).then(
+        () => null,
+        (thrown: unknown) => thrown as Error,
+      );
+      await adapter.stop("kill");
+      return failure;
+    });
+    expect(uncaught).toEqual([]);
+    // The child exited (proving its 1 MiB stderr was drained past the ~64 KiB
+    // pipe buffer) and the rejection carries stderr evidence, bounded.
+    expect(error?.message).toMatch(/pi-lhc runtime exited \(stderr tail: x+/);
+    expect(error!.message.length).toBeLessThan(16_384);
+  });
+});

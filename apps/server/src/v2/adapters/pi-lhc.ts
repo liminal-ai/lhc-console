@@ -11,6 +11,12 @@ import type {
 import { PROVIDER_CAPABILITIES, ProviderUnavailableError } from "../adapter.ts";
 import type { V2StopMode } from "../contract.ts";
 import { StreamJsonlTransport, type JsonlTransport } from "../jsonl-transport.ts";
+import {
+  GRACEFUL_STOP_TIMEOUT_MS,
+  KILL_SETTLE_TIMEOUT_MS,
+  killHard,
+  waitExitBounded,
+} from "../stop-escalation.ts";
 import { spawnFencedChild, type HeldWriterLock } from "../writer-lock.ts";
 
 const RPC_TIMEOUT_MS = 30_000;
@@ -43,6 +49,10 @@ export interface PiLhcAdapterOptions {
    * Test-only: inject a JSONL pair. Production never sets this.
    */
   testTransport?: JsonlTransport;
+  /** Test override: graceful-stop wait before SIGKILL escalation. */
+  gracefulStopTimeoutMs?: number;
+  /** Test override: post-SIGKILL settlement wait. */
+  killSettleTimeoutMs?: number;
 }
 
 interface HandoffQuiesceReceipt {
@@ -239,11 +249,14 @@ export class PiLhcAdapter implements ProviderAdapter {
         // process-group kill is best-effort
       }
       this.#child.kill("SIGKILL");
-    } else {
-      this.#transport?.close();
-      this.#child?.kill("SIGTERM");
+      const exit = await this.#waitExit();
+      this.#cleanup();
+      this.#emit({ type: "exited", code: exit.code, signal: exit.signal });
+      return exit;
     }
-    const exit = await this.#waitExit();
+    this.#transport?.close();
+    this.#child?.kill("SIGTERM");
+    const exit = await this.#waitExitEscalating();
     this.#cleanup();
     this.#emit({ type: "exited", code: exit.code, signal: exit.signal });
     return exit;
@@ -529,6 +542,28 @@ export class PiLhcAdapter implements ProviderAdapter {
         (code: number | null, signal: NodeJS.Signals | null) => resolve({ code, signal }),
       );
     });
+  }
+
+  /**
+   * Graceful-stop wait, bounded so a child that ignores EOF/SIGTERM cannot
+   * wedge the per-target command queue: escalate to SIGKILL after the grace
+   * window, then settle within a final bound even if "exit" never arrives.
+   */
+  async #waitExitEscalating(): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+    const child = this.#child;
+    if (!child) return { code: 0, signal: null };
+    if (this.#childError && child.pid === undefined) return { code: null, signal: null };
+    const graceful = await waitExitBounded(
+      child,
+      this.#options.gracefulStopTimeoutMs ?? GRACEFUL_STOP_TIMEOUT_MS,
+    );
+    if (graceful.exited) return { code: graceful.code, signal: graceful.signal };
+    killHard(child);
+    const settled = await waitExitBounded(
+      child,
+      this.#options.killSettleTimeoutMs ?? KILL_SETTLE_TIMEOUT_MS,
+    );
+    return { code: settled.code, signal: settled.signal };
   }
 
   #cleanup(): void {

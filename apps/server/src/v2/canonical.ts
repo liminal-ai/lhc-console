@@ -17,8 +17,14 @@ export async function inspectCanonicalSpan(input: {
   canonicalThreadId: string;
   commandId?: string | null;
   nativeTurnId?: string | null;
+  /**
+   * Target-specific host home. A hermes V2 target lives in its own disposable
+   * HERMES_HOME; without this the lookup would read whatever profile the
+   * Console process's global env happens to point at.
+   */
+  hostHome?: string | null;
 }): Promise<{ closed: boolean; span?: Record<string, unknown> }> {
-  const host = describeHost(input.hostId);
+  const host = describeHost(input.hostId, { homeOverride: input.hostHome });
   try {
     const thread = resolveThread(host, input.canonicalThreadId);
     if (!thread?.filePath || !existsSync(thread.filePath)) {

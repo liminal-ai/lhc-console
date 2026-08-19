@@ -20,6 +20,7 @@ import {
   type V2TurnOutcome,
 } from "./contract.ts";
 import {
+  hostHomeOverrideFor,
   resolveThreadIdentity,
   resolveWriterResource,
   requireV2Provider,
@@ -62,6 +63,8 @@ export interface V2CanonicalInspector {
     canonicalThreadId: string;
     commandId?: string | null;
     nativeTurnId?: string | null;
+    /** Target-specific host home (hermes disposable HERMES_HOME); null = default. */
+    hostHome?: string | null;
   }): Promise<{ closed: boolean; span?: Record<string, unknown> }>;
 }
 
@@ -656,9 +659,15 @@ export class RuntimeManager {
       if (ownerPid !== null && processIsAlive(ownerPid)) {
         attachWriterLockOwner(acquired.held, ownerPid);
       }
+      // Typed start evidence: an adapter that inspected its provider's resume
+      // payload may know the session was NOT proven idle (running run loop,
+      // retained inflight turn, scheduled auto-continue). Claiming idle then
+      // would be a lie the whole command plane builds on.
+      const startState = adapter.startEvidence?.() ?? { kind: "idle" as const };
+      const startupState = startState.kind === "idle" ? ("idle" as const) : ("unknown" as const);
       const events = this.#store.transaction(() => {
         this.#patchRuntime(agent.id, {
-          state: "idle",
+          state: startupState,
           generation,
           ownerKind: "v2-runtime",
           ownerPid,
@@ -684,7 +693,15 @@ export class RuntimeManager {
           target: agent.id,
           kind: "runtime.state",
           commandId,
-          data: { state: "idle" },
+          data:
+            startState.kind === "idle"
+              ? { state: "idle" }
+              : {
+                  state: "unknown",
+                  reason: "start_state_unproven",
+                  startReasons: startState.reasons,
+                  startEvidence: startState.evidence,
+                },
         });
         const e2 = this.#store.appendEvent({
           target: agent.id,
@@ -695,7 +712,9 @@ export class RuntimeManager {
         return [e1, e2];
       });
       for (const event of events) this.#events.emit("event", event);
-      const resumeFollowUps = this.#resumeFollowUps(params);
+      // Auto-resuming queued follow-ups fires a turn on the runtime; on an
+      // unproven-idle start that could collide with a live provider-side turn.
+      const resumeFollowUps = startupState === "idle" && this.#resumeFollowUps(params);
       if (resumeFollowUps) {
         this.#store.releaseHeldFollowUps(agent.id);
         void this.#maybeStartFollowUp(agent.id, "", "completed");
@@ -1305,6 +1324,7 @@ export class RuntimeManager {
       inspected = await this.#inspectCanonical({
         hostId: agent.relay.hostId,
         canonicalThreadId,
+        hostHome: hostHomeOverrideFor(agent),
       });
     } catch {
       return false;

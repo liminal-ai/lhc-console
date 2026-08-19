@@ -59,7 +59,14 @@ function agent(provider: V2Provider, id = AGENT_IDS[provider]): AgentRecord {
       command: provider,
       args: [],
     },
-    v2: { provider },
+    v2: {
+      provider,
+      // A hermes target must declare its own disposable home; the writer
+      // fence refuses to key off the Console process's global HERMES_HOME.
+      // One home per canonical store: aliases of the same thread share it so
+      // the writer fence still collides them.
+      ...(provider === "hermes" ? { env: { HERMES_HOME: "/tmp/lhc-v2-hermes-home" } } : {}),
+    },
   };
 }
 

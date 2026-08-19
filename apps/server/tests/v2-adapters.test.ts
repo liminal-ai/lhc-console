@@ -193,6 +193,7 @@ describe("Codex-LHC JSON-RPC fixture", () => {
         canonicalThreadId: "th_codex",
         cwd: "/tmp",
         approvalPolicy: "bypass-at-spawn",
+        proveCanonicalSession: async () => true,
       }),
     ).resolves.toBe("sess-1");
     expect(seen.some((message) => (message as { method?: string }).method === "initialize")).toBe(

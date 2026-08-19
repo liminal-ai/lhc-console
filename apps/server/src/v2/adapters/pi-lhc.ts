@@ -15,7 +15,9 @@ import {
   GRACEFUL_STOP_TIMEOUT_MS,
   KILL_SETTLE_TIMEOUT_MS,
   killHard,
+  StopUnprovenError,
   waitExitBounded,
+  type BoundedExit,
 } from "../stop-escalation.ts";
 import { spawnFencedChild, type HeldWriterLock } from "../writer-lock.ts";
 
@@ -240,26 +242,56 @@ export class PiLhcAdapter implements ProviderAdapter {
     return result.data ?? {};
   }
 
+  /**
+   * Every path is bounded, and `exited`/cleanup only ever follow an observed
+   * child exit. When even the post-SIGKILL settlement window passes without
+   * one, the child may still be alive, so this throws `StopUnprovenError` and
+   * retains child/transport state instead of inventing a stop.
+   */
   async stop(mode: V2StopMode): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
     this.#stopping = true;
-    if (mode === "kill" && this.#child) {
-      try {
-        if (this.#child.pid) process.kill(-this.#child.pid, "SIGKILL");
-      } catch {
-        // process-group kill is best-effort
+    const child = this.#child;
+    let exit: BoundedExit;
+    if (!child) {
+      // Injected-transport session: no console-spawned process exists.
+      this.#transport?.close();
+      exit = { exited: true, code: 0, signal: null };
+    } else if (this.#childError && child.pid === undefined) {
+      // Spawn itself failed: no OS process ever existed, so there is no exit
+      // to observe and nothing that could still hold the thread.
+      exit = { exited: true, code: null, signal: null };
+    } else if (mode === "kill") {
+      killHard(child);
+      exit = await waitExitBounded(
+        child,
+        this.#options.killSettleTimeoutMs ?? KILL_SETTLE_TIMEOUT_MS,
+      );
+    } else {
+      this.#transport?.close();
+      child.kill("SIGTERM");
+      exit = await waitExitBounded(
+        child,
+        this.#options.gracefulStopTimeoutMs ?? GRACEFUL_STOP_TIMEOUT_MS,
+      );
+      if (!exit.exited) {
+        killHard(child);
+        exit = await waitExitBounded(
+          child,
+          this.#options.killSettleTimeoutMs ?? KILL_SETTLE_TIMEOUT_MS,
+        );
       }
-      this.#child.kill("SIGKILL");
-      const exit = await this.#waitExit();
-      this.#cleanup();
-      this.#emit({ type: "exited", code: exit.code, signal: exit.signal });
-      return exit;
     }
-    this.#transport?.close();
-    this.#child?.kill("SIGTERM");
-    const exit = await this.#waitExitEscalating();
+    if (!exit.exited) {
+      // Re-arm exit notification: if the child does die later, its "exit"
+      // handler must reach the manager as a real observed exit.
+      this.#stopping = false;
+      throw new StopUnprovenError(
+        `pi-lhc child pid ${child?.pid ?? "unknown"} did not exit within the SIGKILL bound; child state retained, stop unproven`,
+      );
+    }
     this.#cleanup();
     this.#emit({ type: "exited", code: exit.code, signal: exit.signal });
-    return exit;
+    return { code: exit.code, signal: exit.signal };
   }
 
   #spawn(input: AdapterStartInput): JsonlTransport {
@@ -527,43 +559,6 @@ export class PiLhcAdapter implements ProviderAdapter {
 
   #emit(event: ProviderNotification): void {
     this.#events.emit("event", event);
-  }
-
-  async #waitExit(): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
-    if (!this.#child) return { code: 0, signal: null };
-    if (this.#child.exitCode !== null)
-      return { code: this.#child.exitCode, signal: this.#child.signalCode };
-    // A child that failed to spawn (no pid) will never emit "exit"; waiting
-    // on it would hang stop() forever.
-    if (this.#childError && this.#child.pid === undefined) return { code: null, signal: null };
-    return await new Promise((resolve) => {
-      (this.#child as unknown as EventEmitter).once(
-        "exit",
-        (code: number | null, signal: NodeJS.Signals | null) => resolve({ code, signal }),
-      );
-    });
-  }
-
-  /**
-   * Graceful-stop wait, bounded so a child that ignores EOF/SIGTERM cannot
-   * wedge the per-target command queue: escalate to SIGKILL after the grace
-   * window, then settle within a final bound even if "exit" never arrives.
-   */
-  async #waitExitEscalating(): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
-    const child = this.#child;
-    if (!child) return { code: 0, signal: null };
-    if (this.#childError && child.pid === undefined) return { code: null, signal: null };
-    const graceful = await waitExitBounded(
-      child,
-      this.#options.gracefulStopTimeoutMs ?? GRACEFUL_STOP_TIMEOUT_MS,
-    );
-    if (graceful.exited) return { code: graceful.code, signal: graceful.signal };
-    killHard(child);
-    const settled = await waitExitBounded(
-      child,
-      this.#options.killSettleTimeoutMs ?? KILL_SETTLE_TIMEOUT_MS,
-    );
-    return { code: settled.code, signal: settled.signal };
   }
 
   #cleanup(): void {

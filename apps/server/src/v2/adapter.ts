@@ -52,6 +52,17 @@ export interface AdapterStartInput {
   proveCanonicalSession?: (nativeThreadRef: string, canonicalThreadId: string) => Promise<boolean>;
 }
 
+/**
+ * What the provider's own start/resume evidence says about the attached
+ * session's activity. `idle` requires the provider to have affirmatively
+ * reported an idle session; anything the wire left ambiguous (a running run
+ * loop, a retained inflight turn, a scheduled auto-continue, or fields the
+ * response simply omitted) is `unproven` and must never be presented as idle.
+ */
+export type AdapterStartState =
+  | { kind: "idle" }
+  | { kind: "unproven"; reasons: string[]; evidence: Record<string, unknown> };
+
 export interface AdapterTurnItem {
   type: "agent_message" | "tool" | "other";
   text?: string;
@@ -111,6 +122,13 @@ export interface ProviderAdapter {
    */
   stop(mode: V2StopMode): Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
   getState?(): Promise<Record<string, unknown>>;
+  /**
+   * Typed start evidence from the provider's own resume/attach response.
+   * Absent means the adapter has no richer signal than a successful start
+   * (Codex/Pi today); present, the manager must not mark the runtime idle
+   * unless this says `idle`.
+   */
+  startEvidence?(): AdapterStartState;
   /**
    * Host capture flush + post-settle compact quiesce. Absence or a false
    * receipt must fail handoff; adapters must not invent success.

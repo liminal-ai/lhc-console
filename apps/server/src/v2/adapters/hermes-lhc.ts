@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import { scrubbedEnv } from "../../tmux.ts";
 import type {
   AdapterStartInput,
+  AdapterStartState,
   AdapterSteerResult,
   ProviderAdapter,
   ProviderListener,
@@ -13,7 +14,7 @@ import {
   ProviderUnavailableError,
   ProviderUnsupportedError,
 } from "../adapter.ts";
-import type { V2StopMode } from "../contract.ts";
+import type { V2StopMode, V2TurnOutcome } from "../contract.ts";
 import { StreamJsonlTransport, type JsonlTransport } from "../jsonl-transport.ts";
 import {
   GRACEFUL_STOP_TIMEOUT_MS,
@@ -92,8 +93,28 @@ export class HermesLhcAdapter implements ProviderAdapter {
   #unsub: (() => void) | null = null;
   #nextId = 1;
   #runtimeGeneration = 0;
-  #nativeThreadRef: string | null = null;
+  /**
+   * Durable native reference: the stored session key (`resumed`/`session_key`
+   * in the resume payload) that the canonical store's own resume recipe names.
+   * This is the identity that persists across gateway restarts.
+   */
+  #sessionKey: string | null = null;
+  /**
+   * Ephemeral live session id (`session_id` in the resume payload): the
+   * gateway-session handle every subsequent RPC must address. It dies with
+   * the worker and proves nothing about identity.
+   */
+  #liveSid: string | null = null;
+  #startState: AdapterStartState | null = null;
   #activeNativeTurnId: string | null = null;
+  /**
+   * Events received between sending prompt.submit and its response. The
+   * gateway runs the turn on a daemon thread, so message.start — or even the
+   * terminal message.complete — can hit the wire before the RPC response;
+   * replaying them after the caller has recorded the minted turn id is what
+   * keeps a fast turn from being dropped or leaving the manager active.
+   */
+  #pendingSubmit: { nativeTurnId: string; buffered: Record<string, unknown>[] } | null = null;
   #turnStartedEmitted = false;
   #finalTextBuffer = "";
   #lastSubmitStatus: string | null = null;
@@ -124,11 +145,23 @@ export class HermesLhcAdapter implements ProviderAdapter {
 
   async getState(): Promise<Record<string, unknown>> {
     return {
-      nativeThreadRef: this.#nativeThreadRef,
+      nativeThreadRef: this.#sessionKey,
+      liveSessionId: this.#liveSid,
       activeNativeTurnId: this.#activeNativeTurnId,
       lastSubmitStatus: this.#lastSubmitStatus,
+      startState: this.#startState,
       stderrTail: this.#tailLines(),
     };
+  }
+
+  startEvidence(): AdapterStartState {
+    return (
+      this.#startState ?? {
+        kind: "unproven",
+        reasons: ["no resume evidence recorded"],
+        evidence: {},
+      }
+    );
   }
 
   async start(input: AdapterStartInput): Promise<string> {
@@ -157,40 +190,45 @@ export class HermesLhcAdapter implements ProviderAdapter {
     const result = (await this.#rpc("session.resume", {
       session_id: input.hostThreadId,
     })) as Record<string, unknown>;
-    // Resume follows the compression-continuation chain; the RESOLVED session
-    // id is the identity that binds, so anything else (including the id we
-    // asked for) is refused rather than assumed.
-    const resolved =
-      typeof result.session_id === "string" && result.session_id
-        ? result.session_id
-        : typeof result.session_key === "string" && result.session_key
-          ? result.session_key
-          : null;
-    if (!resolved) {
+    // The resume payload carries two identities with different lifetimes:
+    // `session_id` is a freshly minted ephemeral gateway-session handle (the
+    // SID all later RPCs must address) while `resumed`/`session_key` name the
+    // durable stored conversation the gateway actually attached. Only the
+    // durable reference is identity; only the live SID is addressable.
+    const liveSid = nonEmptyString(result.session_id);
+    const sessionKey = nonEmptyString(result.resumed) ?? nonEmptyString(result.session_key);
+    if (!liveSid) {
       throw new ProviderUnavailableError(
-        "hermes session.resume returned no resolved session id; refusing to invent a thread identity",
+        "hermes session.resume returned no live session_id; refusing to invent an RPC handle",
+      );
+    }
+    if (!sessionKey) {
+      throw new ProviderUnavailableError(
+        "hermes session.resume returned no durable resumed/session_key reference; refusing to invent a thread identity",
       );
     }
     if (!input.proveCanonicalSession) {
-      // String equality between the resolved session id and configured thread
+      // String equality between the resumed session key and configured thread
       // ids is not identity evidence; only a canonical-store proof is.
       throw new ProviderUnavailableError(
-        `hermes resume produced session ${resolved} but no canonical identity prover was supplied; refusing string-equality identity for ${input.canonicalThreadId}`,
+        `hermes resume attached stored session ${sessionKey} but no canonical identity prover was supplied; refusing string-equality identity for ${input.canonicalThreadId}`,
       );
     }
-    const mapped = await input.proveCanonicalSession(resolved, input.canonicalThreadId);
+    const mapped = await input.proveCanonicalSession(sessionKey, input.canonicalThreadId);
     if (!mapped) {
       throw new ProviderUnavailableError(
-        `hermes session ${resolved} does not map to configured canonical LHC thread ${input.canonicalThreadId}`,
+        `hermes session ${sessionKey} does not map to configured canonical LHC thread ${input.canonicalThreadId}`,
       );
     }
-    this.#nativeThreadRef = resolved;
-    this.#emit({ type: "threadAttached", nativeThreadRef: resolved });
-    return resolved;
+    this.#liveSid = liveSid;
+    this.#sessionKey = sessionKey;
+    this.#startState = resumeStartState(result);
+    this.#emit({ type: "threadAttached", nativeThreadRef: sessionKey });
+    return sessionKey;
   }
 
   async startTurn(text: string): Promise<string> {
-    if (!this.#transport || !this.#nativeThreadRef) {
+    if (!this.#transport || !this.#liveSid) {
       throw new ProviderUnavailableError("hermes session is not attached");
     }
     if (this.#activeNativeTurnId) {
@@ -207,16 +245,35 @@ export class HermesLhcAdapter implements ProviderAdapter {
     const requestId = String(this.#nextId++);
     const nativeTurnId = correlateHermesNativeTurnId(this.#runtimeGeneration, requestId);
     this.#activeNativeTurnId = nativeTurnId;
+    // Turn events can beat the prompt.submit response onto the wire (the
+    // gateway answers from a daemon thread). Buffer them under this turn's
+    // generation and replay after the caller's own post-await bookkeeping —
+    // otherwise a terminal frame that raced the response is dropped and the
+    // manager stays active forever.
+    this.#pendingSubmit = { nativeTurnId, buffered: [] };
     try {
       const result = (await this.#rpc(
         "prompt.submit",
-        { session_id: this.#nativeThreadRef, text },
+        { session_id: this.#liveSid, text },
         requestId,
       )) as Record<string, unknown>;
       this.#lastSubmitStatus = typeof result.status === "string" ? result.status : null;
     } catch (error) {
+      this.#pendingSubmit = null;
       this.#activeNativeTurnId = null;
       throw error;
+    }
+    const pending = this.#pendingSubmit;
+    this.#pendingSubmit = null;
+    if (pending && pending.buffered.length > 0) {
+      // setImmediate runs after the caller's microtask continuation (where the
+      // manager records the minted turn id), so replayed events correlate.
+      setImmediate(() => {
+        for (const params of pending.buffered) {
+          if (this.#activeNativeTurnId !== pending.nativeTurnId) return;
+          this.#handleEvent(typeof params.type === "string" ? params.type : "", params);
+        }
+      });
     }
     return nativeTurnId;
   }
@@ -227,7 +284,7 @@ export class HermesLhcAdapter implements ProviderAdapter {
     if (!this.#activeNativeTurnId) return "mismatch";
     if (this.#activeNativeTurnId !== nativeTurnId) return "mismatch";
     const result = (await this.#rpc("session.steer", {
-      session_id: this.#nativeThreadRef,
+      session_id: this.#liveSid,
       text,
     })) as Record<string, unknown>;
     if (result.status === "queued") {
@@ -238,10 +295,10 @@ export class HermesLhcAdapter implements ProviderAdapter {
   }
 
   async interrupt(_nativeTurnId: string): Promise<void> {
-    if (!this.#transport || !this.#nativeThreadRef) {
+    if (!this.#transport || !this.#liveSid) {
       throw new ProviderUnavailableError("hermes session is not attached");
     }
-    await this.#rpc("session.interrupt", { session_id: this.#nativeThreadRef });
+    await this.#rpc("session.interrupt", { session_id: this.#liveSid });
   }
 
   async quiesceForHandoff(): Promise<{
@@ -271,7 +328,7 @@ export class HermesLhcAdapter implements ProviderAdapter {
           jsonrpc: "2.0",
           id: `stop-interrupt-${this.#nextId++}`,
           method: "session.interrupt",
-          params: { session_id: this.#nativeThreadRef },
+          params: { session_id: this.#liveSid },
         });
       } catch {
         // the bounded SIGTERM/SIGKILL path below is the real stop
@@ -429,17 +486,28 @@ export class HermesLhcAdapter implements ProviderAdapter {
     if (message.method !== "event") return;
     const params = (message.params ?? {}) as Record<string, unknown>;
     const type = typeof params.type === "string" ? params.type : "";
-    this.#handleEvent(type, params);
-  }
-
-  #handleEvent(type: string, params: Record<string, unknown>): void {
     if (type === "gateway.ready") {
       this.#ready = true;
       for (const waiter of this.#readyWaiters.splice(0)) waiter();
       return;
     }
+    // The envelope's session_id names the emitting gateway session; frames
+    // from any session other than the one this adapter resumed are not ours.
+    const sid = typeof params.session_id === "string" ? params.session_id : "";
+    if (sid && this.#liveSid && sid !== this.#liveSid) return;
+    if (this.#pendingSubmit) {
+      this.#pendingSubmit.buffered.push(params);
+      return;
+    }
+    this.#handleEvent(type, params);
+  }
+
+  #handleEvent(type: string, params: Record<string, unknown>): void {
     const nativeTurnId = this.#activeNativeTurnId;
     if (!nativeTurnId) return;
+    // Event payloads ride nested under params.payload, not on params itself:
+    // {"method":"event","params":{"type":…,"session_id":…,"payload":{…}}}.
+    const payload = asRecord(params.payload);
     if (type === "message.start") {
       if (this.#turnStartedEmitted) return;
       this.#turnStartedEmitted = true;
@@ -448,10 +516,10 @@ export class HermesLhcAdapter implements ProviderAdapter {
     }
     if (type === "message.delta") {
       // Buffered, not emitted per-token; the terminal frame carries the text.
-      if (typeof params.text === "string") this.#finalTextBuffer += params.text;
+      if (typeof payload.text === "string") this.#finalTextBuffer += payload.text;
       return;
     }
-    if (type === "reasoning.available") {
+    if (type === "reasoning.available" || type === "reasoning.delta") {
       this.#emit({ type: "item", nativeTurnId, item: { type: "other", text: "reasoning" } });
       return;
     }
@@ -461,8 +529,8 @@ export class HermesLhcAdapter implements ProviderAdapter {
         nativeTurnId,
         item: {
           type: "tool",
-          text: typeof params.name === "string" ? params.name : undefined,
-          nativeItemId: typeof params.tool_id === "string" ? params.tool_id : undefined,
+          text: typeof payload.name === "string" ? payload.name : undefined,
+          nativeItemId: typeof payload.tool_id === "string" ? payload.tool_id : undefined,
         },
       });
       return;
@@ -471,38 +539,58 @@ export class HermesLhcAdapter implements ProviderAdapter {
       this.#emit({
         type: "item",
         nativeTurnId,
-        item: { type: "other", text: typeof params.kind === "string" ? params.kind : "status" },
+        item: { type: "other", text: typeof payload.kind === "string" ? payload.kind : "status" },
       });
+      return;
+    }
+    if (type === "error") {
+      // The gateway's cancel-before-ready path closes a turn with a bare
+      // `error` event and never sends message.complete; without this the
+      // turn would hang open forever.
+      this.#settleTurn(nativeTurnId, "failed", this.#finalTextBuffer);
       return;
     }
     if (type === "message.complete") {
       const finalText =
-        typeof params.text === "string" && params.text ? params.text : this.#finalTextBuffer;
-      const status = typeof params.status === "string" ? params.status : "complete";
+        typeof payload.text === "string" && payload.text ? payload.text : this.#finalTextBuffer;
+      const status = typeof payload.status === "string" ? payload.status : "";
+      // Truthful outcomes: only the statuses the gateway actually emits map
+      // to definite outcomes; anything unrecognized is indeterminate, never
+      // silently promoted to completed.
       const outcome =
-        status === "interrupted" ? "interrupted" : status === "error" ? "failed" : "completed";
-      if (finalText) {
-        this.#emit({
-          type: "item",
-          nativeTurnId,
-          item: { type: "agent_message", text: finalText },
-        });
-      }
-      // The sole terminal frame per turn: exactly one turnCompleted per minted
-      // turn id, and clearing the active id closes the correlation window.
-      this.#emit({
-        type: "turnCompleted",
-        nativeTurnId,
-        outcome,
-        finalText: finalText || undefined,
-      });
-      this.#activeNativeTurnId = null;
-      this.#turnStartedEmitted = false;
+        status === "complete"
+          ? ("completed" as const)
+          : status === "interrupted"
+            ? ("interrupted" as const)
+            : status === "error"
+              ? ("failed" as const)
+              : ("indeterminate" as const);
+      this.#settleTurn(nativeTurnId, outcome, finalText);
       return;
     }
     // session.info, session.usage, notification.show, *.request prompts and
     // anything unrecognized: evidence, never fatal.
     this.#emit({ type: "item", nativeTurnId, item: { type: "other", text: type } });
+  }
+
+  #settleTurn(nativeTurnId: string, outcome: V2TurnOutcome, finalText: string): void {
+    if (finalText) {
+      this.#emit({
+        type: "item",
+        nativeTurnId,
+        item: { type: "agent_message", text: finalText },
+      });
+    }
+    // The sole terminal frame per turn: exactly one turnCompleted per minted
+    // turn id, and clearing the active id closes the correlation window.
+    this.#emit({
+      type: "turnCompleted",
+      nativeTurnId,
+      outcome,
+      finalText: finalText || undefined,
+    });
+    this.#activeNativeTurnId = null;
+    this.#turnStartedEmitted = false;
   }
 
   /**
@@ -577,7 +665,10 @@ export class HermesLhcAdapter implements ProviderAdapter {
     this.#unsub = null;
     this.#transport = null;
     this.#child = null;
-    this.#nativeThreadRef = null;
+    this.#sessionKey = null;
+    this.#liveSid = null;
+    this.#startState = null;
+    this.#pendingSubmit = null;
     this.#activeNativeTurnId = null;
     this.#turnStartedEmitted = false;
     this.#stopping = false;
@@ -595,6 +686,62 @@ export class HermesLhcAdapter implements ProviderAdapter {
     }
     this.#pending.clear();
   }
+}
+
+function nonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value ? value : null;
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+/**
+ * Typed start state from the gateway's own resume payload. Idle is claimed
+ * only when the payload affirms it on every axis it reports activity on:
+ * `running` false, no retained `inflight` turn snapshot, `status` "idle", and
+ * no scheduled `auto_continue`. A payload that omits or garbles those fields
+ * proves nothing and stays unproven — resume of a mid-run or auto-continuing
+ * session must never be presented as an idle attach.
+ */
+export function resumeStartState(result: Record<string, unknown>): AdapterStartState {
+  const reasons: string[] = [];
+  if (result.running !== false) {
+    reasons.push(
+      result.running === true
+        ? "resume reported a running run loop"
+        : "resume payload did not affirm running=false",
+    );
+  }
+  if (result.inflight !== null) {
+    reasons.push(
+      result.inflight === undefined
+        ? "resume payload did not affirm inflight=null"
+        : "resume retained an inflight turn snapshot",
+    );
+  }
+  if (result.auto_continue !== undefined) {
+    reasons.push("resume scheduled an auto_continue turn");
+  }
+  const status = nonEmptyString(result.status);
+  if (status !== "idle") {
+    reasons.push(
+      status ? `resume status is '${status}', not idle` : "resume payload carried no status",
+    );
+  }
+  if (reasons.length === 0) return { kind: "idle" };
+  return {
+    kind: "unproven",
+    reasons,
+    evidence: {
+      running: result.running ?? null,
+      inflight: result.inflight ?? null,
+      status: result.status ?? null,
+      auto_continue: result.auto_continue ?? null,
+    },
+  };
 }
 
 /**

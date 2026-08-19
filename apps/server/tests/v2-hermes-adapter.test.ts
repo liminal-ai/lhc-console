@@ -6,13 +6,20 @@ import { describe, expect, it } from "vite-plus/test";
 import type { AdapterStartInput, ProviderNotification } from "../src/v2/adapter.ts";
 import { CodexLhcAdapter } from "../src/v2/adapters/codex-lhc.ts";
 import { createProviderAdapter } from "../src/v2/adapters/factory.ts";
-import { correlateHermesNativeTurnId, HermesLhcAdapter } from "../src/v2/adapters/hermes-lhc.ts";
+import {
+  correlateHermesNativeTurnId,
+  HermesLhcAdapter,
+  resumeStartState,
+} from "../src/v2/adapters/hermes-lhc.ts";
 import { PiLhcAdapter } from "../src/v2/adapters/pi-lhc.ts";
 import { V2_PROVIDERS, type V2Provider } from "../src/v2/contract.ts";
 import { MemoryJsonlPair } from "../src/v2/jsonl-transport.ts";
 import type { HeldWriterLock } from "../src/v2/writer-lock.ts";
 
-const RESOLVED_STEM = "20260819_010203_abcdef";
+/** Durable stored-session key (thread-file stem) the gateway resumes. */
+const SESSION_KEY = "20260819_010203_abcdef";
+/** Ephemeral live gateway-session id minted per resume (8 hex chars). */
+const LIVE_SID = "ab12cd34";
 
 function startInput(overrides: Partial<AdapterStartInput> = {}): AdapterStartInput {
   return {
@@ -27,60 +34,112 @@ function startInput(overrides: Partial<AdapterStartInput> = {}): AdapterStartInp
 }
 
 /**
- * In-memory Hermes gateway fixture over the real JSONL codec: JSON-RPC 2.0
- * requests in, `{"method":"event","params":{type,...}}` frames out, with
- * `gateway.ready` as the first frame (sent by the test via `ready()` once the
- * adapter is listening). `manualTurn` accepts prompt.submit without streaming
- * the scripted event sequence, so tests can drive the turn frame by frame.
+ * The real `session.resume` payload shape emitted by `tui_gateway`
+ * (`methods_session.py`): an ephemeral `session_id` SID plus the durable
+ * `resumed`/`session_key` stored reference, with the idle affirmation fields
+ * (`running`, `inflight`, `status`).
+ */
+function resumeResult(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    session_id: LIVE_SID,
+    resumed: SESSION_KEY,
+    message_count: 0,
+    messages: [],
+    messages_omitted: false,
+    info: { cwd: "/tmp", model: "", provider: "", profile: "lhc-v2-test" },
+    inflight: null,
+    running: false,
+    session_key: SESSION_KEY,
+    started_at: "2026-08-19T00:00:00Z",
+    status: "idle",
+    ...overrides,
+  };
+}
+
+/**
+ * In-memory Hermes gateway fixture over the real JSONL codec, speaking the
+ * real wire shapes: JSON-RPC 2.0 requests in; event frames out as
+ * `{"jsonrpc":"2.0","method":"event","params":{type,session_id,payload}}`
+ * (`tui_gateway/server.py` `_event_frame`), with `gateway.ready` first
+ * (payload only, no session_id — `entry.py`). `manualTurn` accepts
+ * prompt.submit without streaming the scripted event sequence, so tests can
+ * drive the turn frame by frame.
  */
 function attachHermesGateway(
   pair: MemoryJsonlPair,
   options: {
-    resolvedSessionId?: string | null;
+    resume?: Record<string, unknown> | null;
     steerStatus?: string;
     manualTurn?: boolean;
     handle?: (message: Record<string, unknown>) => boolean;
   } = {},
-): { seen: Record<string, unknown>[]; ready: () => void; event: (params: unknown) => void } {
+): {
+  seen: Record<string, unknown>[];
+  ready: () => void;
+  event: (type: string, payload?: unknown, sid?: string) => void;
+} {
   const seen: Record<string, unknown>[] = [];
-  const event = (params: unknown) => pair.server.send({ method: "event", params });
+  const event = (type: string, payload?: unknown, sid: string = LIVE_SID) => {
+    const params: Record<string, unknown> = { type, session_id: sid };
+    if (payload !== undefined) params.payload = payload;
+    pair.server.send({ jsonrpc: "2.0", method: "event", params });
+  };
   pair.server.onLine((line) => {
     const message = JSON.parse(line) as Record<string, unknown>;
     seen.push(message);
     if (options.handle?.(message)) return;
     if (message.method === "session.resume") {
-      const resolved =
-        options.resolvedSessionId === undefined ? RESOLVED_STEM : options.resolvedSessionId;
       pair.server.send({
+        jsonrpc: "2.0",
         id: message.id,
-        result: resolved ? { session_id: resolved, sid: "aa11bb22" } : { sid: "aa11bb22" },
+        result: options.resume === undefined ? resumeResult() : (options.resume ?? {}),
       });
       return;
     }
     if (message.method === "prompt.submit") {
-      pair.server.send({ id: message.id, result: { status: "streaming" } });
+      pair.server.send({ jsonrpc: "2.0", id: message.id, result: { status: "streaming" } });
       if (options.manualTurn) return;
-      event({ type: "message.start" });
-      event({ type: "message.delta", text: "hel" });
-      event({ type: "message.delta", text: "lo" });
-      event({ type: "reasoning.available" });
-      event({ type: "tool.start", tool_id: "t1", name: "bash", context: "ls" });
-      event({ type: "tool.complete", tool_id: "t1", name: "bash", args: {}, summary: "ok" });
-      event({ type: "status.update", kind: "compacting", text: "compacting" });
-      event({ type: "session.usage", tokens: 12 });
-      event({ type: "message.complete", text: "hello", usage: {}, status: "complete" });
+      event("message.start");
+      event("message.delta", { text: "hel" });
+      event("message.delta", { text: "lo" });
+      event("reasoning.available", { text: "thinking…" });
+      event("tool.start", { tool_id: "t1", name: "bash", context: "ls", args: { cmd: "ls" } });
+      event("tool.complete", {
+        tool_id: "t1",
+        name: "bash",
+        args: { cmd: "ls" },
+        result: "ok",
+        summary: "ok",
+        duration_s: 0.2,
+      });
+      event("status.update", { kind: "compacting", text: "compacting" });
+      event("session.usage", { tokens: 12 });
+      event("message.complete", { text: "hello", usage: {}, status: "complete" });
       return;
     }
     if (message.method === "session.steer") {
-      pair.server.send({ id: message.id, result: { status: options.steerStatus ?? "queued" } });
+      pair.server.send({
+        jsonrpc: "2.0",
+        id: message.id,
+        result: { status: options.steerStatus ?? "queued" },
+      });
       return;
     }
     if (message.method === "session.interrupt") {
-      pair.server.send({ id: message.id, result: {} });
-      event({ type: "message.complete", text: "", usage: {}, status: "interrupted" });
+      pair.server.send({ jsonrpc: "2.0", id: message.id, result: {} });
+      event("message.complete", { text: "", usage: {}, status: "interrupted" });
     }
   });
-  return { seen, ready: () => event({ type: "gateway.ready" }), event };
+  return {
+    seen,
+    ready: () =>
+      pair.server.send({
+        jsonrpc: "2.0",
+        method: "event",
+        params: { type: "gateway.ready", payload: { skin: "default", change_events: true } },
+      }),
+    event,
+  };
 }
 
 async function startedAdapter(
@@ -89,7 +148,7 @@ async function startedAdapter(
 ): Promise<{
   adapter: HermesLhcAdapter;
   seen: Record<string, unknown>[];
-  event: (params: unknown) => void;
+  event: (type: string, payload?: unknown, sid?: string) => void;
   events: ProviderNotification[];
 }> {
   const pair = new MemoryJsonlPair();
@@ -139,7 +198,11 @@ function fakeHermesChild(
   // Anything the "worker" writes before its ready frame — including garbage —
   // is buffered by the PassThrough until the adapter's readline attaches.
   for (const line of options.prelude ?? []) stdout.write(`${line}\n`);
-  send({ method: "event", params: { type: "gateway.ready" } });
+  send({
+    jsonrpc: "2.0",
+    method: "event",
+    params: { type: "gateway.ready", payload: { skin: "default", change_events: true } },
+  });
   const rl = createInterface({ input: stdin }) as unknown as EventEmitter;
   rl.on("line", (line: string) => {
     const trimmed = line.trim();
@@ -147,6 +210,11 @@ function fakeHermesChild(
     respond(JSON.parse(trimmed) as Record<string, unknown>, send);
   });
   return child;
+}
+
+/** Wait past the adapter's setImmediate replay of pre-response events. */
+function afterReplay(): Promise<void> {
+  return new Promise((resolve) => setImmediate(() => setImmediate(resolve)));
 }
 
 describe("provider adapter factory", () => {
@@ -180,7 +248,7 @@ describe("Hermes V2 JSON-RPC fixture", () => {
     await expect(adapter.start(startInput({ env: {} }))).rejects.toThrow(/HERMES_HOME/);
   });
 
-  it("waits gateway.ready, resumes, records the RESOLVED session id, and never sends profile", async () => {
+  it("separates the durable session_key from the ephemeral SID and never sends profile", async () => {
     let proved: { native: string; canonical: string } | null = null;
     const { adapter, seen } = await startedAdapter(
       {},
@@ -191,9 +259,12 @@ describe("Hermes V2 JSON-RPC fixture", () => {
         },
       },
     );
-    // The resolved id from the continuation chain binds, not the asked-for id.
-    expect((await adapter.getState()).nativeThreadRef).toBe(RESOLVED_STEM);
-    expect(proved).toEqual({ native: RESOLVED_STEM, canonical: "th_hermes" });
+    const state = await adapter.getState();
+    // The durable resumed/session_key reference is the identity that binds…
+    expect(state.nativeThreadRef).toBe(SESSION_KEY);
+    expect(proved).toEqual({ native: SESSION_KEY, canonical: "th_hermes" });
+    // …while the ephemeral SID is only the RPC handle.
+    expect(state.liveSessionId).toBe(LIVE_SID);
     const resume = seen.find((message) => message.method === "session.resume")!;
     expect(resume.params).toEqual({ session_id: "20260801_000000_parent" });
     // O4: HERMES_HOME is the single binding; the RPC profile param is never passed.
@@ -202,13 +273,41 @@ describe("Hermes V2 JSON-RPC fixture", () => {
     }
   });
 
-  it("refuses start when the resume response carries no resolved session id", async () => {
+  it("addresses every post-resume RPC by the live SID, not the durable key", async () => {
+    const { adapter, seen, event } = await startedAdapter({ manualTurn: true });
+    const native = await adapter.startTurn("hello");
+    event("message.start");
+    await adapter.steer(native, "nudge");
+    await adapter.interrupt(native);
+    const rpcSids = seen
+      .filter((m) =>
+        ["prompt.submit", "session.steer", "session.interrupt"].includes(m.method as string),
+      )
+      .map((m) => (m.params as Record<string, unknown>).session_id);
+    expect(rpcSids.length).toBeGreaterThanOrEqual(3);
+    for (const sid of rpcSids) expect(sid).toBe(LIVE_SID);
+  });
+
+  it("refuses start when the resume response carries no live session_id", async () => {
     const pair = new MemoryJsonlPair();
-    const gateway = attachHermesGateway(pair, { resolvedSessionId: null });
+    const gateway = attachHermesGateway(pair, {
+      resume: resumeResult({ session_id: undefined }),
+    });
     const adapter = new HermesLhcAdapter({ transport: pair.client });
     const started = adapter.start(startInput());
     gateway.ready();
-    await expect(started).rejects.toThrow(/no resolved session id/);
+    await expect(started).rejects.toThrow(/no live session_id/);
+  });
+
+  it("refuses start when the resume response carries no durable resumed/session_key", async () => {
+    const pair = new MemoryJsonlPair();
+    const gateway = attachHermesGateway(pair, {
+      resume: resumeResult({ resumed: undefined, session_key: undefined }),
+    });
+    const adapter = new HermesLhcAdapter({ transport: pair.client });
+    const started = adapter.start(startInput());
+    gateway.ready();
+    await expect(started).rejects.toThrow(/no durable resumed\/session_key/);
   });
 
   it("refuses string-equality identity when no canonical prover is supplied", async () => {
@@ -220,7 +319,7 @@ describe("Hermes V2 JSON-RPC fixture", () => {
     await expect(started).rejects.toThrow(/no canonical identity prover/);
   });
 
-  it("refuses start when the canonical proof rejects the resolved session", async () => {
+  it("refuses start when the canonical proof rejects the resumed session", async () => {
     const pair = new MemoryJsonlPair();
     const gateway = attachHermesGateway(pair);
     const adapter = new HermesLhcAdapter({ transport: pair.client });
@@ -235,9 +334,41 @@ describe("Hermes V2 JSON-RPC fixture", () => {
     await expect(adapter.start(startInput())).rejects.toThrow(/gateway\.ready within 50ms/);
   });
 
+  it("claims idle start evidence only from an affirmatively idle resume payload", async () => {
+    const { adapter } = await startedAdapter();
+    expect(adapter.startEvidence()).toEqual({ kind: "idle" });
+  });
+
+  it.each([
+    ["running run loop", { running: true, status: "streaming" }, /running run loop/],
+    ["retained inflight turn", { inflight: { user: "hi" } }, /inflight turn snapshot/],
+    ["scheduled auto_continue", { auto_continue: { delay_s: 1 } }, /auto_continue/],
+    ["missing idle affirmation", { running: undefined, status: undefined }, /did not affirm/],
+  ] as const)(
+    "surfaces %s as unproven start evidence, never idle",
+    async (_label, overrides, pattern) => {
+      const { adapter } = await startedAdapter({
+        resume: resumeResult(overrides as Record<string, unknown>),
+      });
+      const evidence = adapter.startEvidence();
+      expect(evidence.kind).toBe("unproven");
+      if (evidence.kind === "unproven") {
+        expect(evidence.reasons.join("; ")).toMatch(pattern);
+        expect(evidence.evidence).toHaveProperty("running");
+      }
+    },
+  );
+
+  it("typed resume start-state helper is honest about each uncertainty axis", () => {
+    expect(resumeStartState(resumeResult())).toEqual({ kind: "idle" });
+    const unproven = resumeStartState(resumeResult({ running: true, status: "streaming" }));
+    expect(unproven.kind).toBe("unproven");
+  });
+
   it("mints hermes-rpc turn ids from generation and request id and maps the event stream", async () => {
     const { adapter, events } = await startedAdapter({}, { runtimeGeneration: 7 });
     const native = await adapter.startTurn("hello");
+    await afterReplay();
     expect(native).toMatch(/^hermes-rpc:7:\d+$/);
     expect(native).toBe(correlateHermesNativeTurnId(7, native.split(":")[2]!));
     const kinds = events.map((event) => event.type);
@@ -246,10 +377,15 @@ describe("Hermes V2 JSON-RPC fixture", () => {
     const items = events.filter(
       (event): event is Extract<ProviderNotification, { type: "item" }> => event.type === "item",
     );
-    // tool.start + tool.complete both surface as tool items.
-    expect(items.filter((item) => item.item.type === "tool")).toHaveLength(2);
-    // reasoning + status.update + unrecognized session.usage surface as other items.
-    expect(items.filter((item) => item.item.type === "other").length).toBeGreaterThanOrEqual(3);
+    // tool.start + tool.complete both surface as tool items, named from payload.
+    const tools = items.filter((item) => item.item.type === "tool");
+    expect(tools).toHaveLength(2);
+    expect(tools[0]!.item.text).toBe("bash");
+    expect(tools[0]!.item.nativeItemId).toBe("t1");
+    // reasoning + status.update kind + unrecognized session.usage surface as other items.
+    const others = items.filter((item) => item.item.type === "other");
+    expect(others.length).toBeGreaterThanOrEqual(3);
+    expect(others.some((item) => item.item.text === "compacting")).toBe(true);
     const completed = events.find(
       (event): event is Extract<ProviderNotification, { type: "turnCompleted" }> =>
         event.type === "turnCompleted",
@@ -260,13 +396,64 @@ describe("Hermes V2 JSON-RPC fixture", () => {
     expect(items.some((item) => item.item.text === "hel")).toBe(false);
   });
 
-  it("falls back to accumulated deltas when message.complete carries no text", async () => {
+  it("settles a turn whose events all beat the prompt.submit response", async () => {
+    // The gateway runs turns on a daemon thread: the terminal frame can hit
+    // the wire before the RPC response. Nothing may be dropped and the
+    // adapter must not stay active.
+    const pair = new MemoryJsonlPair();
+    const gateway = attachHermesGateway(pair, {
+      handle: (message) => {
+        if (message.method !== "prompt.submit") return false;
+        gateway.event("message.start");
+        gateway.event("message.delta", { text: "fast" });
+        gateway.event("message.complete", { text: "fast", usage: {}, status: "complete" });
+        pair.server.send({ jsonrpc: "2.0", id: message.id, result: { status: "streaming" } });
+        return true;
+      },
+    });
+    const adapter = new HermesLhcAdapter({ transport: pair.client });
+    const events: ProviderNotification[] = [];
+    adapter.on((event) => events.push(event));
+    const started = adapter.start(startInput());
+    gateway.ready();
+    await started;
+    const native = await adapter.startTurn("quick");
+    // Buffered events replay only after the caller's post-await continuation.
+    expect(events.some((e) => e.type === "turnCompleted")).toBe(false);
+    await afterReplay();
+    const kinds = events.map((e) => e.type);
+    expect(kinds).toContain("turnStarted");
+    const completed = events.find(
+      (e): e is Extract<ProviderNotification, { type: "turnCompleted" }> =>
+        e.type === "turnCompleted",
+    )!;
+    expect(completed).toMatchObject({ nativeTurnId: native, outcome: "completed" });
+    expect(completed.finalText).toBe("fast");
+    expect((await adapter.getState()).activeNativeTurnId).toBeNull();
+  });
+
+  it("ignores events addressed to a foreign gateway session", async () => {
     const { adapter, events, event } = await startedAdapter({ manualTurn: true });
     const native = await adapter.startTurn("hi");
-    event({ type: "message.start" });
-    event({ type: "message.delta", text: "streamed " });
-    event({ type: "message.delta", text: "answer" });
-    event({ type: "message.complete", usage: {}, status: "complete" });
+    event("message.start");
+    // A different SID's terminal frame must not close our turn.
+    event("message.complete", { text: "not ours", status: "complete" }, "ffff0000");
+    expect(events.some((e) => e.type === "turnCompleted")).toBe(false);
+    event("message.complete", { text: "ours", usage: {}, status: "complete" });
+    const completed = events.find(
+      (e): e is Extract<ProviderNotification, { type: "turnCompleted" }> =>
+        e.type === "turnCompleted",
+    )!;
+    expect(completed).toMatchObject({ nativeTurnId: native, finalText: "ours" });
+  });
+
+  it("falls back to accumulated payload deltas when message.complete carries no text", async () => {
+    const { adapter, events, event } = await startedAdapter({ manualTurn: true });
+    const native = await adapter.startTurn("hi");
+    event("message.start");
+    event("message.delta", { text: "streamed " });
+    event("message.delta", { text: "answer" });
+    event("message.complete", { usage: {}, status: "complete" });
     const completed = events.find(
       (e): e is Extract<ProviderNotification, { type: "turnCompleted" }> =>
         e.type === "turnCompleted",
@@ -279,6 +466,7 @@ describe("Hermes V2 JSON-RPC fixture", () => {
     const { adapter, events, seen } = await startedAdapter();
     await expect(adapter.steer("hermes-rpc:0:999", "early")).resolves.toBe("mismatch");
     const native = await adapter.startTurn("go");
+    await afterReplay();
     // Fixture settles the turn synchronously — a steer after the terminal
     // frame is a mismatch, not a queued lie.
     await expect(adapter.steer(native, "late")).resolves.toBe("mismatch");
@@ -289,24 +477,24 @@ describe("Hermes V2 JSON-RPC fixture", () => {
   it("emits steerQueued on a queued steer of the live turn", async () => {
     const { adapter, events, event } = await startedAdapter({ manualTurn: true });
     const native = await adapter.startTurn("long");
-    event({ type: "message.start" });
+    event("message.start");
     await expect(adapter.steer(native, "nudge")).resolves.toBe("ok");
     expect(events.some((e) => e.type === "steerQueued" && e.nativeTurnId === native)).toBe(true);
-    event({ type: "message.complete", text: "done", usage: {}, status: "complete" });
+    event("message.complete", { text: "done", usage: {}, status: "complete" });
   });
 
   it("maps a rejected steer status to mismatch", async () => {
     const { adapter, event } = await startedAdapter({ manualTurn: true, steerStatus: "rejected" });
     const native = await adapter.startTurn("long");
-    event({ type: "message.start" });
+    event("message.start");
     await expect(adapter.steer(native, "nudge")).resolves.toBe("mismatch");
-    event({ type: "message.complete", text: "", usage: {}, status: "complete" });
+    event("message.complete", { text: "", usage: {}, status: "complete" });
   });
 
   it("interrupt settles the turn through the terminal interrupted frame", async () => {
     const { adapter, events, event } = await startedAdapter({ manualTurn: true });
     const native = await adapter.startTurn("long");
-    event({ type: "message.start" });
+    event("message.start");
     await adapter.interrupt(native);
     const completed = events.find((e) => e.type === "turnCompleted");
     expect(completed).toMatchObject({ nativeTurnId: native, outcome: "interrupted" });
@@ -315,22 +503,54 @@ describe("Hermes V2 JSON-RPC fixture", () => {
   it("maps an error-status terminal frame to a failed outcome, exactly once", async () => {
     const { adapter, events, event } = await startedAdapter({ manualTurn: true });
     await adapter.startTurn("doomed");
-    event({ type: "message.start" });
-    event({ type: "message.complete", text: "partial", usage: {}, status: "error" });
+    event("message.start");
+    event("message.complete", {
+      text: "partial",
+      usage: {},
+      status: "error",
+      error: "provider 500",
+      recoverable: true,
+    });
     // A duplicate terminal frame after the turn closed must not double-settle.
-    event({ type: "message.complete", text: "partial", usage: {}, status: "error" });
+    event("message.complete", { text: "partial", usage: {}, status: "error" });
     const completed = events.filter((e) => e.type === "turnCompleted");
     expect(completed).toHaveLength(1);
     expect(completed[0]).toMatchObject({ outcome: "failed", finalText: "partial" });
   });
 
+  it("closes a turn the gateway abandons with a bare error event as failed", async () => {
+    // methods_prompt.py's cancel-before-ready path emits `error` and never a
+    // message.complete; the turn must not hang open.
+    const { adapter, events, event } = await startedAdapter({ manualTurn: true });
+    const native = await adapter.startTurn("doomed");
+    event("error", { message: "Turn cancelled before the agent was ready" });
+    const completed = events.find(
+      (e): e is Extract<ProviderNotification, { type: "turnCompleted" }> =>
+        e.type === "turnCompleted",
+    )!;
+    expect(completed).toMatchObject({ nativeTurnId: native, outcome: "failed" });
+    expect((await adapter.getState()).activeNativeTurnId).toBeNull();
+  });
+
+  it("reports an unrecognized terminal status as indeterminate, never completed", async () => {
+    const { adapter, events, event } = await startedAdapter({ manualTurn: true });
+    await adapter.startTurn("odd");
+    event("message.start");
+    event("message.complete", { text: "??", usage: {}, status: "paused" });
+    const completed = events.find(
+      (e): e is Extract<ProviderNotification, { type: "turnCompleted" }> =>
+        e.type === "turnCompleted",
+    )!;
+    expect(completed.outcome).toBe("indeterminate");
+  });
+
   it("refuses a second prompt.submit while a turn is active", async () => {
     const { adapter, seen, event } = await startedAdapter({ manualTurn: true });
     await adapter.startTurn("first");
-    event({ type: "message.start" });
+    event("message.start");
     await expect(adapter.startTurn("second")).rejects.toThrow(/while a turn is active/);
     expect(seen.filter((message) => message.method === "prompt.submit")).toHaveLength(1);
-    event({ type: "message.complete", text: "", usage: {}, status: "complete" });
+    event("message.complete", { text: "", usage: {}, status: "complete" });
   });
 
   it("classifies gateway app errors by code, never wording", async () => {
@@ -339,7 +559,11 @@ describe("Hermes V2 JSON-RPC fixture", () => {
     const gateway = attachHermesGateway(pair, {
       handle: (message) => {
         if (message.method !== "prompt.submit") return false;
-        pair.server.send({ id: message.id, error: { code, message: `app error ${code}` } });
+        pair.server.send({
+          jsonrpc: "2.0",
+          id: message.id,
+          error: { code, message: `app error ${code}` },
+        });
         return true;
       },
     });
@@ -381,21 +605,30 @@ describe("Hermes V2 JSON-RPC fixture", () => {
         fakeHermesChild(
           (message, send) => {
             if (message.method === "session.resume") {
-              send({ id: message.id, result: { session_id: RESOLVED_STEM } });
+              send({ jsonrpc: "2.0", id: message.id, result: resumeResult() });
             }
             if (message.method === "prompt.submit") {
-              send({ id: message.id, result: { status: "streaming" } });
-              send({ method: "event", params: { type: "message.start" } });
+              send({ jsonrpc: "2.0", id: message.id, result: { status: "streaming" } });
               send({
+                jsonrpc: "2.0",
                 method: "event",
-                params: { type: "message.complete", text: "ok", status: "complete" },
+                params: { type: "message.start", session_id: LIVE_SID },
+              });
+              send({
+                jsonrpc: "2.0",
+                method: "event",
+                params: {
+                  type: "message.complete",
+                  session_id: LIVE_SID,
+                  payload: { text: "ok", usage: {}, status: "complete" },
+                },
               });
             }
           },
           { prelude: ["this is not json {", '"a bare json string"', '{"method":"noise"}'] },
         ),
     });
-    await expect(adapter.start(startInput())).resolves.toBe(RESOLVED_STEM);
+    await expect(adapter.start(startInput())).resolves.toBe(SESSION_KEY);
     await expect(adapter.startTurn("still works")).resolves.toMatch(/^hermes-rpc:/);
     await adapter.stop("kill");
   });
@@ -409,7 +642,7 @@ describe("Hermes V2 JSON-RPC fixture", () => {
     } = {};
     const lock = {
       resourceKey: "rk",
-      fenceName: " lhc-v2-writer.rk",
+      fenceName: " lhc-v2-writer.rk",
       ownerPath: "/tmp/rk.owner",
       token: "tok",
       ownerPid: 1,
@@ -424,12 +657,12 @@ describe("Hermes V2 JSON-RPC fixture", () => {
         spawned.writerLock = options.writerLock ?? null;
         return fakeHermesChild((message, send) => {
           if (message.method === "session.resume") {
-            send({ id: message.id, result: { session_id: RESOLVED_STEM } });
+            send({ jsonrpc: "2.0", id: message.id, result: resumeResult() });
           }
         });
       },
     });
-    await expect(adapter.start(startInput({ writerLock: lock }))).resolves.toBe(RESOLVED_STEM);
+    await expect(adapter.start(startInput({ writerLock: lock }))).resolves.toBe(SESSION_KEY);
     expect(spawned.command).toBe("python");
     expect(spawned.args).toEqual(["-m", "tui_gateway.entry"]);
     expect(spawned.writerLock).toBe(lock);
@@ -447,7 +680,7 @@ describe("Hermes V2 JSON-RPC fixture", () => {
       spawnProcess: () =>
         fakeHermesChild((message, send) => {
           if (message.method === "session.resume") {
-            send({ id: message.id, result: { session_id: RESOLVED_STEM } });
+            send({ jsonrpc: "2.0", id: message.id, result: resumeResult() });
           }
           // prompt.submit deliberately never answered: the worker dies mid-line
         }),

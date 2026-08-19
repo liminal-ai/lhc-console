@@ -76,10 +76,21 @@ const HOME_OVERRIDES: Record<string, string[]> = {
   "codex-lhc": [".codex", "lhc"],
 };
 
-function homeFor(id: string): string {
+function homeFor(id: string, homeOverride?: string | null): string {
+  if (typeof homeOverride === "string" && homeOverride.trim()) return homeOverride.trim();
   const envKey = `${id.toUpperCase().replace(/-/g, "_")}_HOME`;
   const override = HOME_OVERRIDES[id];
   return process.env[envKey] ?? join(homedir(), ...(override ?? [`.${id}`]));
+}
+
+export interface DescribeHostOptions {
+  /**
+   * Caller-supplied host home for this one lookup, taking precedence over the
+   * process-global `<ID>_HOME` env var. A Console V2 hermes target binds a
+   * disposable per-target HERMES_HOME; reading that target's canonical store
+   * through the Console process's own env would inspect the wrong profile.
+   */
+  homeOverride?: string | null;
 }
 
 /**
@@ -107,8 +118,8 @@ function hermesRoots(home: string): ScanRoot[] {
   return roots;
 }
 
-export function describeHost(id: string): HostDescriptor {
-  const home = homeFor(id);
+export function describeHost(id: string, options: DescribeHostOptions = {}): HostDescriptor {
+  const home = homeFor(id, options.homeOverride);
   if ((SCAN_HOST_IDS as readonly string[]).includes(id)) {
     const scanRoots = hermesRoots(home);
     return {
@@ -137,7 +148,7 @@ export function describeHost(id: string): HostDescriptor {
 /** Hosts that are actually present on this machine. */
 export function discoverHosts(): HostDescriptor[] {
   return [...REGISTRY_HOST_IDS, ...SCAN_HOST_IDS]
-    .map(describeHost)
+    .map((id) => describeHost(id))
     .filter((h) =>
       h.kind === "registry"
         ? !!h.registryPath && existsSync(h.registryPath)

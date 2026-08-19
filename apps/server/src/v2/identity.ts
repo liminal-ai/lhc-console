@@ -53,8 +53,27 @@ export function writerResourceKey(hostHome: string, canonicalThreadId: string): 
   return createHash("sha256").update(`${hostHome}\0${canonicalThreadId}`).digest("hex");
 }
 
+/**
+ * Target-specific host-home override. Hermes is the only host whose home is a
+ * per-target binding (each V2 target owns a disposable HERMES_HOME in its
+ * env); Codex/Pi homes are machine-global and stay on the default resolution.
+ */
+export function hostHomeOverrideFor(agent: AgentRecord): string | null {
+  if (agent.relay.hostId !== "hermes") return null;
+  const home = agent.v2?.env?.HERMES_HOME ?? agent.relay.env?.HERMES_HOME;
+  return typeof home === "string" && home.trim() ? home.trim() : null;
+}
+
 export function resolveWriterResource(agent: AgentRecord): WriterResource {
-  const host = describeHost(agent.relay.hostId);
+  const homeOverride = hostHomeOverrideFor(agent);
+  if (agent.relay.hostId === "hermes" && !homeOverride) {
+    // Keying the fence off the Console process's own HERMES_HOME would fence
+    // (or fail to fence) a different profile than the one this target writes.
+    throw new WriterIdentityUnresolvedError(
+      `hermes target ${agent.id} declares no explicit HERMES_HOME; refusing to key the writer fence off the Console process home`,
+    );
+  }
+  const host = describeHost(agent.relay.hostId, { homeOverride });
   const canonicalThreadId = resolveCanonicalThreadId(agent);
   if (!host.home) {
     throw new WriterIdentityUnresolvedError(`host home unresolved for ${agent.relay.hostId}`);

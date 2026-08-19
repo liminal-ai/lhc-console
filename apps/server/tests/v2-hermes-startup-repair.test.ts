@@ -6,30 +6,30 @@ import { afterEach, describe, expect, it } from "vite-plus/test";
 import type { AgentRecord } from "../src/agent-registry.ts";
 import { HermesLhcAdapter } from "../src/v2/adapters/hermes-lhc.ts";
 import { inspectCanonicalSpan } from "../src/v2/canonical.ts";
+import { hostHomeOverrideFor, resolveWriterResource } from "../src/v2/identity.ts";
 import { MemoryJsonlPair } from "../src/v2/jsonl-transport.ts";
 import { RuntimeManager } from "../src/v2/manager.ts";
 import { TEST_ONLY_OWNER_POLICIES, testOnlyOwnerPolicies } from "../src/v2/policies.ts";
 import { V2Store } from "../src/v2/store.ts";
 
 /**
- * O1's deterministic half: the hermes thread file's stem is the gateway
- * session_key, so the resolved session id from `session.resume` must equal the
- * canonical store's own resume reference (`launchRecipe(thread).sessionRef`).
+ * O1's deterministic half: the hermes thread file's stem is the durable
+ * gateway session_key, so the `resumed`/`session_key` reference from
+ * `session.resume` must equal the canonical store's own resume reference
+ * (`launchRecipe(thread).sessionRef`). The ephemeral `session_id` SID minted
+ * per resume proves nothing and must never be used as identity.
  */
 const SESSION_STEM = "20260819_120000_a1b2c3";
 const FOREIGN_STEM = "20260819_130000_ffffff";
+const LIVE_SID = "ab12cd34";
 const CANONICAL_THREAD_ID = "th_hermes_startup_repair";
 const PROFILE = "lhc-v2-test";
 
 const dirs: string[] = [];
 const managers: RuntimeManager[] = [];
-let savedHermesHome: string | undefined;
 
 afterEach(() => {
   for (const manager of managers.splice(0)) manager.close();
-  if (savedHermesHome === undefined) delete process.env.HERMES_HOME;
-  else process.env.HERMES_HOME = savedHermesHome;
-  savedHermesHome = undefined;
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -37,7 +37,9 @@ afterEach(() => {
  * A real disposable hermes profile home: `profiles/<name>/lhc/threads/<stem>.sqlite`
  * in the exact per-profile layout `describeHost("hermes")` scans, identity
  * carried by the file's own `thread_metadata` row exactly as the LHC engine
- * writes it. The producer under test reads this store; nothing is stubbed.
+ * writes it. The producer under test reads this store; nothing is stubbed and
+ * the Console process's global HERMES_HOME is never consulted or mutated —
+ * the home travels as the target's own v2.env binding.
  */
 function hermesHome(): string {
   const dir = mkdtempSync(join(tmpdir(), "lhc-hermes-home-"));
@@ -81,8 +83,6 @@ function hermesHome(): string {
     INSERT INTO message_block VALUES ('m1', 0, 'text', 'hello');
   `);
   thread.close();
-  savedHermesHome = process.env.HERMES_HOME;
-  process.env.HERMES_HOME = dir;
   return dir;
 }
 
@@ -107,13 +107,37 @@ function hermesAgent(home: string): AgentRecord {
   };
 }
 
-/** A gateway fixture that resumes as `resolvedStem`, over the real JSONL codec. */
-function gateway(resolvedStem: string): MemoryJsonlPair {
+/**
+ * A gateway fixture answering `session.resume` with the real payload shape
+ * (`tui_gateway/methods_session.py`): ephemeral `session_id` SID plus durable
+ * `resumed`/`session_key`, with the idle-affirmation fields.
+ */
+function gateway(
+  resolvedStem: string,
+  resumeOverrides: Record<string, unknown> = {},
+): MemoryJsonlPair {
   const pair = new MemoryJsonlPair();
   pair.server.onLine((line) => {
     const message = JSON.parse(line) as Record<string, unknown>;
     if (message.method === "session.resume") {
-      pair.server.send({ id: message.id, result: { session_id: resolvedStem, sid: "ab12cd34" } });
+      pair.server.send({
+        jsonrpc: "2.0",
+        id: message.id,
+        result: {
+          session_id: LIVE_SID,
+          resumed: resolvedStem,
+          session_key: resolvedStem,
+          message_count: 1,
+          messages: [],
+          messages_omitted: true,
+          info: { cwd: "/tmp", profile: PROFILE },
+          inflight: null,
+          running: false,
+          started_at: "2026-08-19T00:00:00Z",
+          status: "idle",
+          ...resumeOverrides,
+        },
+      });
     }
   });
   return pair;
@@ -121,7 +145,8 @@ function gateway(resolvedStem: string): MemoryJsonlPair {
 
 /**
  * The real producer wired to the real consumer: `inspectCanonicalSpan` reads
- * the profile home above and `RuntimeManager` proves the resolved session
+ * the disposable profile home above (threaded per-target, never via the
+ * Console process env) and `RuntimeManager` proves the resumed session_key
  * against it. No hand-written `inspectCanonical` stands in for either side.
  */
 function managerOver(pair: MemoryJsonlPair, home: string): RuntimeManager {
@@ -160,7 +185,7 @@ async function submitStart(manager: RuntimeManager, pair: MemoryJsonlPair) {
 }
 
 describe("Hermes V2 startup: real canonical producer against the real manager proof", () => {
-  it("accepts a start whose resolved session is this canonical thread's resume stem", async () => {
+  it("accepts a start whose resumed session_key is this canonical thread's resume stem", async () => {
     const home = hermesHome();
     const pair = gateway(SESSION_STEM);
     const manager = managerOver(pair, home);
@@ -171,12 +196,16 @@ describe("Hermes V2 startup: real canonical producer against the real manager pr
     const status = manager.status("hermes-agent");
     expect(status.state).toBe("idle");
     expect(status.provider).toBe("hermes");
+    // Identity is the durable session_key, never the ephemeral SID.
     expect(status.thread.nativeThreadRef).toBe(SESSION_STEM);
     expect(status.thread.canonicalThreadId).toBe(CANONICAL_THREAD_ID);
     expect(status.capabilities.steerConsumption).toBe("unsupported");
+    // The proof ran against the target's disposable home, not whatever the
+    // Console process's global HERMES_HOME points at (unset or a real seat).
+    expect(process.env.HERMES_HOME ?? "").not.toBe(home);
   });
 
-  it("refuses a start whose resolved session is some other stem", async () => {
+  it("refuses a start whose resumed session_key is some other stem", async () => {
     const home = hermesHome();
     const pair = gateway(FOREIGN_STEM);
     const manager = managerOver(pair, home);
@@ -191,11 +220,43 @@ describe("Hermes V2 startup: real canonical producer against the real manager pr
     expect(manager.status("hermes-agent").thread.nativeThreadRef).toBe(null);
   });
 
+  it("refuses identity carried only by the ephemeral SID with no durable reference", async () => {
+    const home = hermesHome();
+    const pair = gateway(SESSION_STEM, { resumed: undefined, session_key: undefined });
+    const manager = managerOver(pair, home);
+
+    const receipt = await submitStart(manager, pair);
+
+    expect(receipt.state).toBe("rejected");
+    expect(receipt.reason).toBe("provider_unavailable");
+    expect(receipt.message).toMatch(/durable resumed\/session_key/);
+  });
+
+  it("marks an unproven-idle resume as unknown, never idle", async () => {
+    const home = hermesHome();
+    // The gateway resumed a session with a live run loop and a retained
+    // inflight turn (a mid-run reconnect); startup must surface that.
+    const pair = gateway(SESSION_STEM, {
+      running: true,
+      inflight: { user: "still going" },
+      status: "streaming",
+    });
+    const manager = managerOver(pair, home);
+
+    const receipt = await submitStart(manager, pair);
+
+    expect(receipt.state).toBe("applied");
+    const status = manager.status("hermes-agent");
+    expect(status.state).toBe("unknown");
+    expect(status.thread.nativeThreadRef).toBe(SESSION_STEM);
+  });
+
   it("carries the hermes stem as the host's own resume reference on success spans", async () => {
-    hermesHome();
+    const home = hermesHome();
     const inspected = await inspectCanonicalSpan({
       hostId: "hermes",
       canonicalThreadId: CANONICAL_THREAD_ID,
+      hostHome: home,
     });
     // sessionRef comes from launchRecipe(thread) — the host's own resume
     // recipe (`hermes --profile … --resume <stem>`), not a Console guess.
@@ -207,12 +268,37 @@ describe("Hermes V2 startup: real canonical producer against the real manager pr
   });
 
   it("leaves failure spans field-less so identity can never be inferred from them", async () => {
-    hermesHome();
+    const home = hermesHome();
     const missing = await inspectCanonicalSpan({
       hostId: "hermes",
       canonicalThreadId: "th_not_in_this_profile",
+      hostHome: home,
     });
     expect(missing.closed).toBe(false);
     expect(missing.span).toEqual({ reason: "thread_file_missing" });
+  });
+
+  it("keys the writer fence off the target's own disposable home, never the process home", () => {
+    const homeA = hermesHome();
+    const agentA = hermesAgent(homeA);
+    expect(hostHomeOverrideFor(agentA)).toBe(homeA);
+    const resourceA = resolveWriterResource(agentA);
+    expect(resourceA.hostHome).toBe(homeA);
+    // A second target with a different disposable home must land on a
+    // different fence key — same canonical id, different store.
+    const homeB = mkdtempSync(join(tmpdir(), "lhc-hermes-home-b-"));
+    dirs.push(homeB);
+    const resourceB = resolveWriterResource(hermesAgent(homeB));
+    expect(resourceB.key).not.toBe(resourceA.key);
+    // Codex/Pi targets carry no override and keep default home resolution.
+    expect(
+      hostHomeOverrideFor({ ...agentA, relay: { ...agentA.relay, hostId: "codex-lhc" } }),
+    ).toBeNull();
+  });
+
+  it("refuses to key a hermes writer fence without an explicit HERMES_HOME", () => {
+    const agent = hermesAgent(hermesHome());
+    const bare = { ...agent, v2: { provider: "hermes" as const } };
+    expect(() => resolveWriterResource(bare)).toThrow(/no explicit HERMES_HOME/);
   });
 });

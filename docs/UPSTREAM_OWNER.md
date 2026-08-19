@@ -10,12 +10,12 @@ for both forks** is owned by **codex-fork-steward**. Upstream owner stops at
 
 ## Approval model (Lee / CTO)
 
-| May continue **without** Lee | Requires **stop / escalate** | Requires **explicit Lee or CTO approval** |
-| --- | --- | --- |
-| Routine watch, assessment | Consequential **product** decisions | **Promotion** of a qualified exact artifact |
-| Compatible upstream sync + repair | Unsafe **history** changes (reset) | |
-| Handoff, candidate build, Linux smoke | Material **cost/risk** | |
-| | **Failed gates** (tripwire/smoke/qualify) | |
+| May continue **without** Lee          | Requires **stop / escalate**              | Requires **explicit Lee or CTO approval**   |
+| ------------------------------------- | ----------------------------------------- | ------------------------------------------- |
+| Routine watch, assessment             | Consequential **product** decisions       | **Promotion** of a qualified exact artifact |
+| Compatible upstream sync + repair     | Unsafe **history** changes (reset)        |                                             |
+| Handoff, candidate build, Linux smoke | Material **cost/risk**                    |                                             |
+|                                       | **Failed gates** (tripwire/smoke/qualify) |                                             |
 
 **Never automatic:** tag/publish/promote without the approval path below.
 Routine merge of compatible upstream is **not** blocked on Lee.
@@ -49,7 +49,8 @@ Console/relay **does not** bind `approval_id` into GitHub Actions
 **Smallest follow-up (not this change):** optional promote workflow input
 `approval_id` + job step that loads the store (or a checked-in attestation)
 and asserts digests match artifacts before publish — coordinate with console
-+ qualifier.
+
+- qualifier.
 
 ### After promote succeeds (Lee one-off)
 
@@ -66,13 +67,13 @@ python3 scripts/upstream-watch/release_notify.py lee-success \
   --limitations "Windows and macOS not published in this cut."
 ```
 
-| Rule | Detail |
-| --- | --- |
-| Timing | **After** public verify success — never before, never on PROMOTION_READY alone |
-| Content | Product/version; plain what-changed; published platform(s); material limitation/action if any |
-| Omit | Raw run IDs, digests, internal process (success path) |
-| Dedupe | Exact **fork + tag** in `dispatched.json` (`lee_release_success:…`) — retries do not double-message |
-| Failure verify | Optional `lee-failure` only if public verification failed |
+| Rule           | Detail                                                                                              |
+| -------------- | --------------------------------------------------------------------------------------------------- |
+| Timing         | **After** public verify success — never before, never on PROMOTION_READY alone                      |
+| Content        | Product/version; plain what-changed; published platform(s); material limitation/action if any       |
+| Omit           | Raw run IDs, digests, internal process (success path)                                               |
+| Dedupe         | Exact **fork + tag** in `dispatched.json` (`lee_release_success:…`) — retries do not double-message |
+| Failure verify | Optional `lee-failure` only if public verification failed                                           |
 
 Schemas (exact):
 
@@ -94,13 +95,13 @@ Fork product drills remain authoritative per tree:
 
 ## Roles
 
-| Role | Agent key | Responsibility |
-| --- | --- | --- |
-| Upstream owner | `grok-build-fork-steward` (interim host seat; duties cross-fork) | Watch, assess, sync drill, tripwire, **CANDIDATE_HANDOFF** for both forks |
-| Release qualifier | `codex-fork-steward` | **Qualify both forks**: handoff → candidate → smoke; record **PROMOTION_READY**; promote **only** after correlated approval |
-| Portfolio CTO | `cto` | Receives PROMOTION_READY; may async Lee; records approve/reject |
-| Lee | `lhc-agent lee` | Async one-way; may approve via operator running `promotion_ready.py approve --by lee` |
-| Control plane | `console` | Relay/monitors; not merge/promote authority |
+| Role              | Agent key                                                        | Responsibility                                                                                                              |
+| ----------------- | ---------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| Upstream owner    | `grok-build-fork-steward` (interim host seat; duties cross-fork) | Watch, assess, sync drill, tripwire, **CANDIDATE_HANDOFF** for both forks                                                   |
+| Release qualifier | `codex-fork-steward`                                             | **Qualify both forks**: handoff → candidate → smoke; record **PROMOTION_READY**; promote **only** after correlated approval |
+| Portfolio CTO     | `cto`                                                            | Receives PROMOTION_READY; may async Lee; records approve/reject                                                             |
+| Lee               | `lhc-agent lee`                                                  | Async one-way; may approve via operator running `promotion_ready.py approve --by lee`                                       |
+| Control plane     | `console`                                                        | Relay/monitors; not merge/promote authority                                                                                 |
 
 Registry live file: `~/.lhc-console/agents.json` (owner-only). Documented duty
 strings should match this split — see §Registry wording.
@@ -111,10 +112,10 @@ strings should match this split — see §Registry wording.
 
 Per fork file: `~/.lhc-console/upstream-watch/<fork-id>.json`
 
-| Key | Purpose |
-| --- | --- |
-| `last_seen_upstream_sha` | Last observed `upstream/main` tip |
-| `known_upstream_tags` | Stable set of upstream tag **names** already baselined |
+| Key                      | Purpose                                                |
+| ------------------------ | ------------------------------------------------------ |
+| `last_seen_upstream_sha` | Last observed `upstream/main` tip                      |
+| `known_upstream_tags`    | Stable set of upstream tag **names** already baselined |
 
 **Tag / release detection:** independent of tip movement. First successful
 `--update-state` run **baselines** all current remote tags with **no**
@@ -218,12 +219,12 @@ Preserve **distinct evidence** per fork (separate reports, separate handoffs).
 
 Unit files (not enabled by this change) — **all four**:
 
-| File | Role |
-| --- | --- |
-| `deploy/lhc-upstream-watch.service` | Daily oneshot |
-| `deploy/lhc-upstream-watch.timer` | Daily calendar |
-| `deploy/lhc-upstream-watch-weekly.service` | Weekly oneshot |
-| `deploy/lhc-upstream-watch-weekly.timer` | Weekly calendar |
+| File                                       | Role            |
+| ------------------------------------------ | --------------- |
+| `deploy/lhc-upstream-watch.service`        | Daily oneshot   |
+| `deploy/lhc-upstream-watch.timer`          | Daily calendar  |
+| `deploy/lhc-upstream-watch-weekly.service` | Weekly oneshot  |
+| `deploy/lhc-upstream-watch-weekly.timer`   | Weekly calendar |
 
 Proposed install (CTO) — copy **every** unit explicitly (do not rely on a
 partial glob that might miss weekly units):

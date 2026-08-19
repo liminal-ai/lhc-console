@@ -847,6 +847,7 @@ describe("review repairs: events, correlation, start rollback, delivery", () => 
       canonicalThreadId: "th_codex",
       cwd: "/tmp",
       approvalPolicy: "bypass-at-spawn",
+      proveCanonicalSession: async () => true,
     });
     await adapter.startTurn("hello");
     await expect(adapter.steer("codex-turn-1", "nudge")).resolves.toBe("ok");

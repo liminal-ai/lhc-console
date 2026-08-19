@@ -15,7 +15,9 @@ import {
   GRACEFUL_STOP_TIMEOUT_MS,
   KILL_SETTLE_TIMEOUT_MS,
   killHard,
+  StopUnprovenError,
   waitExitBounded,
+  type BoundedExit,
 } from "../stop-escalation.ts";
 import { spawnFencedChild, type HeldWriterLock } from "../writer-lock.ts";
 
@@ -163,9 +165,11 @@ export class CodexLhcAdapter implements ProviderAdapter {
           `codex-lhc native session ${native} does not map to configured canonical LHC thread ${input.canonicalThreadId}`,
         );
       }
-    } else if (native !== input.hostThreadId && native !== input.canonicalThreadId) {
+    } else {
+      // String equality between the native session id and the configured
+      // thread ids is not identity evidence; only a canonical-store proof is.
       throw new ProviderUnavailableError(
-        `codex-lhc native session ${native} does not map to configured canonical LHC thread ${input.canonicalThreadId}`,
+        `codex-lhc resume produced native session ${native} but no canonical identity prover was supplied; refusing string-equality identity for ${input.canonicalThreadId}`,
       );
     }
     this.#nativeThreadRef = native;
@@ -224,23 +228,52 @@ export class CodexLhcAdapter implements ProviderAdapter {
     });
   }
 
+  /**
+   * Every path is bounded, and `exited`/cleanup only ever follow an observed
+   * child exit. When even the post-SIGKILL settlement window passes without
+   * one, the child may still be alive, so this throws `StopUnprovenError` and
+   * retains child/transport state instead of inventing a stop.
+   */
   async stop(mode: V2StopMode): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
-    let exit: { code: number | null; signal: NodeJS.Signals | null };
-    if (mode === "kill" && this.#child?.pid) {
-      try {
-        process.kill(-this.#child.pid, "SIGKILL");
-      } catch {
-        this.#child.kill("SIGKILL");
-      }
-      exit = await this.#waitExit();
+    const child = this.#child;
+    let exit: BoundedExit;
+    if (!child) {
+      // Injected-transport session: no console-spawned process exists.
+      this.#transport?.close();
+      exit = { exited: true, code: 0, signal: null };
+    } else if (this.#childError && child.pid === undefined) {
+      // Spawn itself failed: no OS process ever existed, so there is no exit
+      // to observe and nothing that could still hold the thread.
+      exit = { exited: true, code: null, signal: null };
+    } else if (mode === "kill") {
+      killHard(child);
+      exit = await waitExitBounded(
+        child,
+        this.#options.killSettleTimeoutMs ?? KILL_SETTLE_TIMEOUT_MS,
+      );
     } else {
       this.#transport?.close();
-      this.#child?.kill("SIGTERM");
-      exit = await this.#waitExitEscalating();
+      child.kill("SIGTERM");
+      exit = await waitExitBounded(
+        child,
+        this.#options.gracefulStopTimeoutMs ?? GRACEFUL_STOP_TIMEOUT_MS,
+      );
+      if (!exit.exited) {
+        killHard(child);
+        exit = await waitExitBounded(
+          child,
+          this.#options.killSettleTimeoutMs ?? KILL_SETTLE_TIMEOUT_MS,
+        );
+      }
+    }
+    if (!exit.exited) {
+      throw new StopUnprovenError(
+        `codex-lhc child pid ${child?.pid ?? "unknown"} did not exit within the SIGKILL bound; child state retained, stop unproven`,
+      );
     }
     this.#cleanup();
     this.#emit({ type: "exited", code: exit.code, signal: exit.signal });
-    return exit;
+    return { code: exit.code, signal: exit.signal };
   }
 
   #spawn(input: AdapterStartInput): JsonlTransport {
@@ -473,43 +506,6 @@ export class CodexLhcAdapter implements ProviderAdapter {
 
   #emit(event: ProviderNotification): void {
     this.#events.emit("event", event);
-  }
-
-  async #waitExit(): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
-    if (!this.#child) return { code: 0, signal: null };
-    if (this.#child.exitCode !== null)
-      return { code: this.#child.exitCode, signal: this.#child.signalCode };
-    // A child that failed to spawn (no pid) will never emit "exit"; waiting
-    // on it would hang stop() forever.
-    if (this.#childError && this.#child.pid === undefined) return { code: null, signal: null };
-    return await new Promise((resolve) => {
-      (this.#child as unknown as EventEmitter).once(
-        "exit",
-        (code: number | null, signal: NodeJS.Signals | null) => resolve({ code, signal }),
-      );
-    });
-  }
-
-  /**
-   * Graceful-stop wait, bounded so a child that ignores EOF/SIGTERM cannot
-   * wedge the per-target command queue: escalate to SIGKILL after the grace
-   * window, then settle within a final bound even if "exit" never arrives.
-   */
-  async #waitExitEscalating(): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
-    const child = this.#child;
-    if (!child) return { code: 0, signal: null };
-    if (this.#childError && child.pid === undefined) return { code: null, signal: null };
-    const graceful = await waitExitBounded(
-      child,
-      this.#options.gracefulStopTimeoutMs ?? GRACEFUL_STOP_TIMEOUT_MS,
-    );
-    if (graceful.exited) return { code: graceful.code, signal: graceful.signal };
-    killHard(child);
-    const settled = await waitExitBounded(
-      child,
-      this.#options.killSettleTimeoutMs ?? KILL_SETTLE_TIMEOUT_MS,
-    );
-    return { code: settled.code, signal: settled.signal };
   }
 
   #cleanup(): void {

@@ -82,7 +82,7 @@ function summarize(
  * Which native session this canonical thread resumes as, taken from the host's
  * own resume recipe — the same `sessionRef` the host would resume by, so it is
  * host evidence rather than a Console guess. Consumers (the runtime manager's
- * canonical-session proof) read `nativeThreadRef`/`hostThreadId` from here, so
+ * canonical-session proof) accept only `nativeThreadRef` as identity, so
  * omitting a field must mean "unproven", never "not looked up": fields are
  * absent only when no thread record backs the file, or when the host has no
  * resume reference at all (a cc-lhc `--continue` fallback has none).

@@ -1,4 +1,5 @@
 import type { ChildProcess } from "node:child_process";
+import type { EventEmitter } from "node:events";
 
 /**
  * How long a graceful stop (drain/interrupt → EOF + SIGTERM) waits for the
@@ -13,6 +14,33 @@ export const GRACEFUL_STOP_TIMEOUT_MS = 5_000;
  * still refuse to die; stop() must resolve anyway with truthful evidence.
  */
 export const KILL_SETTLE_TIMEOUT_MS = 2_000;
+
+/**
+ * The exit-event surface adapters are allowed to touch on a child process.
+ *
+ * The configured TypeScript surface for `ChildProcess` does not expose its
+ * EventEmitter methods (`once`/`off`/`listenerCount`), so calling them on the
+ * `ChildProcess` type directly fails `vp check`. Every exit-event listen goes
+ * through this one seam; the cast lives here and nowhere else.
+ */
+export type ChildExitEvents = Pick<EventEmitter, "once" | "off" | "listenerCount">;
+
+export function childExitEvents(child: ChildProcess): ChildExitEvents {
+  return child as unknown as ChildExitEvents;
+}
+
+/**
+ * A stop that ran out its final SIGKILL bound without ever observing the
+ * child's "exit". The child may still be alive, so the adapter retains its
+ * child/transport state and never emits `exited`; callers must treat the
+ * runtime as unproven rather than stopped.
+ */
+export class StopUnprovenError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "StopUnprovenError";
+  }
+}
 
 export interface BoundedExit {
   /** True when the child actually emitted "exit" (or had already exited). */
@@ -31,16 +59,17 @@ export function waitExitBounded(child: ChildProcess, timeoutMs: number): Promise
   if (child.exitCode !== null || child.signalCode !== null) {
     return Promise.resolve({ exited: true, code: child.exitCode, signal: child.signalCode });
   }
+  const events = childExitEvents(child);
   return new Promise((resolve) => {
     const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
       clearTimeout(timer);
       resolve({ exited: true, code, signal });
     };
     const timer = setTimeout(() => {
-      child.off("exit", onExit);
+      events.off("exit", onExit);
       resolve({ exited: false, code: child.exitCode, signal: child.signalCode });
     }, timeoutMs);
-    child.once("exit", onExit);
+    events.once("exit", onExit);
   });
 }
 

@@ -5,6 +5,7 @@ import type { ChildProcess } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { CodexLhcAdapter } from "../src/v2/adapters/codex-lhc.ts";
 import { LHC_HANDOFF_QUIESCE_COMMAND, PiLhcAdapter } from "../src/v2/adapters/pi-lhc.ts";
+import { childExitEvents } from "../src/v2/stop-escalation.ts";
 
 // Outside any real pid range, so killHard's process-group SIGKILL can only
 // ever throw ESRCH instead of touching a real process group on this machine.
@@ -162,19 +163,32 @@ describe("Codex-LHC bounded stop escalation", () => {
     expect(exited).toContainEqual({ code: null, signal: "SIGKILL" });
   });
 
-  it("settles interrupt-mode stop within the final bound when even SIGKILL is ignored, leaking no timers or listeners", async () => {
+  it("rejects interrupt-mode stop within the final bound when even SIGKILL is ignored, retaining child state and emitting no exited", async () => {
     const fake = stubbornChild(codexResponder(true), { dieOnSigkill: false });
     const adapter = await startCodex(fake, {});
-    const exitListenersBefore = fake.child.listenerCount("exit");
+    const exited: unknown[] = [];
+    adapter.on((event) => {
+      if (event.type === "exited") exited.push(event);
+    });
+    const exitListenersBefore = childExitEvents(fake.child).listenerCount("exit");
     vi.useFakeTimers();
     const stopping = adapter.stop("interrupt");
+    const outcome = stopping.then(
+      () => null,
+      (error: Error) => error,
+    );
     await vi.advanceTimersByTimeAsync(5_000);
     expect(fake.killSignals).toEqual(["SIGTERM", "SIGKILL"]);
     await vi.advanceTimersByTimeAsync(2_000);
-    // Truthful evidence: no exit ever happened, so nothing is invented.
-    await expect(stopping).resolves.toEqual({ code: null, signal: null });
+    // No exit was ever observed, so stop must not claim one happened.
+    const error = await outcome;
+    expect(error?.name).toBe("StopUnprovenError");
+    expect(error?.message).toMatch(/did not exit within the SIGKILL bound/);
+    expect(exited).toEqual([]);
+    // Child state is retained for manager truth, not torn down as if stopped.
+    expect(adapter.pid()).toBe(IMPOSSIBLE_PID);
     expect(vi.getTimerCount()).toBe(0);
-    expect(fake.child.listenerCount("exit")).toBe(exitListenersBefore);
+    expect(childExitEvents(fake.child).listenerCount("exit")).toBe(exitListenersBefore);
   });
 });
 
@@ -191,18 +205,29 @@ describe("Pi-LHC bounded stop escalation", () => {
     await expect(hungRejected).resolves.toMatch(/runtime exited|runtime stopped/);
   });
 
-  it("settles drain-mode stop within the final bound when even SIGKILL is ignored, leaking no timers or listeners", async () => {
+  it("rejects drain-mode stop within the final bound when even SIGKILL is ignored, retaining child state and emitting no exited", async () => {
     const handshake = { done: false };
     const fake = stubbornChild(piResponder(handshake), { dieOnSigkill: false });
     const adapter = await startPi(fake, {});
-    const exitListenersBefore = fake.child.listenerCount("exit");
+    const exited: unknown[] = [];
+    adapter.on((event) => {
+      if (event.type === "exited") exited.push(event);
+    });
+    const exitListenersBefore = childExitEvents(fake.child).listenerCount("exit");
     vi.useFakeTimers();
     const stopping = adapter.stop("drain");
+    const outcome = stopping.then(
+      () => null,
+      (error: Error) => error,
+    );
     await vi.advanceTimersByTimeAsync(5_000);
     expect(fake.killSignals).toEqual(["SIGTERM", "SIGKILL"]);
     await vi.advanceTimersByTimeAsync(2_000);
-    await expect(stopping).resolves.toEqual({ code: null, signal: null });
+    const error = await outcome;
+    expect(error?.name).toBe("StopUnprovenError");
+    expect(exited).toEqual([]);
+    expect(adapter.pid()).toBe(IMPOSSIBLE_PID);
     expect(vi.getTimerCount()).toBe(0);
-    expect(fake.child.listenerCount("exit")).toBe(exitListenersBefore);
+    expect(childExitEvents(fake.child).listenerCount("exit")).toBe(exitListenersBefore);
   });
 });

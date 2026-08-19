@@ -708,13 +708,17 @@ export class RuntimeManager {
       } catch {
         killed = false;
       }
-      unsubscribe();
-      this.#live.delete(agent.id);
-      if (killed) releaseWriterLock(acquired.held);
+      if (killed) {
+        unsubscribe();
+        this.#live.delete(agent.id);
+        releaseWriterLock(acquired.held);
+      }
       // Only claim the start was rejected once the spawned writer is proved
       // gone. If the kill failed or the fence is still held, a writer may have
       // attached the thread, so the outcome stays indeterminate and the fence
-      // stays put rather than inviting a second writer.
+      // stays put rather than inviting a second writer. The live entry (and
+      // its event subscription) is retained on an unproven kill so that a
+      // later observed child exit can still settle ownership truthfully.
       if (!killed || isWriterLockHeld(this.#consoleHome, resource.key)) {
         const unresolved = this.#store.transaction(() => {
           this.#store.updateCommand(commandId, {
@@ -1282,20 +1286,31 @@ export class RuntimeManager {
     );
   }
 
+  /**
+   * The only accepted identity evidence is the canonical store's own resume
+   * reference from a successful, identity-bearing span. String equality
+   * between the native session id and the canonical thread id proves nothing
+   * (any host can hand back a matching-looking id), and a missing or failed
+   * span rejects even when the strings match.
+   */
   async #proveCanonicalSession(
     agent: AgentRecord,
     nativeThreadRef: string,
     canonicalThreadId: string,
   ): Promise<boolean> {
-    if (nativeThreadRef === canonicalThreadId) return true;
-    if (!this.#inspectCanonical) return false;
-    const inspected = await this.#inspectCanonical({
-      hostId: agent.relay.hostId,
-      canonicalThreadId,
-    });
+    if (!this.#inspectCanonical || !nativeThreadRef) return false;
+    let inspected: Awaited<ReturnType<V2CanonicalInspector>>;
+    try {
+      inspected = await this.#inspectCanonical({
+        hostId: agent.relay.hostId,
+        canonicalThreadId,
+      });
+    } catch {
+      return false;
+    }
     const evidence = inspected.span ?? {};
     return (
-      evidence.nativeThreadRef === nativeThreadRef || evidence.hostThreadId === nativeThreadRef
+      typeof evidence.nativeThreadRef === "string" && evidence.nativeThreadRef === nativeThreadRef
     );
   }
 

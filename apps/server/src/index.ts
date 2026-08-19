@@ -65,6 +65,16 @@ import { GoalService } from "./goal.ts";
 import { assertLegacyGoalsStartupSafe } from "./goal-migrate.ts";
 import { registerGoalRoutes } from "./goal-routes.ts";
 import { registerAgentRoutes } from "./agent-routes.ts";
+import { CodexLhcAdapter } from "./v2/adapters/codex-lhc.ts";
+import { PiLhcAdapter } from "./v2/adapters/pi-lhc.ts";
+import { inspectCanonicalSpan } from "./v2/canonical.ts";
+import { isV2Enabled, loadConfiguredOwnerPolicies, v2BearerToken, v2DbPath } from "./v2/config.ts";
+import { RuntimeManager } from "./v2/manager.ts";
+import { UnsettledOwnerPolicyError } from "./v2/policies.ts";
+import { registerV2Routes } from "./v2/routes.ts";
+import { V2Store } from "./v2/store.ts";
+import { resolveOptedWriterResource } from "./v2/identity.ts";
+import { createV1Admission, releaseLaunchLock } from "./v2/v1-admission.ts";
 
 const PORT = Number(process.env.LHC_CONSOLE_PORT ?? 5959);
 
@@ -76,6 +86,7 @@ const agentRegistry = loadAgentRegistry(consoleHome);
 const relayToken = loadRelayToken(consoleHome);
 const photonRef: { current: PhotonConnectorManager | null } = { current: null };
 const photonTypingRef: { current: PhotonTypingCoordinator | null } = { current: null };
+const v1RunningRef: { current: ((resourceKey: string) => boolean) | null } = { current: null };
 
 const relayDbPath = join(consoleHome, "relay.sqlite");
 const relayTargets: Record<string, import("./relay.ts").RelayTarget> = {
@@ -94,26 +105,110 @@ for (const [id, target] of Object.entries(agentRegistry.relayTargets)) {
   };
 }
 
+const v2Enabled = isV2Enabled();
+const v2Policies = v2Enabled ? loadConfiguredOwnerPolicies(consoleHome) : null;
+if (v2Enabled && !v2Policies) {
+  throw new UnsettledOwnerPolicyError(
+    "Q1",
+    "LHC_CONSOLE_V2=1 requires an explicit owner policy object in LHC_CONSOLE_V2_POLICIES or ~/.lhc-console/v2-policies.json",
+  );
+}
+const v2Store = v2Enabled ? new V2Store({ dbPath: v2DbPath(consoleHome) }) : null;
+const v2Manager =
+  v2Store && v2Policies
+    ? new RuntimeManager({
+        store: v2Store,
+        consoleHome,
+        agents: agentRegistry.agents,
+        policies: v2Policies,
+        adapterFactory: (provider) =>
+          provider === "codex-lhc" ? new CodexLhcAdapter() : new PiLhcAdapter(),
+        detectBusy: (target) =>
+          detectAttachedOne(
+            {
+              hostId: target.hostId,
+              threadId: target.threadId,
+              recipe: { command: target.recipeCommand ?? "", sessionRef: target.threadId },
+            },
+            ownTerminals(),
+            { includeOwnProcesses: true },
+          ),
+        v1Running: (resourceKey) => v1RunningRef.current?.(resourceKey) ?? false,
+        ownTerminals: () => ownTerminals(),
+        inspectCanonical: inspectCanonicalSpan,
+        deliver: async (input) => {
+          const { deliverV2PhotonText } = await import("./v2/delivery.ts");
+          return deliverV2PhotonText({
+            ...input,
+            agents: agentRegistry.agents,
+            consoleHome,
+            photonConnectors: photonRef.current,
+            store: v2Store,
+          });
+        },
+      })
+    : null;
+if (v2Manager) {
+  // Reconcile, then dispatch what reconciliation proved was never sent, before
+  // any route can accept new work for these targets.
+  await v2Manager.reconcileAll();
+  if (v2Store) {
+    const { drainV2Deliveries } = await import("./v2/delivery.ts");
+    void drainV2Deliveries({
+      store: v2Store,
+      agents: agentRegistry.agents,
+      consoleHome,
+      photonConnectors: photonRef.current,
+    });
+    const retry = setInterval(() => {
+      if (!v2Store) return;
+      void drainV2Deliveries({
+        store: v2Store,
+        agents: agentRegistry.agents,
+        consoleHome,
+        photonConnectors: photonRef.current,
+      });
+    }, 1_000);
+    retry.unref?.();
+  }
+}
+
+const v1Busy = (target: import("./relay.ts").RelayTarget) => {
+  if (target.hostId === "lee") return false;
+  invalidateProcessScan();
+  return (
+    detectAttachedOne(
+      {
+        hostId: target.hostId,
+        threadId: target.threadId,
+        recipe: { command: target.command, sessionRef: target.threadId },
+      },
+      [],
+      { includeOwnProcesses: true },
+    ).attached.length > 0
+  );
+};
+const v1Admission = createV1Admission({
+  enabled: v2Enabled,
+  consoleHome,
+  agents: agentRegistry.agents,
+  manager: v2Manager,
+  isBusy: v1Busy,
+});
+
 const relayQueue = new RelayQueue({
   dbPath: relayDbPath,
   targets: relayTargets,
-  isBusy: (target) => {
-    if (target.hostId === "lee") return false;
-    invalidateProcessScan();
-    return (
-      detectAttachedOne(
-        {
-          hostId: target.hostId,
-          threadId: target.threadId,
-          recipe: { command: target.command, sessionRef: target.threadId },
-        },
-        [],
-        { includeOwnProcesses: true },
-      ).attached.length > 0
-    );
-  },
-  execute: (target, prompt, signal, lifecycle) =>
-    executeRelayTarget(target, prompt, { signal, onSpawn: lifecycle?.onSpawn }),
+  isBusy: (target) => v1Admission.isBusy(target),
+  acquireWriterLock: (target) => v1Admission.acquireForLaunch(target),
+  releaseWriterLock: (held) =>
+    releaseLaunchLock(held as import("./v2/writer-lock.ts").HeldWriterLock, v2Manager),
+  execute: (target, prompt, signal, lifecycle, writerLock) =>
+    executeRelayTarget(target, prompt, {
+      signal,
+      onSpawn: lifecycle?.onSpawn,
+      writerLock: writerLock as import("./v2/writer-lock.ts").HeldWriterLock | undefined,
+    }),
   deliver: async (job) => {
     await deliverRelayJob(job, {
       agents: agentRegistry.agents,
@@ -130,6 +225,13 @@ const relayQueue = new RelayQueue({
   },
   consoleHome,
 });
+v1RunningRef.current = (resourceKey) =>
+  relayQueue.listRunningJobs().some((job) => {
+    const target = relayTargets[job.target];
+    if (!target) return false;
+    const resolved = resolveOptedWriterResource(agentRegistry.agents, target);
+    return resolved !== null && resolved !== "unresolved" && resolved.key === resourceKey;
+  });
 
 const goalService = new GoalService({
   dbPath: relayDbPath,
@@ -144,6 +246,7 @@ const photonConnectors = new PhotonConnectorManager({
   agents: agentRegistry.agents,
   consoleHome,
   queue: relayQueue,
+  v2: v2Manager,
 });
 photonRef.current = photonConnectors;
 photonTypingRef.current = new PhotonTypingCoordinator(photonConnectors, (job) =>
@@ -289,6 +392,13 @@ registerRelayRoutes(app, {
   agents: agentRegistry.agents,
   consoleHome,
 });
+if (v2Manager && v2Policies) {
+  registerV2Routes(app, {
+    manager: v2Manager,
+    token: v2BearerToken(v2Policies.policies, relayToken),
+    enabled: v2Enabled,
+  });
+}
 registerMonitorRoutes(app, { service: monitorService, token: relayToken });
 registerGoalRoutes(app, { service: goalService, token: relayToken });
 registerAgentRoutes(app, { agents: agentRegistry.agents, token: relayToken });
@@ -656,6 +766,7 @@ app.get("/api/threads/:hostId/:threadId/view-arrangement", async (req, reply) =>
 for (const sig of ["SIGINT", "SIGTERM"] as const) {
   process.once(sig, async () => {
     shutdownTerminals();
+    v2Manager?.close();
     await goalService.stop();
     await relayQueue.close();
     removeGoalSettledListener();

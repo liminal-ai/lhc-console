@@ -85,7 +85,7 @@ async function deliverPhoton(job: RelayJob, context: RelayDeliveryContext): Prom
   }
 }
 
-function formatPhotonMessage(message: string, jobId: string): string {
+export function formatPhotonMessage(message: string, jobId: string): string {
   if (message.length <= MAX_PHOTON_MESSAGE_LENGTH) return message;
   const suffix = `\n\n[Reply truncated for iMessage; full output remains in relay job ${jobId}.]`;
   return `${message.slice(0, MAX_PHOTON_MESSAGE_LENGTH - suffix.length)}${suffix}`;

@@ -13,13 +13,19 @@ function requestUrl(input: string | URL | Request): string {
   return input instanceof URL ? input.href : input.url;
 }
 
-function deps(fetchImpl: typeof fetch, stdin = "", agentId: string | null = null) {
+function deps(
+  fetchImpl: typeof fetch,
+  stdin = "",
+  agentId: string | null = null,
+  extras: { v2Token?: string } = {},
+) {
   const stdout: string[] = [];
   const stderr: string[] = [];
   return {
     value: {
       fetch: fetchImpl,
       token: "test-secret",
+      v2Token: extras.v2Token,
       baseUrl: "http://127.0.0.1:5959",
       agentId,
       readStdin: async () => stdin,
@@ -70,6 +76,57 @@ describe("lhc-agent CLI", () => {
       body: JSON.stringify({ prompt: "Review this" }),
     });
     expect(new Headers(requests[0]?.init?.headers).get("authorization")).toBe("Bearer test-secret");
+  });
+
+  it("keeps one-shot calls on V1 and adds an explicit v2 subcommand", async () => {
+    const requests: Array<{ url: string; init?: RequestInit }> = [];
+    const state = deps(async (input, init) => {
+      requests.push({ url: requestUrl(input), init });
+      if (requestUrl(input).includes("/api/v2/")) {
+        return response(200, { commandId: "c1", kind: "runtime.start", state: "applied" });
+      }
+      return response(200, { id: "job-1", status: "completed", output: "Fable reply" });
+    });
+    expect(await runAgentCli(["fable", "Review", "this"], state.value)).toBe(0);
+    expect(requests[0]?.url).toBe("http://127.0.0.1:5959/api/relay/targets/fable/jobs");
+    expect(await runAgentCli(["v2", "start", "fable"], state.value)).toBe(0);
+    expect(requests[1]?.url).toBe("http://127.0.0.1:5959/api/v2/targets/fable/commands");
+    expect(
+      JSON.parse(typeof requests[1]?.init?.body === "string" ? requests[1].init.body : "{}").kind,
+    ).toBe("runtime.start");
+  });
+
+  it("sends the separate Q1 V2 token on v2 subcommands only", async () => {
+    const requests: Array<{ url: string; init?: RequestInit }> = [];
+    const state = deps(
+      async (input, init) => {
+        requests.push({ url: requestUrl(input), init });
+        if (requestUrl(input).includes("/api/v2/")) {
+          return response(200, { commandId: "c1", kind: "runtime.start", state: "applied" });
+        }
+        return response(200, { id: "job-1", status: "completed", output: "Fable reply" });
+      },
+      "",
+      null,
+      { v2Token: "owner-only-v2" },
+    );
+    expect(await runAgentCli(["fable", "Review"], state.value)).toBe(0);
+    expect(new Headers(requests[0]?.init?.headers).get("authorization")).toBe("Bearer test-secret");
+    expect(await runAgentCli(["v2", "start", "fable"], state.value)).toBe(0);
+    expect(new Headers(requests[1]?.init?.headers).get("authorization")).toBe(
+      "Bearer owner-only-v2",
+    );
+  });
+
+  it("does not hijack a V1 agent named v2", async () => {
+    const requests: Array<{ url: string; init?: RequestInit }> = [];
+    const state = deps(async (input, init) => {
+      requests.push({ url: requestUrl(input), init });
+      return response(200, { id: "job-v2", status: "completed", output: "from v2 agent" });
+    });
+    expect(await runAgentCli(["v2", "hello from one-shot"], state.value)).toBe(0);
+    expect(requests[0]?.url).toBe("http://127.0.0.1:5959/api/relay/targets/v2/jobs");
+    expect(state.stdout).toEqual(["from v2 agent"]);
   });
 
   it("accepts a prompt from stdin", async () => {

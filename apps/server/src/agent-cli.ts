@@ -9,6 +9,7 @@ import { isRelayJobWaitSettled, type RelayJob } from "./relay.ts";
 interface CliDeps {
   fetch: typeof fetch;
   token: string;
+  v2Token?: string | null;
   baseUrl: string;
   agentId: string | null;
   readStdin: () => Promise<string>;
@@ -31,6 +32,8 @@ Usage:
   lhc-agent start <agent> "Message"  Start a long call; print its job key
   lhc-agent start [--from <agent>] [--priority] <agent> "Message"
   lhc-agent job <job>                 Check a job; print its reply when done
+  lhc-agent v2 <command> <agent>      Additive V2 plane (does not change one-shot calls)
+  lhc-agent v2 <agent> <command>      Same, unless a V1 agent is named v2
   lhc-agent goal start <agent> "objective" [--every <duration>]
   lhc-agent goal list
   lhc-agent goal <id>
@@ -66,6 +69,12 @@ export async function runAgentCli(args: string[], deps: CliDeps): Promise<number
     if (args[0] === "goal") return await goal(args.slice(1), deps);
     if (args[0] === "start") return await start(args.slice(1), deps);
     if (args[0] === "job") return await job(args.slice(1), deps);
+    if (args[0] === "v2") {
+      // A V1 agent may be named "v2". Only enter the V2 plane when an action
+      // token is present: `v2 start fable` or `v2 fable start`.
+      if (isV2Subcommand(args[1]) || isV2Subcommand(args[2])) return await v2(args.slice(1), deps);
+      return await call(args, deps, false);
+    }
     return await call(args, deps, false);
   } catch (error) {
     deps.stderr(error instanceof Error ? error.message : String(error));
@@ -140,6 +149,112 @@ async function call(args: string[], deps: CliDeps, detached: boolean): Promise<n
 function normalizeInlineLeeMessage(target: string, prompt: string): string {
   if (target !== "lee") return prompt;
   return prompt.replace(/\\r\\n|\\n/g, "\n");
+}
+
+const V2_ACTIONS = new Set([
+  "start",
+  "stop",
+  "turn",
+  "steer",
+  "next",
+  "interrupt",
+  "status",
+  "handoff",
+  "release",
+]);
+
+function isV2Subcommand(value: string | undefined): boolean {
+  return Boolean(value && V2_ACTIONS.has(value));
+}
+
+async function v2(args: string[], deps: CliDeps): Promise<number> {
+  let target = args[0];
+  let action = args[1];
+  let rest = args.slice(2);
+  if (isV2Subcommand(target) && action) {
+    rest = args.slice(2);
+    [action, target] = [target, action];
+  }
+  if (!target || !action) {
+    throw new Error(
+      "usage: lhc-agent v2 <agent> <start|stop|turn|steer|next|interrupt|status|handoff|release> [text]",
+    );
+  }
+  if (action === "status") {
+    const status = await api(
+      deps,
+      `/api/v2/targets/${encodeURIComponent(target)}/status`,
+      {},
+      true,
+    );
+    deps.stdout(JSON.stringify(status));
+    return 0;
+  }
+  const kind =
+    action === "start"
+      ? "runtime.start"
+      : action === "stop"
+        ? "runtime.stop"
+        : action === "turn"
+          ? "turn.start"
+          : action === "steer"
+            ? "turn.steer"
+            : action === "next"
+              ? "turn.followUp"
+              : action === "interrupt"
+                ? "turn.interrupt"
+                : action === "handoff"
+                  ? "handoff.request"
+                  : action === "release"
+                    ? "handoff.release"
+                    : null;
+  if (!kind) throw new Error(`unknown v2 command: ${action}`);
+  const text = rest.join(" ").trim();
+  const params: Record<string, unknown> =
+    kind === "runtime.start"
+      ? {}
+      : kind === "runtime.stop"
+        ? { mode: "drain" }
+        : kind === "turn.start"
+          ? { text }
+          : kind === "turn.steer" || kind === "turn.followUp"
+            ? { text, ...(kind === "turn.steer" ? { expectedTurnId: "" } : { afterTurnId: "" }) }
+            : kind === "turn.interrupt"
+              ? { expectedTurnId: "" }
+              : kind === "handoff.request"
+                ? { mode: "drain", launch: "command-only" }
+                : {};
+  if (
+    (kind === "turn.steer" || kind === "turn.followUp" || kind === "turn.interrupt") &&
+    !params.expectedTurnId &&
+    !params.afterTurnId
+  ) {
+    const status = (await api(
+      deps,
+      `/api/v2/targets/${encodeURIComponent(target)}/status`,
+      {},
+      true,
+    )) as {
+      currentTurn?: { turnId?: string };
+    };
+    const turnId = status.currentTurn?.turnId;
+    if (!turnId) throw new Error("no active V2 turn");
+    if (kind === "turn.steer") Object.assign(params, { expectedTurnId: turnId });
+    if (kind === "turn.followUp") Object.assign(params, { afterTurnId: turnId });
+    if (kind === "turn.interrupt") Object.assign(params, { expectedTurnId: turnId });
+  }
+  const receipt = await api(
+    deps,
+    `/api/v2/targets/${encodeURIComponent(target)}/commands`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ commandId: crypto.randomUUID(), kind, params }),
+    },
+    true,
+  );
+  deps.stdout(JSON.stringify(receipt));
+  return 0;
 }
 
 async function job(args: string[], deps: CliDeps): Promise<number> {
@@ -319,9 +434,15 @@ function printSettled(job: RelayJob, deps: CliDeps): number {
   return 0;
 }
 
-async function api(deps: CliDeps, path: string, init: RequestInit = {}): Promise<unknown> {
+async function api(
+  deps: CliDeps,
+  path: string,
+  init: RequestInit = {},
+  v2 = false,
+): Promise<unknown> {
   const headers = new Headers(init.headers);
-  headers.set("authorization", `Bearer ${deps.token}`);
+  const token = v2 ? deps.v2Token?.trim() || deps.token : deps.token;
+  headers.set("authorization", `Bearer ${token}`);
   const response = await deps.fetch(`${deps.baseUrl}${path}`, { ...init, headers });
   const body = (await response.json().catch(() => null)) as { error?: string } | null;
   if (!response.ok)
@@ -332,11 +453,13 @@ async function api(deps: CliDeps, path: string, init: RequestInit = {}): Promise
 function productionDeps(): CliDeps {
   const home = process.env.LHC_CONSOLE_HOME ?? join(homedir(), ".lhc-console");
   const token = process.env.LHC_RELAY_TOKEN?.trim() || readToken(join(home, "relay-token"));
+  const v2Token = process.env.LHC_CONSOLE_V2_TOKEN?.trim() || null;
   const port = process.env.LHC_CONSOLE_PORT ?? "5959";
   const agentId = process.env.LHC_AGENT_ID?.trim() || null;
   return {
     fetch,
     token,
+    v2Token,
     baseUrl: process.env.LHC_CONSOLE_URL ?? `http://127.0.0.1:${port}`,
     agentId,
     readStdin: async () => {

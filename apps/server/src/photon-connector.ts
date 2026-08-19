@@ -16,6 +16,8 @@ import { InboundDedupeStore } from "./inbound-dedupe.ts";
 import { cleanMentionText, compileMentionPatterns, matchesMention } from "./mention-patterns.ts";
 import type { RelayQueue } from "./relay.ts";
 import { renderRelayPrompt } from "./relay-prompt.ts";
+import { parsePhotonV2Control } from "./v2/photon-ingress.ts";
+import type { RuntimeManager } from "./v2/manager.ts";
 
 const DEFAULT_SIDECAR_PATH =
   process.env.LHC_PHOTON_SIDECAR_PATH ??
@@ -73,6 +75,7 @@ export interface PhotonConnectorOptions {
   agent: AgentRecord;
   consoleHome: string;
   queue: RelayQueue;
+  v2?: RuntimeManager | null;
   sidecar?: SidecarBinding;
   sidecarPath?: string;
   fetchImpl?: typeof fetch;
@@ -92,6 +95,7 @@ export class PhotonConnector {
   readonly agentId: string;
   readonly #agent: AgentRecord;
   readonly #queue: RelayQueue;
+  readonly #v2: RuntimeManager | null;
   readonly #sidecarPath: string;
   readonly #fetchImpl: typeof fetch;
   readonly #loadPhotonEnv: (path: string) => Record<string, string>;
@@ -122,6 +126,7 @@ export class PhotonConnector {
     this.#agent = options.agent;
     this.agentId = options.agent.id;
     this.#queue = options.queue;
+    this.#v2 = options.v2 ?? null;
     this.#sidecarPath = options.sidecarPath ?? DEFAULT_SIDECAR_PATH;
     this.#fetchImpl = options.fetchImpl ?? fetch;
     this.#loadPhotonEnv = options.loadPhotonEnv ?? loadPhotonEnvFile;
@@ -276,6 +281,10 @@ export class PhotonConnector {
     const claim = this.#dedupe.begin(spaceId, messageId);
     if (claim.gate === "skip") return;
     try {
+      if (await this.#handleV2Control(spaceId, text)) {
+        this.#dedupe.complete(spaceId, messageId, claim.token);
+        return;
+      }
       this.#enqueueRelay(spaceId, text);
       this.#dedupe.complete(spaceId, messageId, claim.token);
     } catch (error) {
@@ -323,6 +332,11 @@ export class PhotonConnector {
     const cleaned = cleanMentionText(text, this.#mentionPatterns);
     const prompt = renderRelayPrompt(cleaned, channelContext ?? undefined);
     try {
+      if (await this.#handleV2Control(spaceId, cleaned)) {
+        this.#catchUp.advanceCursor(spaceId, messageId, consumedIds);
+        this.#dedupe.complete(spaceId, messageId, claim.token);
+        return;
+      }
       this.#enqueueRelay(spaceId, prompt, {
         kind: "photon_group_wake",
         spaceId,
@@ -372,6 +386,58 @@ export class PhotonConnector {
       }
       throw error;
     }
+  }
+
+  async #handleV2Control(spaceId: string, text: string): Promise<boolean> {
+    const control = parsePhotonV2Control(text);
+    if (!control) return false;
+    if (!this.#v2 || !this.#agent.v2) {
+      // Unprefixed text already stays V1. Explicit /v2 syntax on a V1-only
+      // target must also stay on the one-shot plane rather than consuming the
+      // message as a V2 acknowledgement.
+      return false;
+    }
+    try {
+      if (control.kind === "status") {
+        const status = this.#v2.status(this.#agent.id);
+        await this.#send(
+          spaceId,
+          `v2 ${status.target} ${status.state} turn=${status.currentTurn?.turnId ?? "-"} seq=${status.lastEventSeq}`,
+        );
+        return true;
+      }
+      const commandId = crypto.randomUUID();
+      const params =
+        control.kind === "turn.start"
+          ? { text: control.text, delivery: "photon" }
+          : control.kind === "turn.steer"
+            ? {
+                text: control.text,
+                expectedTurnId: this.#v2.status(this.#agent.id).currentTurn?.turnId,
+              }
+            : control.kind === "turn.followUp"
+              ? {
+                  text: control.text,
+                  afterTurnId: this.#v2.status(this.#agent.id).currentTurn?.turnId,
+                  delivery: "photon",
+                }
+              : control.kind === "turn.interrupt"
+                ? { expectedTurnId: this.#v2.status(this.#agent.id).currentTurn?.turnId }
+                : { targetCommandId: control.targetCommandId };
+      const receipt = await this.#v2.submit({
+        target: this.#agent.id,
+        commandId,
+        kind: control.kind,
+        params,
+      });
+      await this.#send(
+        spaceId,
+        `v2 ${receipt.kind} ${receipt.commandId} ${receipt.state}${receipt.reason ? ` ${receipt.reason}` : ""}`,
+      );
+    } catch (error) {
+      await this.#send(spaceId, error instanceof Error ? error.message : String(error));
+    }
+    return true;
   }
 
   #enqueueRelay(spaceId: string, prompt: string, groupWake?: GroupWakeMetadata): void {
@@ -539,6 +605,7 @@ export class PhotonConnectorManager {
     queue: RelayQueue;
     sidecarPath?: string;
     onError?: (message: string) => void;
+    v2?: RuntimeManager | null;
   };
 
   constructor(options: {
@@ -547,6 +614,7 @@ export class PhotonConnectorManager {
     queue: RelayQueue;
     sidecarPath?: string;
     onError?: (message: string) => void;
+    v2?: RuntimeManager | null;
   }) {
     this.#options = options;
   }
@@ -560,6 +628,7 @@ export class PhotonConnectorManager {
         queue: this.#options.queue,
         sidecarPath: this.#options.sidecarPath,
         onError: this.#options.onError,
+        v2: this.#options.v2,
       });
       await connector.start();
       this.#connectors.set(agent.id, connector);

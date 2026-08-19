@@ -108,7 +108,15 @@ interface RelayQueueOptions {
     prompt: string,
     signal: AbortSignal,
     lifecycle?: RelayExecuteLifecycle,
+    writerLock?: unknown,
   ) => Promise<string>;
+  /**
+   * Optional V2-opted launch fence. Returning "blocked" defers the job the
+   * same way `isBusy` does. A held lock is passed to `execute` so the writer
+   * child can inherit it.
+   */
+  acquireWriterLock?: (target: RelayTarget) => unknown;
+  releaseWriterLock?: (held: unknown) => void;
   deliver?: (job: RelayJob) => Promise<void>;
   jobLifecycle?: RelayJobLifecycle;
   busyPollMs?: number;
@@ -126,6 +134,8 @@ export class RelayQueue {
   readonly #db: DatabaseSync;
   readonly #targets: Record<string, RelayTarget>;
   readonly #isBusy: RelayQueueOptions["isBusy"];
+  readonly #acquireWriterLock: RelayQueueOptions["acquireWriterLock"];
+  readonly #releaseWriterLock: RelayQueueOptions["releaseWriterLock"];
   readonly #execute: RelayQueueOptions["execute"];
   readonly #deliver: RelayQueueOptions["deliver"];
   readonly #jobLifecycle: RelayQueueOptions["jobLifecycle"];
@@ -157,6 +167,8 @@ export class RelayQueue {
     this.#db = new DatabaseSync(options.dbPath);
     this.#targets = options.targets;
     this.#isBusy = options.isBusy;
+    this.#acquireWriterLock = options.acquireWriterLock;
+    this.#releaseWriterLock = options.releaseWriterLock;
     this.#execute = options.execute;
     this.#deliver = options.deliver;
     this.#jobLifecycle = options.jobLifecycle;
@@ -653,6 +665,26 @@ export class RelayQueue {
           this.#defer(targetName);
           return;
         }
+        const launchFence = this.#acquireWriterLock?.(target);
+        if (launchFence === "blocked" || launchFence === "unresolved") {
+          this.#db
+            .prepare(
+              `UPDATE relay_jobs
+               SET status = 'blocked'
+               WHERE id = (
+                 SELECT r.id FROM relay_jobs AS r
+                 WHERE r.target = ? AND r.status = 'queued'
+                   AND NOT EXISTS (
+                     SELECT 1 FROM relay_cancelled_jobs AS c WHERE c.id = r.id
+                   )
+                 ORDER BY CASE r.job_class WHEN 'prioritized' THEN 0 ELSE 1 END, r.created_at, r.rowid
+                 LIMIT 1
+               )`,
+            )
+            .run(targetName);
+          this.#defer(targetName);
+          return;
+        }
         const startedAt = new Date().toISOString();
         const claim = this.#db
           .prepare(
@@ -684,6 +716,7 @@ export class RelayQueue {
           )
           .run(startedAt, process.pid, targetName, targetName, targetName);
         if (claim.changes !== 1) {
+          this.#dropLaunchFence(launchFence);
           const activeRun = this.#db
             .prepare(
               "SELECT id, owner_pid FROM relay_jobs WHERE target = ? AND status = 'running' LIMIT 1",
@@ -726,9 +759,13 @@ export class RelayQueue {
             "SELECT * FROM relay_jobs WHERE target = ? AND status = 'running' AND owner_pid = ? LIMIT 1",
           )
           .get(targetName, process.pid) as unknown as RelayRow | undefined;
-        if (!running) continue;
+        if (!running) {
+          this.#dropLaunchFence(launchFence);
+          continue;
+        }
         const job = rowToJob(running);
         if (job.jobKind === "outbound") {
+          this.#dropLaunchFence(launchFence);
           const finishedAt = new Date().toISOString();
           this.#withDb(() => {
             this.#db
@@ -752,6 +789,7 @@ export class RelayQueue {
             job.prompt,
             controller.signal,
             executeLifecycle,
+            launchFence,
           );
           const finishedAt = new Date().toISOString();
           this.#withDb(() => {
@@ -781,6 +819,7 @@ export class RelayQueue {
             if (finished) await finished.catch(() => undefined);
           }
           this.#controllers.delete(controller);
+          this.#dropLaunchFence(launchFence);
         }
         this.#notify(job.id);
         this.#emitSettled(job.id);
@@ -802,7 +841,7 @@ export class RelayQueue {
   #emitSettled(id: string): void {
     const job = this.get(id);
     if (!job) return;
-    for (const listener of [...this.#settledListeners]) {
+    for (const listener of this.#settledListeners.slice()) {
       try {
         const result = listener(job);
         if (result) void result.catch(() => undefined);
@@ -830,6 +869,11 @@ export class RelayQueue {
     } catch {
       // lifecycle failures must not affect relay execution
     }
+  }
+
+  #dropLaunchFence(fence: unknown): void {
+    if (!fence || fence === "blocked" || fence === "unresolved") return;
+    this.#releaseWriterLock?.(fence);
   }
 
   #defer(target: string): void {

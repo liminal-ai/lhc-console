@@ -133,6 +133,60 @@ describe("loadAgentRegistry", () => {
     expect(() => loadAgentRegistry(home)).toThrow(/health\.threadId/);
   });
 
+  it("loads an optional v2 block without changing the required relay block", () => {
+    const home = mkdtempSync(join(tmpdir(), "lhc-agents-"));
+    dirs.push(home);
+    writeRegistry(home, {
+      version: 1,
+      agents: {
+        fable: {
+          ownerSenderIds: ["owner"],
+          health: { hostId: "pi-lhc", threadId: "th_canonical" },
+          relay: {
+            hostId: "pi-lhc",
+            threadId: "th_canonical",
+            cwd: "/tmp",
+            command: "pi-lhc",
+            args: ["-p"],
+          },
+          v2: {
+            provider: "pi-lhc",
+            command: "pi-lhc",
+            args: ["--lhc-thread", "th_canonical", "--mode", "rpc"],
+          },
+        },
+      },
+    });
+    const loaded = loadAgentRegistry(home);
+    expect(loaded.agents[0]?.v2).toMatchObject({
+      provider: "pi-lhc",
+      command: "pi-lhc",
+    });
+    expect(loaded.relayTargets.fable.command).toBe("pi-lhc");
+  });
+
+  it("rejects a v2 provider that does not match relay.hostId", () => {
+    const home = mkdtempSync(join(tmpdir(), "lhc-agents-"));
+    dirs.push(home);
+    writeRegistry(home, {
+      version: 1,
+      agents: {
+        fable: {
+          ownerSenderIds: ["owner"],
+          relay: {
+            hostId: "pi-lhc",
+            threadId: "th_test",
+            cwd: "/tmp",
+            command: "pi-lhc",
+            args: ["-p"],
+          },
+          v2: { provider: "codex-lhc" },
+        },
+      },
+    });
+    expect(() => loadAgentRegistry(home)).toThrow(/v2\.provider must match/);
+  });
+
   it("rejects agent keys reserved by the CLI", () => {
     for (const key of ["help", "goal"]) {
       const home = mkdtempSync(join(tmpdir(), "lhc-agents-"));
@@ -154,6 +208,50 @@ describe("loadAgentRegistry", () => {
       });
       expect(() => loadAgentRegistry(home)).toThrow(`reserved agent key: ${key}`);
     }
+  });
+
+  it("does not reserve v2 as a V1 target name when the agent has no v2 block", () => {
+    const home = mkdtempSync(join(tmpdir(), "lhc-agents-"));
+    dirs.push(home);
+    writeRegistry(home, {
+      version: 1,
+      agents: {
+        v2: {
+          ownerSenderIds: ["owner"],
+          relay: {
+            hostId: "pi-lhc",
+            threadId: "th_test",
+            cwd: "/tmp",
+            command: "pi-lhc",
+            args: ["-p"],
+          },
+        },
+      },
+    });
+    const loaded = loadAgentRegistry(home);
+    expect(loaded.agents[0]?.id).toBe("v2");
+  });
+
+  it("reserves v2 only when that agent opts into the V2 plane", () => {
+    const home = mkdtempSync(join(tmpdir(), "lhc-agents-"));
+    dirs.push(home);
+    writeRegistry(home, {
+      version: 1,
+      agents: {
+        v2: {
+          ownerSenderIds: ["owner"],
+          relay: {
+            hostId: "pi-lhc",
+            threadId: "th_test",
+            cwd: "/tmp",
+            command: "pi-lhc",
+            args: ["-p"],
+          },
+          v2: { provider: "pi-lhc" },
+        },
+      },
+    });
+    expect(() => loadAgentRegistry(home)).toThrow("reserved agent key: v2");
   });
 
   it("returns empty targets when no agents are configured", () => {

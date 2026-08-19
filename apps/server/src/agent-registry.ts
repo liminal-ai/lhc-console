@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { assertOwnerOnlyFile } from "./env-file.ts";
 import type { RelayTarget } from "./relay.ts";
+import { isV2Provider, type V2Provider } from "./v2/contract.ts";
 
 export interface PhotonChannelConfig {
   address: string;
@@ -18,6 +19,15 @@ export interface AgentHealthRef {
   threadId: string;
 }
 
+export interface AgentV2Config {
+  provider: V2Provider;
+  command?: string;
+  args?: string[];
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
+  nativeThreadRef?: string;
+}
+
 export interface AgentRecord {
   id: string;
   name: string;
@@ -28,6 +38,8 @@ export interface AgentRecord {
   health?: AgentHealthRef;
   channels: AgentChannels;
   relay: RelayTarget;
+  /** Absent → the target is V1-only. */
+  v2?: AgentV2Config;
 }
 
 export interface LoadedAgentRegistry {
@@ -67,6 +79,15 @@ interface RawHealthRef {
   threadId?: unknown;
 }
 
+interface RawV2Config {
+  provider?: unknown;
+  command?: unknown;
+  args?: unknown;
+  cwd?: unknown;
+  env?: unknown;
+  nativeThreadRef?: unknown;
+}
+
 interface RawAgentConfig {
   name?: unknown;
   description?: unknown;
@@ -76,6 +97,7 @@ interface RawAgentConfig {
   health?: RawHealthRef;
   channels?: RawChannels;
   relay?: RawRelayConfig;
+  v2?: RawV2Config;
 }
 
 interface RawRegistry {
@@ -113,13 +135,19 @@ export function loadAgentRegistry(consoleHome: string): LoadedAgentRegistry {
   return { agents, relayTargets };
 }
 
-const RESERVED_AGENT_KEYS = new Set(["help", "list", "start", "job", "goal", "lee"]);
+const ALWAYS_RESERVED_AGENT_KEYS = new Set(["help", "list", "start", "job", "goal", "lee"]);
+
+export function reservedAgentKeys(v2Enabled = false): Set<string> {
+  return v2Enabled
+    ? new Set([...ALWAYS_RESERVED_AGENT_KEYS, "v2"])
+    : new Set(ALWAYS_RESERVED_AGENT_KEYS);
+}
 
 function parseAgent(id: string, raw: RawAgentConfig, consoleHome: string): AgentRecord {
   if (!/^[a-z][a-z0-9-]*$/.test(id)) {
     throw new Error(`agent key must match [a-z][a-z0-9-]*: ${id}`);
   }
-  if (RESERVED_AGENT_KEYS.has(id)) throw new Error(`reserved agent key: ${id}`);
+  if (reservedAgentKeys(Boolean(raw.v2)).has(id)) throw new Error(`reserved agent key: ${id}`);
   const name = optionalString(raw.name) ?? id;
   const description = optionalString(raw.description) ?? `${name} durable agent`;
   const duties = raw.duties === undefined ? [] : requireStringArray(raw.duties, `${id}.duties`);
@@ -131,6 +159,7 @@ function parseAgent(id: string, raw: RawAgentConfig, consoleHome: string): Agent
   const health = parseHealth(id, raw.health);
   const channels = parseChannels(id, raw.channels, consoleHome);
   const relay = parseRelay(id, raw.relay);
+  const v2 = parseV2(id, raw.v2, relay);
   return {
     id,
     name,
@@ -141,6 +170,7 @@ function parseAgent(id: string, raw: RawAgentConfig, consoleHome: string): Agent
     health,
     channels,
     relay,
+    ...(v2 ? { v2 } : {}),
   };
 }
 
@@ -221,6 +251,44 @@ function parseRelay(id: string, raw: RawRelayConfig | undefined): RelayTarget {
     target.env = env;
   }
   return target;
+}
+
+function parseV2(
+  id: string,
+  raw: RawV2Config | undefined,
+  relay: RelayTarget,
+): AgentV2Config | undefined {
+  if (raw === undefined) return undefined;
+  if (!raw || typeof raw !== "object") throw new Error(`${id}.v2 must be an object`);
+  const provider =
+    raw.provider === undefined ? relay.hostId : requireString(raw.provider, `${id}.v2.provider`);
+  if (!isV2Provider(provider)) {
+    throw new Error(`${id}.v2.provider must be codex-lhc or pi-lhc`);
+  }
+  if (provider !== relay.hostId) {
+    throw new Error(`${id}.v2.provider must match ${id}.relay.hostId (${relay.hostId})`);
+  }
+  const config: AgentV2Config = { provider };
+  if (raw.command !== undefined) config.command = requireString(raw.command, `${id}.v2.command`);
+  if (raw.args !== undefined) config.args = requireStringArray(raw.args, `${id}.v2.args`);
+  if (raw.cwd !== undefined) config.cwd = requireString(raw.cwd, `${id}.v2.cwd`);
+  if (raw.nativeThreadRef !== undefined) {
+    config.nativeThreadRef = requireString(raw.nativeThreadRef, `${id}.v2.nativeThreadRef`);
+  }
+  if (raw.env !== undefined) {
+    if (!raw.env || typeof raw.env !== "object" || Array.isArray(raw.env)) {
+      throw new Error(`${id}.v2.env must be an object`);
+    }
+    const env: NodeJS.ProcessEnv = {};
+    for (const [key, value] of Object.entries(raw.env)) {
+      if (typeof value !== "string") {
+        throw new Error(`${id}.v2.env.${key} must be a string`);
+      }
+      env[key] = value;
+    }
+    config.env = env;
+  }
+  return config;
 }
 
 function parseMentionPatterns(raw: unknown): string[] {

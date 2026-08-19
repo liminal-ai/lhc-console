@@ -170,6 +170,25 @@ function readToken(path: string): string {
   return token;
 }
 
+function isHelpArgs(args: string[]): boolean {
+  return args.length === 0 || args[0] === "help" || args[0] === "--help" || args[0] === "-h";
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {
-  process.exitCode = await runMonitorCli(process.argv.slice(2), productionDeps());
+  const args = process.argv.slice(2);
+  // Help must not construct production credentials. A PATH-symlink --help
+  // spawn inherits the test/process environment; missing LHC_RELAY_TOKEN
+  // plus an absent relay-token file previously crashed before usage printed.
+  process.exitCode = await runMonitorCli(
+    args,
+    isHelpArgs(args)
+      ? {
+          fetch,
+          token: "",
+          baseUrl: "",
+          stdout: (line) => process.stdout.write(`${line}\n`),
+          stderr: (line) => process.stderr.write(`${line}\n`),
+        }
+      : productionDeps(),
+  );
 }

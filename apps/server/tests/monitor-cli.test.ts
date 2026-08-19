@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vite-plus/test";
 import { mkdtempSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { runMonitorCli } from "../src/monitor-cli.ts";
@@ -21,11 +21,19 @@ function requestUrl(input: string | URL | Request): string {
 describe("lhc-monitor CLI", () => {
   it("runs through a PATH symlink", () => {
     const dir = mkdtempSync(join(tmpdir(), "lhc-monitor-cli-"));
+    const home = mkdtempSync(join(tmpdir(), "lhc-monitor-home-"));
     const cliPath = join(dirname(fileURLToPath(import.meta.url)), "../src/monitor-cli.ts");
     const linkPath = join(dir, "lhc-monitor");
     symlinkSync(cliPath, linkPath);
-    const result = spawnSync(linkPath, ["--help"], { encoding: "utf8" });
-    expect(result.status).toBe(0);
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      PATH: `${dir}${delimiter}${process.env.PATH ?? ""}`,
+      HOME: home,
+      LHC_CONSOLE_HOME: join(home, ".lhc-console"),
+    };
+    delete env.LHC_RELAY_TOKEN;
+    const result = spawnSync("lhc-monitor", ["--help"], { encoding: "utf8", env });
+    expect(result.status, result.stderr).toBe(0);
     expect(result.stdout).toContain("lhc-monitor add");
   });
 

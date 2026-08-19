@@ -55,6 +55,8 @@ import {
 } from "./attach-detect.ts";
 import { threadName } from "./prefs.ts";
 import * as tmx from "./tmux.ts";
+import { acquireTerminalWriterLock } from "./v2/ownership.ts";
+import { attachWriterLockOwner, releaseWriterLock, type HeldWriterLock } from "./v2/writer-lock.ts";
 
 /** Total scrollback kept per terminal in the warm ring. tmux holds 50k lines more. */
 const BUFFER_CAP = 2_000_000;
@@ -118,6 +120,12 @@ interface Terminal {
   bridge: IPty | null;
   bridgeRetry: NodeJS.Timeout | null;
   removeOnExit: boolean;
+  /**
+   * Canonical writer fence held for this pane. A tmux pane is not a console
+   * descendant, so it cannot inherit the fence — the console holds it for the
+   * pane's lifetime and must drop it when the pane goes away.
+   */
+  writerLock: HeldWriterLock | null;
 }
 
 const terminals = new Map<string, Terminal>();
@@ -644,6 +652,7 @@ async function commitRekeyLocked(t: Terminal, hostId: string, threadId: string):
 function markExited(t: Terminal): void {
   t.sessionId = null;
   t.state = "exited";
+  releaseTerminalWriterLock(t);
   detachBridge(t);
   broadcastControl(t, { type: "exit", exitCode: null, signal: null, ...stamp() });
   persistCatalog();
@@ -656,6 +665,14 @@ function markExited(t: Terminal): void {
  * at boot: dynamic re-keys can collide, and deleting one claimant must clear
  * the survivor's flag. Changes broadcast stamped so clients stay truthful.
  */
+/** Idempotent: dropping a pane must free its fence exactly once. */
+function releaseTerminalWriterLock(t: Terminal): void {
+  if (!t.writerLock) return;
+  const held = t.writerLock;
+  t.writerLock = null;
+  releaseWriterLock(held);
+}
+
 function recomputeConflicts(): void {
   const claims = new Map<string, Terminal[]>();
   for (const t of terminals.values()) {
@@ -676,6 +693,7 @@ function recomputeConflicts(): void {
 }
 
 function dropTerminal(t: Terminal): void {
+  releaseTerminalWriterLock(t);
   terminals.delete(t.id);
   for (const s of t.sockets) {
     try {
@@ -757,6 +775,7 @@ async function createTerminalLocked(spec: CreateSpec): Promise<Terminal> {
       bridge: null,
       bridgeRetry: null,
       removeOnExit: false,
+      writerLock: null,
     };
     terminals.set(t.id, t);
     await applySizingMode(t);
@@ -894,6 +913,7 @@ function newTerminalRecord(base: {
     bridge: null,
     bridgeRetry: null,
     removeOnExit: false,
+    writerLock: null,
   };
 }
 
@@ -1218,6 +1238,14 @@ async function resumeIdleLocked(
     if (!recipe?.command) {
       return { code: 409, body: { error: recipe?.reason ?? "no resume recipe" } };
     }
+    if (!t.threadRef.threadId) {
+      return { code: 409, body: { error: "terminal has no thread to resume" } };
+    }
+    const held = acquireTerminalWriterLock(t.threadRef.hostId, t.threadRef.threadId);
+    if (held === "blocked" || held === "unresolved") {
+      return { code: 409, body: { error: "session in use", reason: "v2-runtime" } };
+    }
+    const heldLock = held && typeof held === "object" ? held : null;
     if (writerPolicyFor(t.threadRef.hostId) === "single") {
       invalidateProcessScan();
       const info = detectAttachedOne(
@@ -1225,6 +1253,7 @@ async function resumeIdleLocked(
         ownTerminals().filter((o) => o.pid !== row.panePid),
       );
       if (info.attached.length > 0 && !force) {
+        releaseWriterLock(heldLock);
         return { code: 409, body: { error: "session in use", attached: info.attached } };
       }
     }
@@ -1232,6 +1261,7 @@ async function resumeIdleLocked(
       await tmx.clearReady(t.sessionId);
       await tmx.respawnPane(t.sessionId, t.uuid, recipe.command);
     } catch {
+      releaseWriterLock(heldLock);
       // Nothing was (necessarily) respawned; keep the prior state and let the
       // caller retry. Observation will re-derive the truth either way.
       return { code: 503, body: { error: "respawn failed — retry" } };
@@ -1241,7 +1271,14 @@ async function resumeIdleLocked(
     t.lastSeenToken = "";
     try {
       const fresh = (await tmx.listSessions()).find((x) => x.uuid === t.uuid);
-      if (fresh) panePids.set(t.uuid, fresh.panePid);
+      if (fresh) {
+        panePids.set(t.uuid, fresh.panePid);
+        if (heldLock) attachWriterLockOwner(heldLock, fresh.panePid);
+      }
+      if (heldLock && t.writerLock !== heldLock) {
+        releaseTerminalWriterLock(t);
+        t.writerLock = heldLock;
+      }
     } catch {
       // observation refreshes within a tick
     }
@@ -1408,24 +1445,39 @@ export function registerTerminalRoutes(
           return { code: 409, body: { error: "session in use", attached: info.attached } };
         }
       }
+      const held = acquireTerminalWriterLock(thread.hostId, thread.threadId);
+      if (held === "blocked" || held === "unresolved") {
+        return { code: 409, body: { error: "session in use", reason: "v2-runtime" } };
+      }
+      const heldLock = held && typeof held === "object" ? held : null;
       if (admissionBlocked(activeStates(), MAX_ACTIVE).blocked) {
+        releaseWriterLock(heldLock);
         return { code: 429, body: { error: `terminal limit reached (${MAX_ACTIVE})` } };
       }
       const label =
         threadName(thread.hostId, thread.threadId)?.title ?? thread.title ?? thread.threadId;
-      const t = await createTerminalLocked({
-        label,
-        command: recipe.command!,
-        cwd: thread.cwd ?? process.env.HOME ?? homedir(),
-        threadRef: {
-          hostId: thread.hostId,
-          threadId: thread.threadId,
-          title: thread.title ?? thread.sessionId ?? thread.threadId,
-        },
-        kind: "thread",
-        cols,
-        rows,
-      });
+      let t;
+      try {
+        t = await createTerminalLocked({
+          label,
+          command: recipe.command!,
+          cwd: thread.cwd ?? process.env.HOME ?? homedir(),
+          threadRef: {
+            hostId: thread.hostId,
+            threadId: thread.threadId,
+            title: thread.title ?? thread.sessionId ?? thread.threadId,
+          },
+          kind: "thread",
+          cols,
+          rows,
+        });
+      } catch (error) {
+        releaseWriterLock(heldLock);
+        throw error;
+      }
+      const panePid = panePids.get(t.uuid);
+      if (typeof panePid === "number" && heldLock) attachWriterLockOwner(heldLock, panePid);
+      if (heldLock) t.writerLock = heldLock;
       invalidateProcessScan();
       return { code: 201, body: publicView(t) };
     });

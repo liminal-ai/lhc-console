@@ -77,6 +77,7 @@ export class CodexLhcAdapter implements ProviderAdapter {
   #activeNativeTurnId: string | null = null;
   #lastAgentText = "";
   #stderrTail = "";
+  #childError: Error | null = null;
   readonly #configWarnings: CodexConfigWarning[] = [];
 
   constructor(options: CodexLhcAdapterOptions = {}) {
@@ -234,6 +235,7 @@ export class CodexLhcAdapter implements ProviderAdapter {
     // Evidence is per-child: a restart must not inherit the previous one's.
     this.#stderrTail = "";
     this.#configWarnings.length = 0;
+    this.#childError = null;
     const command = input.command ?? this.#options.command ?? "codex-lhc";
     const args = input.args ?? this.#options.args ?? ["app-server"];
     const spawnProcess = this.#options.spawnProcess ?? defaultSpawn;
@@ -241,6 +243,17 @@ export class CodexLhcAdapter implements ProviderAdapter {
       cwd: input.cwd,
       env: { ...scrubbedEnv({}), ...input.env },
       writerLock: input.writerLock,
+    });
+    // Subscribed before anything can await on the child: an unhandled
+    // ChildProcess "error" (spawn ENOENT, kill failure) crashes the whole
+    // server, and a failed spawn never emits "exit", so this is the only
+    // signal that turns a bad executable into a bounded start rejection.
+    (this.#child as unknown as EventEmitter).on("error", (error: Error) => {
+      const failure = new ProviderUnavailableError(
+        `codex-lhc child process failed: ${error.message}`,
+      );
+      if (!this.#childError) this.#childError = failure;
+      this.#rejectPending(failure);
     });
     (this.#child as unknown as EventEmitter).on(
       "exit",
@@ -433,6 +446,7 @@ export class CodexLhcAdapter implements ProviderAdapter {
 
   #rpc(method: string, params: unknown): Promise<unknown> {
     if (!this.#transport) throw new ProviderUnavailableError("codex-lhc transport is not started");
+    if (this.#childError) return Promise.reject(this.#childError);
     const id = String(this.#nextId++);
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -453,6 +467,9 @@ export class CodexLhcAdapter implements ProviderAdapter {
     if (!this.#child) return { code: 0, signal: null };
     if (this.#child.exitCode !== null)
       return { code: this.#child.exitCode, signal: this.#child.signalCode };
+    // A child that failed to spawn (no pid) will never emit "exit"; waiting
+    // on it would hang stop() forever.
+    if (this.#childError && this.#child.pid === undefined) return { code: null, signal: null };
     return await new Promise((resolve) => {
       (this.#child as unknown as EventEmitter).once(
         "exit",
@@ -468,6 +485,7 @@ export class CodexLhcAdapter implements ProviderAdapter {
     this.#child = null;
     this.#nativeThreadRef = null;
     this.#activeNativeTurnId = null;
+    this.#childError = null;
     this.#rejectPending(new Error("codex-lhc runtime stopped"));
   }
 

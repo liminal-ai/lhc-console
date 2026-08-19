@@ -21,10 +21,16 @@ export class StreamJsonlTransport implements JsonlTransport {
       if (trimmed) this.#events.emit("line", trimmed);
     });
     (child as unknown as EventEmitter).on("exit", () => this.#events.emit("close"));
+    // A failed spawn or dying child surfaces EPIPE/destroyed errors on its
+    // pipes; unhandled, a stream "error" crashes the process. The child's
+    // own "error"/"exit" events are the real signal, so these are swallowed.
+    child.stdin?.on("error", () => {});
+    child.stdout.on("error", () => {});
   }
 
   send(message: unknown): void {
     if (!this.#child.stdin) throw new Error("provider stdin is required");
+    if (this.#child.stdin.destroyed) return;
     this.#child.stdin.write(`${JSON.stringify(message)}\n`);
   }
 

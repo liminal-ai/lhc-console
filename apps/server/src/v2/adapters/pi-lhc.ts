@@ -15,6 +15,10 @@ import { spawnFencedChild, type HeldWriterLock } from "../writer-lock.ts";
 
 const RPC_TIMEOUT_MS = 30_000;
 const LHC_THREAD_ENTRY_TYPE = "pi-lhc.thread";
+/** Bytes of child stderr kept for failure evidence. Older bytes are dropped. */
+const STDERR_TAIL_BYTES = 8_192;
+/** Lines of that tail quoted into an error message. */
+const STDERR_TAIL_LINES = 5;
 
 export const LHC_HANDOFF_QUIESCE_COMMAND = "lhc-handoff-quiesce";
 export const LHC_HANDOFF_QUIESCE_RECEIPT_PREFIX = "pi-lhc:handoff-quiesce";
@@ -76,6 +80,8 @@ export class PiLhcAdapter implements ProviderAdapter {
   #lastQuiesceReceipt: HandoffQuiesceReceipt | null = null;
   #awaitingQuiesce = false;
   #stopping = false;
+  #stderrTail = "";
+  #childError: Error | null = null;
 
   constructor(options: PiLhcAdapterOptions = {}) {
     this.#options = options;
@@ -96,6 +102,16 @@ export class PiLhcAdapter implements ProviderAdapter {
   }
 
   async start(input: AdapterStartInput): Promise<string> {
+    try {
+      return await this.#start(input);
+    } catch (error) {
+      // Startup failures are the case where the child's own stderr is the only
+      // account of what went wrong, so it is attached here rather than lost.
+      throw this.#withStartEvidence(error);
+    }
+  }
+
+  async #start(input: AdapterStartInput): Promise<string> {
     const injected = this.#options.transport ?? this.#options.testTransport;
     if (injected) {
       this.#transport = injected;
@@ -234,6 +250,9 @@ export class PiLhcAdapter implements ProviderAdapter {
   }
 
   #spawn(input: AdapterStartInput): JsonlTransport {
+    // Evidence is per-child: a restart must not inherit the previous one's.
+    this.#stderrTail = "";
+    this.#childError = null;
     const command = input.command ?? this.#options.command ?? "pi-lhc";
     const args = resolvePiRpcArgs(
       command,
@@ -246,6 +265,15 @@ export class PiLhcAdapter implements ProviderAdapter {
       env: { ...scrubbedEnv({}), ...input.env },
       writerLock: input.writerLock,
     });
+    // Subscribed before anything can await on the child: an unhandled
+    // ChildProcess "error" (spawn ENOENT, kill failure) crashes the whole
+    // server, and a failed spawn never emits "exit", so this is the only
+    // signal that turns a bad executable into a bounded start rejection.
+    (this.#child as unknown as EventEmitter).on("error", (error: Error) => {
+      const failure = new ProviderUnavailableError(`pi-lhc child process failed: ${error.message}`);
+      if (!this.#childError) this.#childError = failure;
+      this.#rejectPending(failure);
+    });
     (this.#child as unknown as EventEmitter).on(
       "exit",
       (code: number | null, signal: NodeJS.Signals | null) => {
@@ -253,7 +281,53 @@ export class PiLhcAdapter implements ProviderAdapter {
         if (!this.#stopping) this.#emit({ type: "exited", code, signal });
       },
     );
+    this.#drainStderr(this.#child);
     return new StreamJsonlTransport(this.#child);
+  }
+
+  /**
+   * Keep the child's stderr moving. A piped stderr nobody reads fills its OS
+   * buffer and blocks the writer — the launcher logs there, so an unread
+   * pipe can wedge the very process this adapter is waiting on. Only the tail
+   * is kept; the rest is discarded as it arrives.
+   */
+  #drainStderr(child: ChildProcess): void {
+    const stderr = child.stderr;
+    if (!stderr) return;
+    stderr.setEncoding("utf8");
+    (stderr as unknown as EventEmitter).on("data", (chunk: string) => {
+      this.#stderrTail = `${this.#stderrTail}${chunk}`.slice(-STDERR_TAIL_BYTES);
+    });
+    // A stderr error must not take the runtime down; the tail simply stops.
+    (stderr as unknown as EventEmitter).on("error", () => {});
+  }
+
+  /** Last few non-empty stderr lines, oldest first. Empty when nothing arrived. */
+  #tailLines(): string[] {
+    return this.#stderrTail
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .slice(-STDERR_TAIL_LINES);
+  }
+
+  /**
+   * Attach start-failure evidence without changing what the error *is*: the
+   * runtime manager classifies rejections by error class, so a decorated
+   * `ProviderUnavailableError` must stay one. Stderr here is evidence, never
+   * a verdict — advisory launcher warnings must not become fatal by proxy.
+   */
+  #withStartEvidence(error: unknown): Error {
+    const base = error instanceof Error ? error : new Error(String(error));
+    const tail = this.#tailLines();
+    if (tail.length === 0) return base;
+    const message = `${base.message} (stderr tail: ${tail.join(" / ")})`;
+    const decorated =
+      base instanceof ProviderUnavailableError
+        ? new ProviderUnavailableError(message)
+        : new Error(message);
+    decorated.stack = base.stack;
+    return decorated;
   }
 
   async #confirmLhcSafeSession(canonicalThreadId: string): Promise<string> {
@@ -426,6 +500,7 @@ export class PiLhcAdapter implements ProviderAdapter {
     id = String(this.#nextId++),
   ): Promise<unknown> {
     if (!this.#transport) throw new ProviderUnavailableError("pi-lhc transport is not started");
+    if (this.#childError) return Promise.reject(this.#childError);
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         if (!this.#pending.has(id)) return;
@@ -445,6 +520,9 @@ export class PiLhcAdapter implements ProviderAdapter {
     if (!this.#child) return { code: 0, signal: null };
     if (this.#child.exitCode !== null)
       return { code: this.#child.exitCode, signal: this.#child.signalCode };
+    // A child that failed to spawn (no pid) will never emit "exit"; waiting
+    // on it would hang stop() forever.
+    if (this.#childError && this.#child.pid === undefined) return { code: null, signal: null };
     return await new Promise((resolve) => {
       (this.#child as unknown as EventEmitter).once(
         "exit",
@@ -463,6 +541,7 @@ export class PiLhcAdapter implements ProviderAdapter {
     this.#lhcHooksConfirmed = false;
     this.#awaitingQuiesce = false;
     this.#stopping = false;
+    this.#childError = null;
     this.#rejectPending(new Error("pi-lhc runtime stopped"));
   }
 

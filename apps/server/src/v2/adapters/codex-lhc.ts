@@ -14,6 +14,27 @@ import { StreamJsonlTransport, type JsonlTransport } from "../jsonl-transport.ts
 import { spawnFencedChild, type HeldWriterLock } from "../writer-lock.ts";
 
 const RPC_TIMEOUT_MS = 30_000;
+/** Bytes of child stderr kept for failure evidence. Older bytes are dropped. */
+const STDERR_TAIL_BYTES = 8_192;
+/** Lines of that tail quoted into an error message. */
+const STDERR_TAIL_LINES = 5;
+/** Config warnings retained from one app-server startup. */
+const MAX_CONFIG_WARNINGS = 20;
+
+/**
+ * A `configWarning` notification the app-server sent after `initialize`
+ * (`codex-rs/app-server-protocol/src/protocol/v2/config.rs` —
+ * `ConfigWarningNotification`). These are non-fatal by protocol: the server
+ * keeps running, having fallen back to defaults or dropped custom rules. They
+ * are kept because they explain a child that starts but behaves unlike the
+ * seat it was configured as, and dropping them silently would leave that
+ * unexplained.
+ */
+export interface CodexConfigWarning {
+  summary: string;
+  details?: string;
+  path?: string;
+}
 
 interface PendingRequest {
   resolve: (value: unknown) => void;
@@ -31,6 +52,11 @@ export interface CodexLhcAdapterOptions {
   ) => ChildProcess;
   command?: string;
   args?: string[];
+  /**
+   * Where config warnings are reported. Defaults to the console's own error
+   * log so a warning is never only visible to whoever thinks to ask for it.
+   */
+  onConfigWarning?: (warning: CodexConfigWarning) => void;
 }
 
 /**
@@ -50,6 +76,8 @@ export class CodexLhcAdapter implements ProviderAdapter {
   #nativeThreadRef: string | null = null;
   #activeNativeTurnId: string | null = null;
   #lastAgentText = "";
+  #stderrTail = "";
+  readonly #configWarnings: CodexConfigWarning[] = [];
 
   constructor(options: CodexLhcAdapterOptions = {}) {
     this.#options = options;
@@ -69,7 +97,31 @@ export class CodexLhcAdapter implements ProviderAdapter {
     this.#rejectPending(new Error(message));
   }
 
+  /** Config warnings this app-server reported, oldest first. */
+  configWarnings(): CodexConfigWarning[] {
+    return [...this.#configWarnings];
+  }
+
+  async getState(): Promise<Record<string, unknown>> {
+    return {
+      nativeThreadRef: this.#nativeThreadRef,
+      activeNativeTurnId: this.#activeNativeTurnId,
+      configWarnings: this.configWarnings(),
+      stderrTail: this.#tailLines(),
+    };
+  }
+
   async start(input: AdapterStartInput): Promise<string> {
+    try {
+      return await this.#start(input);
+    } catch (error) {
+      // Startup failures are the case where the child's own stderr is the only
+      // account of what went wrong, so it is attached here rather than lost.
+      throw this.#withStartEvidence(error);
+    }
+  }
+
+  async #start(input: AdapterStartInput): Promise<string> {
     if (input.approvalPolicy === "surface-server-requests") {
       throw new ProviderUnavailableError(
         "Q4 surface-server-requests is selectable but not implemented: Codex serverRequest handling is unsupported in this plane",
@@ -179,6 +231,9 @@ export class CodexLhcAdapter implements ProviderAdapter {
   }
 
   #spawn(input: AdapterStartInput): JsonlTransport {
+    // Evidence is per-child: a restart must not inherit the previous one's.
+    this.#stderrTail = "";
+    this.#configWarnings.length = 0;
     const command = input.command ?? this.#options.command ?? "codex-lhc";
     const args = input.args ?? this.#options.args ?? ["app-server"];
     const spawnProcess = this.#options.spawnProcess ?? defaultSpawn;
@@ -194,6 +249,7 @@ export class CodexLhcAdapter implements ProviderAdapter {
         this.#emit({ type: "exited", code, signal });
       },
     );
+    this.#drainStderr(this.#child);
     return new StreamJsonlTransport(this.#child);
   }
 
@@ -225,6 +281,10 @@ export class CodexLhcAdapter implements ProviderAdapter {
   }
 
   #handleNotification(method: string, params: Record<string, unknown>): void {
+    if (method === "configWarning") {
+      this.#recordConfigWarning(params);
+      return;
+    }
     if (method === "turn/started") {
       const turn = params.turn as { id?: string } | undefined;
       const nativeTurnId = turn?.id;
@@ -297,6 +357,80 @@ export class CodexLhcAdapter implements ProviderAdapter {
     }
   }
 
+  /**
+   * Keep the child's stderr moving. A piped stderr nobody reads fills its OS
+   * buffer and blocks the writer — the app-server logs there, so an unread
+   * pipe can wedge the very process this adapter is waiting on. Only the tail
+   * is kept; the rest is discarded as it arrives.
+   */
+  #drainStderr(child: ChildProcess): void {
+    const stderr = child.stderr;
+    if (!stderr) return;
+    stderr.setEncoding("utf8");
+    (stderr as unknown as EventEmitter).on("data", (chunk: string) => {
+      this.#stderrTail = `${this.#stderrTail}${chunk}`.slice(-STDERR_TAIL_BYTES);
+    });
+    // A stderr error must not take the runtime down; the tail simply stops.
+    (stderr as unknown as EventEmitter).on("error", () => {});
+  }
+
+  /** Last few non-empty stderr lines, oldest first. Empty when nothing arrived. */
+  #tailLines(): string[] {
+    return this.#stderrTail
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .slice(-STDERR_TAIL_LINES);
+  }
+
+  /**
+   * Attach start-failure evidence without changing what the error *is*: the
+   * runtime manager classifies rejections by error class, so a decorated
+   * `ProviderUnavailableError` must stay one.
+   */
+  #withStartEvidence(error: unknown): Error {
+    const base = error instanceof Error ? error : new Error(String(error));
+    const parts: string[] = [];
+    const tail = this.#tailLines();
+    if (tail.length > 0) parts.push(`stderr tail: ${tail.join(" / ")}`);
+    if (this.#configWarnings.length > 0) {
+      parts.push(
+        `config warnings: ${this.#configWarnings.map((warning) => warning.summary).join(" / ")}`,
+      );
+    }
+    if (parts.length === 0) return base;
+    const message = `${base.message} (${parts.join("; ")})`;
+    const decorated =
+      base instanceof ProviderUnavailableError
+        ? new ProviderUnavailableError(message)
+        : new Error(message);
+    decorated.stack = base.stack;
+    return decorated;
+  }
+
+  /**
+   * `configWarning` is advisory, not a failure: the app-server has already
+   * decided to continue (defaults loaded, custom rules dropped). Reporting it
+   * as a start failure would be a lie in one direction and dropping it would
+   * be a lie in the other, so it is recorded and surfaced as evidence.
+   */
+  #recordConfigWarning(params: Record<string, unknown>): void {
+    const summary = typeof params.summary === "string" ? params.summary.trim() : "";
+    if (!summary) return;
+    const details = typeof params.details === "string" ? params.details.trim() : "";
+    const path = typeof params.path === "string" ? params.path.trim() : "";
+    const warning: CodexConfigWarning = {
+      summary,
+      ...(details ? { details } : {}),
+      ...(path ? { path } : {}),
+    };
+    // Reported every time; retained only up to the cap, so a warning storm
+    // bounds memory without any warning going unreported.
+    (this.#options.onConfigWarning ?? logConfigWarning)(warning);
+    if (this.#configWarnings.length >= MAX_CONFIG_WARNINGS) return;
+    this.#configWarnings.push(warning);
+  }
+
   #rpc(method: string, params: unknown): Promise<unknown> {
     if (!this.#transport) throw new ProviderUnavailableError("codex-lhc transport is not started");
     const id = String(this.#nextId++);
@@ -344,6 +478,12 @@ export class CodexLhcAdapter implements ProviderAdapter {
     }
     this.#pending.clear();
   }
+}
+
+function logConfigWarning(warning: CodexConfigWarning): void {
+  const details = warning.details ? ` — ${warning.details}` : "";
+  const path = warning.path ? ` (${warning.path})` : "";
+  console.error(`codex-lhc app-server config warning: ${warning.summary}${details}${path}`);
 }
 
 function defaultSpawn(

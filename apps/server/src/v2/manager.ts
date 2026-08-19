@@ -2,7 +2,7 @@ import { EventEmitter } from "node:events";
 import { processIsAlive } from "../process-alive.ts";
 import type { AttachInfo } from "../attach-detect.ts";
 import type { AgentRecord } from "../agent-registry.ts";
-import { PROVIDER_CAPABILITIES } from "./adapter.ts";
+import { PROVIDER_CAPABILITIES, ProviderUnavailableError } from "./adapter.ts";
 import type { ProviderAdapter, ProviderNotification, SteerConsumptionEvidence } from "./adapter.ts";
 import {
   isCommandId,
@@ -1925,14 +1925,17 @@ export class RuntimeManager {
  * Classify a failed command. Used both by the generic apply catch and by
  * `runtime.start`, which settles its own failure once it has proved the
  * spawned writer is gone.
+ *
+ * Classification is by error type. Sniffing the message read `provider_error`
+ * failures as `provider_unavailable` whenever their text happened to contain
+ * "unavailable", and missed every unavailability whose wording did not — the
+ * adapters raise `ProviderUnavailableError` precisely so the reason does not
+ * depend on prose.
  */
 function rejectionReasonFor(error: unknown): V2RejectReason {
   if (error instanceof UnsettledOwnerPolicyError) return "policy_unset";
   if (error instanceof WriterIdentityUnresolvedError) return "writer_identity_unresolved";
-  const message = error instanceof Error ? error.message : String(error);
-  if (/unavailable|not available|RPC launcher|CROSS-REPO BLOCKER/i.test(message)) {
-    return "provider_unavailable";
-  }
+  if (error instanceof ProviderUnavailableError) return "provider_unavailable";
   return "provider_error";
 }
 

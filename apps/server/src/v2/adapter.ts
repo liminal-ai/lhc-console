@@ -28,10 +28,15 @@ export interface ProviderCapabilities {
  *
  * Codex: `turn/steer` acknowledges queueing; no notification correlates a
  * queued steer to the point it entered the turn.
+ *
+ * Hermes: `session.steer` splices text into the current tool-result batch with
+ * no correlating id on any subsequent event, so consumption is unprovable on
+ * its wire.
  */
 export const PROVIDER_CAPABILITIES: Record<V2Provider, ProviderCapabilities> = {
   "codex-lhc": { steerConsumption: "unsupported" },
   "pi-lhc": { steerConsumption: "unsupported" },
+  hermes: { steerConsumption: "unsupported" },
 };
 
 export interface AdapterStartInput {

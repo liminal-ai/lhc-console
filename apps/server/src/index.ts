@@ -65,8 +65,7 @@ import { GoalService } from "./goal.ts";
 import { assertLegacyGoalsStartupSafe } from "./goal-migrate.ts";
 import { registerGoalRoutes } from "./goal-routes.ts";
 import { registerAgentRoutes } from "./agent-routes.ts";
-import { CodexLhcAdapter } from "./v2/adapters/codex-lhc.ts";
-import { PiLhcAdapter } from "./v2/adapters/pi-lhc.ts";
+import { createProviderAdapter } from "./v2/adapters/factory.ts";
 import { inspectCanonicalSpan } from "./v2/canonical.ts";
 import { isV2Enabled, loadConfiguredOwnerPolicies, v2BearerToken, v2DbPath } from "./v2/config.ts";
 import { RuntimeManager } from "./v2/manager.ts";
@@ -121,8 +120,7 @@ const v2Manager =
         consoleHome,
         agents: agentRegistry.agents,
         policies: v2Policies,
-        adapterFactory: (provider) =>
-          provider === "codex-lhc" ? new CodexLhcAdapter() : new PiLhcAdapter(),
+        adapterFactory: (provider) => createProviderAdapter(provider),
         detectBusy: (target) =>
           detectAttachedOne(
             {

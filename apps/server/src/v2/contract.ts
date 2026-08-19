@@ -3,7 +3,7 @@
  * surface; adapters translate to and from it.
  */
 
-export const V2_PROVIDERS = ["codex-lhc", "pi-lhc"] as const;
+export const V2_PROVIDERS = ["codex-lhc", "pi-lhc", "hermes"] as const;
 export type V2Provider = (typeof V2_PROVIDERS)[number];
 
 export const V2_RUNTIME_STATES = [
@@ -275,7 +275,7 @@ export function isV2CommandKind(value: unknown): value is V2CommandKind {
 }
 
 export function isV2Provider(value: unknown): value is V2Provider {
-  return value === "codex-lhc" || value === "pi-lhc";
+  return typeof value === "string" && (V2_PROVIDERS as readonly string[]).includes(value);
 }
 
 export function isTerminalReceipt(state: V2ReceiptState): boolean {

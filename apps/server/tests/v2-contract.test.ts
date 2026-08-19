@@ -22,8 +22,27 @@ afterEach(async () => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-function agent(provider: V2Provider, id = provider === "codex-lhc" ? "codex" : "pi"): AgentRecord {
-  const threadId = provider === "codex-lhc" ? "sess-codex" : "th_pi_canonical";
+const AGENT_IDS: Record<V2Provider, string> = {
+  "codex-lhc": "codex",
+  "pi-lhc": "pi",
+  hermes: "hermes",
+};
+
+/** Host-shaped thread ids: codex session uuid alias, pi canonical id, hermes session stem. */
+const RELAY_THREAD_IDS: Record<V2Provider, string> = {
+  "codex-lhc": "sess-codex",
+  "pi-lhc": "th_pi_canonical",
+  hermes: "20260819_000000_abc123",
+};
+
+const HEALTH_THREAD_IDS: Record<V2Provider, string> = {
+  "codex-lhc": "th_codex_canonical",
+  "pi-lhc": "th_pi_canonical",
+  hermes: "th_hermes_canonical",
+};
+
+function agent(provider: V2Provider, id = AGENT_IDS[provider]): AgentRecord {
+  const threadId = RELAY_THREAD_IDS[provider];
   return {
     id,
     name: id,
@@ -31,7 +50,7 @@ function agent(provider: V2Provider, id = provider === "codex-lhc" ? "codex" : "
     duties: [],
     ownerSenderIds: ["owner"],
     mentionPatterns: [`\\b${id}\\b`],
-    health: { hostId: provider, threadId: provider === "pi-lhc" ? threadId : "th_codex_canonical" },
+    health: { hostId: provider, threadId: HEALTH_THREAD_IDS[provider] },
     channels: {},
     relay: {
       hostId: provider,
@@ -89,6 +108,7 @@ async function startRuntime(manager: RuntimeManager, target: string) {
 describe.each([
   { provider: "codex-lhc" as const, native: true },
   { provider: "pi-lhc" as const, native: false },
+  { provider: "hermes" as const, native: false },
 ])("V2 contract via $provider fake adapter", ({ provider }) => {
   it("A1 ordinary turn emits started/item/completed with native id", async () => {
     const { manager, record, adapters } = setup(provider);

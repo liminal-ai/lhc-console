@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { describeHost } from "@lhc-console/core";
 import type { AgentRecord } from "../agent-registry.ts";
-import type { V2Provider, V2ThreadIdentity } from "./contract.ts";
+import { isV2Provider, V2_PROVIDERS, type V2Provider, type V2ThreadIdentity } from "./contract.ts";
 
 export interface WriterResource {
   key: string;
@@ -145,6 +145,6 @@ export function resolveOptedWriterResource(
 }
 
 export function requireV2Provider(hostId: string): V2Provider {
-  if (hostId === "codex-lhc" || hostId === "pi-lhc") return hostId;
-  throw new Error(`V2 provider must be codex-lhc or pi-lhc (got ${hostId})`);
+  if (isV2Provider(hostId)) return hostId;
+  throw new Error(`V2 provider must be one of ${V2_PROVIDERS.join(", ")} (got ${hostId})`);
 }

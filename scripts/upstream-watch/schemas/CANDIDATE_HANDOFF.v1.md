@@ -38,10 +38,10 @@ not_in_scope:     release publish; smoke promote; version bump unless requested
 These are **three different** values. Equality checks between monorepo and
 public-git bases are **invalid** and will falsely fail candidate workflows.
 
-| Field | Grok source | Role |
-| --- | --- | --- |
-| `candidate_sha` | `git rev-parse origin/lhc` (full) | Exact product tree to check out and build |
-| `source_rev` | repo file `SOURCE_REV` | **xAI monorepo** source revision (e.g. `27b3c666…`) |
+| Field                            | Grok source                                           | Role                                                   |
+| -------------------------------- | ----------------------------------------------------- | ------------------------------------------------------ |
+| `candidate_sha`                  | `git rev-parse origin/lhc` (full)                     | Exact product tree to check out and build              |
+| `source_rev`                     | repo file `SOURCE_REV`                                | **xAI monorepo** source revision (e.g. `27b3c666…`)    |
 | `patches_base` / `upstream_base` | `patches/BASE` / public `upstream/main` tip merged in | **Public git** recovery / patch base (e.g. `8a14c91…`) |
 
 - Manifests and handoffs must record **`source_rev` and `patches_base` separately**.

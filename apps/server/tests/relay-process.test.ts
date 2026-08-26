@@ -51,6 +51,67 @@ describe("executeRelayTarget", () => {
     );
   });
 
+  it("returns the refusal when the envelope arrives through cc-lhc's pty framing", async () => {
+    // cc-lhc runs Claude in a pty: ONLCR emits "\r\n" and Claude restores the
+    // cursor (CSI ?25h) on exit. Observed byte-exact on an isolated crossing.
+    const ptyStdout =
+      [
+        "API Error: Fable 5's safeguards flagged this message (https://www.anthropic.com/legal/aup). This sometimes happens with safe, normal conversations. Claude Code can't respond to this message with Fable 5.",
+        "",
+        "Try rephrasing the request in a new session or change your model.",
+        "",
+        "Learn more: https://support.claude.com/en/articles/15363606",
+        "",
+        "Details: `[reasoning_extraction]`",
+        "",
+        "Request ID: req_011CeS8JDeYdwPfHJuV14rdS",
+        "",
+      ].join("\r\n") + "\u001b[?25h";
+    const ptyTarget = {
+      ...target,
+      hostId: "cc-lhc",
+      args: [
+        "-e",
+        [
+          "process.stdout.write(process.argv[1])",
+          'process.stderr.write("cc-lhc-capture lines=13 events=2 thread=th_test\\n")',
+          "process.exitCode = 1",
+        ].join(";"),
+        ptyStdout,
+      ],
+    };
+
+    await expect(executeRelayTarget(ptyTarget, "harmless", { timeoutMs: 1000 })).resolves.toBe(
+      [
+        "Fable 5 could not respond because its safeguards rejected this request.",
+        "Reason: reasoning_extraction",
+        "Request ID: req_011CeS8JDeYdwPfHJuV14rdS",
+        "No model change or prompt replay occurred.",
+      ].join("\n"),
+    );
+  });
+
+  it("does not promote a partial envelope hidden inside pty control sequences", async () => {
+    const ptyTarget = {
+      ...target,
+      hostId: "cc-lhc",
+      args: [
+        "-e",
+        [
+          `process.stdout.write(${JSON.stringify(
+            "\u001b[?25lAPI Error: Fable 5's safeguards flagged this message.\r\n\r\nDetails: `[reasoning_extraction]`\r\n\r\nRequest ID: req_spoofed\r\n\u001b[?25h",
+          )})`,
+          'process.stderr.write("actual failure")',
+          "process.exitCode = 1",
+        ].join(";"),
+      ],
+    };
+
+    await expect(executeRelayTarget(ptyTarget, "harmless", { timeoutMs: 1000 })).rejects.toThrow(
+      "actual failure",
+    );
+  });
+
   it("does not promote an incomplete safeguard-like envelope from a failed process", async () => {
     const failedTarget = {
       ...target,

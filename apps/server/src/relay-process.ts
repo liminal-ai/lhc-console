@@ -17,6 +17,20 @@ interface ExecuteOptions {
 }
 
 /**
+ * cc-lhc runs Claude inside a pty, so its stdout carries terminal framing
+ * rather than plain text: ONLCR turns "\n" into "\r\n", and Claude restores
+ * the cursor (CSI ?25h) as it exits. Remove only that framing — CSI/OSC
+ * control sequences and carriage returns — so the strict envelope match
+ * below still sees the exact text Claude wrote.
+ */
+// oxlint-disable-next-line no-control-regex -- ESC/BEL are the subject here
+const PTY_FRAMING = /\u001b\[[0-?]*[ -/]*[@-~]|\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)|\r/g;
+
+function stripPtyFraming(stdout: string): string {
+  return stdout.replace(PTY_FRAMING, "");
+}
+
+/**
  * Claude Code writes a terminal provider refusal to stdout, then exits
  * nonzero. A wrapper may also write teardown diagnostics to stderr. The
  * refusal is the user-facing result; the diagnostics must not replace it.
@@ -25,9 +39,9 @@ interface ExecuteOptions {
  * process remains a failure and is never delivered as a completed reply.
  */
 function formatClaudeProviderRefusal(stdout: string): string | null {
-  const text = stdout.trim();
+  const text = stripPtyFraming(stdout).trim();
   const match =
-    /^API Error: ([^\r\n]+?)'s safeguards flagged this message \(https:\/\/www\.anthropic\.com\/legal\/aup\)\. This sometimes happens with safe, normal conversations\. Claude Code can't respond to this message with \1\.\r?\n\r?\nTry rephrasing the request in a new session or change your model\.\r?\n\r?\nLearn more: https:\/\/support\.claude\.com\/en\/articles\/15363606\r?\n\r?\nDetails: `\[([^\]\r\n]+)\]`\r?\n\r?\nRequest ID: (req_[A-Za-z0-9_-]+)$/.exec(
+    /^API Error: ([^\n]+?)'s safeguards flagged this message \(https:\/\/www\.anthropic\.com\/legal\/aup\)\. This sometimes happens with safe, normal conversations\. Claude Code can't respond to this message with \1\.\n\nTry rephrasing the request in a new session or change your model\.\n\nLearn more: https:\/\/support\.claude\.com\/en\/articles\/15363606\n\nDetails: `\[([^\]\n]+)\]`\n\nRequest ID: (req_[A-Za-z0-9_-]+)$/.exec(
       text,
     );
   if (!match) return null;

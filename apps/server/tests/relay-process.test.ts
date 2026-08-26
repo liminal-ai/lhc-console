@@ -15,6 +15,63 @@ describe("executeRelayTarget", () => {
     await expect(executeRelayTarget(target, prompt, { timeoutMs: 1000 })).resolves.toBe(prompt);
   });
 
+  it("returns a concise Claude provider refusal instead of wrapper teardown diagnostics", async () => {
+    const providerFailure = [
+      "API Error: Fable 5's safeguards flagged this message (https://www.anthropic.com/legal/aup). This sometimes happens with safe, normal conversations. Claude Code can't respond to this message with Fable 5.",
+      "",
+      "Try rephrasing the request in a new session or change your model.",
+      "",
+      "Learn more: https://support.claude.com/en/articles/15363606",
+      "",
+      "Details: `[reasoning_extraction]`",
+      "",
+      "Request ID: req_test_123",
+    ].join("\n");
+    const refusalTarget = {
+      ...target,
+      hostId: "cc-lhc",
+      args: [
+        "-e",
+        [
+          "process.stdout.write(process.argv[1])",
+          'process.stderr.write("cc-lhc-capture lines=31 events=2 thread=th_test\\n")',
+          "process.exitCode = 1",
+        ].join(";"),
+        providerFailure,
+      ],
+    };
+
+    await expect(executeRelayTarget(refusalTarget, "harmless", { timeoutMs: 1000 })).resolves.toBe(
+      [
+        "Fable 5 could not respond because its safeguards rejected this request.",
+        "Reason: reasoning_extraction",
+        "Request ID: req_test_123",
+        "No model change or prompt replay occurred.",
+      ].join("\n"),
+    );
+  });
+
+  it("does not promote an incomplete safeguard-like envelope from a failed process", async () => {
+    const failedTarget = {
+      ...target,
+      hostId: "cc-lhc",
+      args: [
+        "-e",
+        [
+          `process.stdout.write(${JSON.stringify(
+            "API Error: Fable 5's safeguards flagged this message.\n\nDetails: `[reasoning_extraction]`\n\nRequest ID: req_spoofed",
+          )})`,
+          'process.stderr.write("actual failure")',
+          "process.exitCode = 1",
+        ].join(";"),
+      ],
+    };
+
+    await expect(executeRelayTarget(failedTarget, "harmless", { timeoutMs: 1000 })).rejects.toThrow(
+      "actual failure",
+    );
+  });
+
   it("invokes onSpawn once when the child process spawns", async () => {
     const spawned: string[] = [];
     await executeRelayTarget(target, "ok", {

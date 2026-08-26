@@ -16,6 +16,30 @@ interface ExecuteOptions {
   writerLock?: HeldWriterLock | null;
 }
 
+/**
+ * Claude Code writes a terminal provider refusal to stdout, then exits
+ * nonzero. A wrapper may also write teardown diagnostics to stderr. The
+ * refusal is the user-facing result; the diagnostics must not replace it.
+ *
+ * Keep this deliberately narrow. Arbitrary partial stdout from a crashed
+ * process remains a failure and is never delivered as a completed reply.
+ */
+function formatClaudeProviderRefusal(stdout: string): string | null {
+  const text = stdout.trim();
+  const match =
+    /^API Error: ([^\r\n]+?)'s safeguards flagged this message \(https:\/\/www\.anthropic\.com\/legal\/aup\)\. This sometimes happens with safe, normal conversations\. Claude Code can't respond to this message with \1\.\r?\n\r?\nTry rephrasing the request in a new session or change your model\.\r?\n\r?\nLearn more: https:\/\/support\.claude\.com\/en\/articles\/15363606\r?\n\r?\nDetails: `\[([^\]\r\n]+)\]`\r?\n\r?\nRequest ID: (req_[A-Za-z0-9_-]+)$/.exec(
+      text,
+    );
+  if (!match) return null;
+  const [, model, reason, requestId] = match;
+  return [
+    `${model} could not respond because its safeguards rejected this request.`,
+    `Reason: ${reason}`,
+    `Request ID: ${requestId}`,
+    "No model change or prompt replay occurred.",
+  ].join("\n");
+}
+
 export function executeRelayTarget(
   target: RelayTarget,
   prompt: string,
@@ -45,6 +69,13 @@ export function executeRelayTarget(
         if (error.killed) {
           reject(new Error(`relay process timed out after ${timeoutMs}ms`));
           return;
+        }
+        if (target.hostId === "cc-lhc") {
+          const refusal = formatClaudeProviderRefusal(stdout);
+          if (refusal !== null) {
+            resolve(refusal);
+            return;
+          }
         }
         reject(new Error(stderr.trim() || error.message));
       },

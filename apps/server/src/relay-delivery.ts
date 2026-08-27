@@ -73,7 +73,10 @@ async function deliverPhoton(job: RelayJob, context: RelayDeliveryContext): Prom
   if (!context.photonConnectors) {
     throw new Error("photon connectors are not running");
   }
-  const message = formatPhotonMessage(job.output?.trim() ? job.output : "(empty reply)", job.id);
+  const message =
+    job.status === "failed"
+      ? formatFailureNotice(job)
+      : formatPhotonMessage(job.output?.trim() ? job.output : "(empty reply)", job.id);
   await context.photonConnectors.send(route.agentId, route.spaceId, message);
   const metadata = job.delivery?.metadata as GroupWakeDeliveryMetadata | undefined;
   if (metadata?.kind === "photon_group_wake") {
@@ -83,6 +86,21 @@ async function deliverPhoton(job: RelayJob, context: RelayDeliveryContext): Prom
     );
     store.advanceCursor(metadata.spaceId, metadata.wakeMessageId, metadata.consumedIds);
   }
+}
+
+const MAX_FAILURE_DETAIL_LENGTH = 600;
+
+/**
+ * One truthful, bounded notice for a failed direct turn. Names the job so the
+ * full error stays reachable, never replays the prompt, never retries the turn.
+ */
+export function formatFailureNotice(job: RelayJob): string {
+  const detail = (job.error ?? "unknown error").trim();
+  const bounded =
+    detail.length > MAX_FAILURE_DETAIL_LENGTH
+      ? `${detail.slice(0, MAX_FAILURE_DETAIL_LENGTH)}…`
+      : detail;
+  return `⚠️ ${job.target} failed to complete your request.\n${bounded}\n[relay job ${job.id}]`;
 }
 
 export function formatPhotonMessage(message: string, jobId: string): string {

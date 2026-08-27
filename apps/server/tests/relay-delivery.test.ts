@@ -180,6 +180,35 @@ describe("deliverRelayJob", () => {
     expect(sent[0]).toContain("truncated for iMessage");
   });
 
+  it("sends one bounded failure notice for a failed direct job without replaying the prompt", async () => {
+    const sent: string[] = [];
+    await deliverRelayJob(
+      job({
+        id: "job-failed",
+        status: "failed",
+        output: null,
+        prompt: "SECRET PROMPT TEXT",
+        error: `codex exec exited with code 2\n${"x".repeat(3_000)}`,
+      }),
+      {
+        agents: [],
+        consoleHome: "/tmp",
+        photonConnectors: {
+          send: async (_agentId: string, _spaceId: string, text: string) => {
+            sent.push(text);
+          },
+        } as RelayDeliveryContext["photonConnectors"],
+      },
+    );
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatch(/failed/i);
+    expect(sent[0]).toContain("job-failed");
+    expect(sent[0]).toContain("codex exec exited with code 2");
+    expect(sent[0]).not.toContain("SECRET PROMPT TEXT");
+    expect(sent[0]?.length).toBeLessThanOrEqual(1_000);
+  });
+
   it("does not send an empty Markdown payload when an agent returns an empty string", async () => {
     const sent: string[] = [];
     await deliverRelayJob(job({ output: "" }), {

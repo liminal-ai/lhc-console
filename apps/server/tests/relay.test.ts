@@ -722,6 +722,81 @@ describe("RelayQueue", () => {
     }
   });
 
+  it("fails a nonempty direct submission whose turn returns only whitespace and delivers one failure notice", async () => {
+    const delivered: Array<{ status: string; output: string | null; error: string | null }> = [];
+    const queue = createQueue({
+      dbPath: tempDb(),
+      targets: {
+        fable: {
+          hostId: "cc-lhc",
+          threadId: "th_fable",
+          cwd: "/tmp",
+          command: "unused",
+          args: [],
+        },
+      },
+      isBusy: () => false,
+      execute: async () => "  \n\t",
+      deliver: async (job) => {
+        delivered.push({ status: job.status, output: job.output, error: job.error });
+      },
+    });
+
+    try {
+      const submitted = queue.enqueue({
+        target: "fable",
+        prompt: "please fix it",
+        notify: "photon",
+      });
+      const settled = await queue.wait(submitted.id);
+      expect(settled.status).toBe("failed");
+      expect(settled.error).toMatch(/empty reply/i);
+      await expect.poll(() => queue.get(submitted.id)?.deliveryStatus).toBe("delivered");
+      expect(queue.get(submitted.id)?.status).toBe("failed");
+      expect(delivered).toEqual([{ status: "failed", output: null, error: settled.error }]);
+    } finally {
+      await queue.close();
+    }
+  });
+
+  it("delivers exactly one failure notice for a nonzero direct failure and keeps the job failed", async () => {
+    const delivered: string[] = [];
+    const queue = createQueue({
+      dbPath: tempDb(),
+      targets: {
+        fable: {
+          hostId: "cc-lhc",
+          threadId: "th_fable",
+          cwd: "/tmp",
+          command: "unused",
+          args: [],
+        },
+      },
+      isBusy: () => false,
+      execute: async () => {
+        throw new Error("codex exec exited with code 2");
+      },
+      deliver: async (job) => {
+        delivered.push(`${job.status}:${job.error}`);
+      },
+    });
+
+    try {
+      const submitted = queue.enqueue({
+        target: "fable",
+        prompt: "please fix it",
+        notify: "photon",
+      });
+      const settled = await queue.wait(submitted.id);
+      expect(settled.status).toBe("failed");
+      await expect.poll(() => queue.get(submitted.id)?.deliveryStatus).toBe("delivered");
+      expect(queue.get(submitted.id)?.status).toBe("failed");
+      expect(delivered).toEqual(["failed:codex exec exited with code 2"]);
+    } finally {
+      await queue.close();
+    }
+  });
+
   it("delivers to a persisted per-job destination", async () => {
     const delivered: Array<{ spaceId: string; text: string }> = [];
     const queue = createQueue({

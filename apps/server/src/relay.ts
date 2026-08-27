@@ -774,7 +774,7 @@ export class RelayQueue {
               )
               .run(job.prompt, finishedAt, job.id);
           }, undefined);
-          if (!this.#dbClosed) await this.#deliverCompleted(job.id);
+          if (!this.#dbClosed) await this.#deliverSettled(job.id);
           continue;
         }
         const controller = new AbortController();
@@ -791,6 +791,11 @@ export class RelayQueue {
             executeLifecycle,
             launchFence,
           );
+          if (isDirectAgentJob(job) && job.prompt.trim() !== "" && output.trim() === "") {
+            // A nonempty direct submission that yields no text is a failed turn,
+            // not a successful empty reply. Group wakes keep their own contract.
+            throw new Error(EMPTY_REPLY_ERROR);
+          }
           const finishedAt = new Date().toISOString();
           this.#withDb(() => {
             this.#db
@@ -801,7 +806,7 @@ export class RelayQueue {
           }, undefined);
           const finished = this.#jobLifecycle?.onFinished?.(job);
           if (finished) await finished.catch(() => undefined);
-          if (!this.#dbClosed) await this.#deliverCompleted(job.id);
+          if (!this.#dbClosed) await this.#deliverSettled(job.id);
         } catch (error) {
           const finishedAt = new Date().toISOString();
           const message = error instanceof Error ? error.message : String(error);
@@ -813,6 +818,7 @@ export class RelayQueue {
               .run(message, finishedAt, job.id);
           }, undefined);
           this.#applyFailureFallback(job.id);
+          if (!this.#dbClosed) await this.#deliverSettled(job.id);
         } finally {
           if (this.get(job.id)?.status !== "completed") {
             const finished = this.#jobLifecycle?.onFinished?.(job);
@@ -890,12 +896,12 @@ export class RelayQueue {
     const rows = this.#db
       .prepare(
         `SELECT id FROM relay_jobs
-         WHERE target = ? AND status = 'completed'
+         WHERE target = ? AND status IN ('completed', 'failed')
            AND delivery_status IN ('pending', 'failed')
          ORDER BY finished_at, rowid`,
       )
       .all(target) as unknown as Array<{ id: string }>;
-    for (const row of rows) await this.#deliverCompleted(row.id);
+    for (const row of rows) await this.#deliverSettled(row.id);
   }
 
   #claimDelivery(id: string): string | null {
@@ -905,7 +911,7 @@ export class RelayQueue {
     const row = this.#db
       .prepare(
         `SELECT delivery_status, delivery_owner_pid, delivery_owner_token, delivery_lease_expires_at
-         FROM relay_jobs WHERE id = ? AND status = 'completed'`,
+         FROM relay_jobs WHERE id = ? AND status IN ('completed', 'failed')`,
       )
       .get(id) as
       | {
@@ -932,7 +938,7 @@ export class RelayQueue {
                delivery_owner_pid = ?,
                delivery_owner_token = ?,
                delivery_lease_expires_at = ?
-           WHERE id = ? AND status = 'completed' AND delivery_status = 'delivering'
+           WHERE id = ? AND status IN ('completed', 'failed') AND delivery_status = 'delivering'
              AND delivery_owner_token IS ?
              AND delivery_lease_expires_at IS ?`,
         )
@@ -948,7 +954,7 @@ export class RelayQueue {
              delivery_owner_pid = ?,
              delivery_owner_token = ?,
              delivery_lease_expires_at = ?
-         WHERE id = ? AND status = 'completed' AND delivery_status IN ('pending', 'failed')`,
+         WHERE id = ? AND status IN ('completed', 'failed') AND delivery_status IN ('pending', 'failed')`,
       )
       .run(process.pid, token, leaseExpires, id);
     return claim.changes === 1 ? token : null;
@@ -999,12 +1005,12 @@ export class RelayQueue {
     return updated.changes === 1;
   }
 
-  async #deliverCompleted(id: string, attempt = 0): Promise<void> {
+  async #deliverSettled(id: string, attempt = 0): Promise<void> {
     this.#outstandingRuns += 1;
     try {
       if (this.#dbClosed) return;
       const job = this.get(id);
-      if (job?.status !== "completed" || !this.#needsDelivery(job) || !this.#deliver) return;
+      if (!job || !this.#isDeliverable(job) || !this.#deliver) return;
       const token = this.#claimDelivery(id);
       if (!token) return;
       let leaseLost = false;
@@ -1110,7 +1116,7 @@ export class RelayQueue {
       this.#deliveryRetryTimers.delete(id);
       this.#outstandingRuns -= 1;
       this.#notifyOutstandingDrain();
-      const run = this.#deliverCompleted(id, attempt);
+      const run = this.#deliverSettled(id, attempt);
       this.#activeRuns.add(run);
       void run.finally(() => this.#activeRuns.delete(run));
     }, delay);
@@ -1120,6 +1126,25 @@ export class RelayQueue {
   #needsDelivery(job: RelayJob): boolean {
     return Boolean(job.delivery ?? job.notify);
   }
+
+  /**
+   * Completed jobs deliver their output. Failed jobs deliver one failure
+   * notice, but only direct Agent submissions: group wakes fall back to the
+   * catch-up store instead, and outbound/lee jobs never execute.
+   */
+  #isDeliverable(job: RelayJob): boolean {
+    if (!this.#needsDelivery(job)) return false;
+    if (job.status === "completed") return true;
+    return job.status === "failed" && isDirectAgentJob(job);
+  }
+}
+
+export const EMPTY_REPLY_ERROR = "agent turn produced an empty reply";
+
+export function isDirectAgentJob(job: RelayJob): boolean {
+  if (job.jobKind !== "agent" || job.target === "lee") return false;
+  const kind = (job.delivery?.metadata as { kind?: unknown } | undefined)?.kind;
+  return kind !== "photon_group_wake";
 }
 
 function sleep(ms: number): Promise<void> {

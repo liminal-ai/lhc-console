@@ -4,6 +4,7 @@ import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { applyGroupWakeFailureFallback } from "./relay-failure-fallback.ts";
 import { processIsAlive } from "./process-alive.ts";
+import { stripPtyFraming } from "./relay-process.ts";
 import { ensureColumn, runExclusiveMigration } from "./sqlite-migrate.ts";
 
 export type RelayJobStatus =
@@ -791,7 +792,11 @@ export class RelayQueue {
             executeLifecycle,
             launchFence,
           );
-          if (isDirectAgentJob(job) && job.prompt.trim() !== "" && output.trim() === "") {
+          if (
+            isDirectAgentJob(job) &&
+            job.prompt.trim() !== "" &&
+            stripPtyFraming(output).trim() === ""
+          ) {
             // A nonempty direct submission that yields no text is a failed turn,
             // not a successful empty reply. Group wakes keep their own contract.
             throw new Error(EMPTY_REPLY_ERROR);

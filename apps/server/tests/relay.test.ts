@@ -5,7 +5,9 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import { GroupCatchUpStore } from "../src/group-catch-up.ts";
-import { RelayQueue, DELIVERY_RETRY_BASE_MS } from "../src/relay.ts";
+import { deliverRelayJob } from "../src/relay-delivery.ts";
+import { executeRelayTarget } from "../src/relay-process.ts";
+import { EMPTY_REPLY_ERROR, RelayQueue, DELIVERY_RETRY_BASE_MS } from "../src/relay.ts";
 
 const dirs: string[] = [];
 
@@ -28,6 +30,23 @@ function failureFallbackApplied(dbPath: string, id: string): number {
       .prepare("SELECT failure_fallback_applied FROM relay_jobs WHERE id = ?")
       .get(id) as { failure_fallback_applied: number };
     return row.failure_fallback_applied;
+  } finally {
+    db.close();
+  }
+}
+
+function durableDeliveryIntents(dbPath: string): Array<{
+  id: string;
+  status: string;
+  delivery_status: string | null;
+}> {
+  const db = new DatabaseSync(dbPath);
+  try {
+    return db
+      .prepare(
+        `SELECT id, status, delivery_status FROM relay_jobs WHERE delivery_status IS NOT NULL`,
+      )
+      .all() as Array<{ id: string; status: string; delivery_status: string | null }>;
   } finally {
     db.close();
   }
@@ -759,6 +778,43 @@ describe("RelayQueue", () => {
     }
   });
 
+  it("fails a nonempty direct submission whose turn returns only pty framing and delivers one failure notice", async () => {
+    const delivered: Array<{ status: string; output: string | null; error: string | null }> = [];
+    const queue = createQueue({
+      dbPath: tempDb(),
+      targets: {
+        fable: {
+          hostId: "cc-lhc",
+          threadId: "th_fable",
+          cwd: "/tmp",
+          command: "unused",
+          args: [],
+        },
+      },
+      isBusy: () => false,
+      execute: async () => "\u001b[?25l\u001b]0;title\u0007\u001b[?25h\r",
+      deliver: async (job) => {
+        delivered.push({ status: job.status, output: job.output, error: job.error });
+      },
+    });
+
+    try {
+      const submitted = queue.enqueue({
+        target: "fable",
+        prompt: "please fix it",
+        notify: "photon",
+      });
+      const settled = await queue.wait(submitted.id);
+      expect(settled.status).toBe("failed");
+      expect(settled.error).toBe(EMPTY_REPLY_ERROR);
+      await expect.poll(() => queue.get(submitted.id)?.deliveryStatus).toBe("delivered");
+      expect(queue.get(submitted.id)?.status).toBe("failed");
+      expect(delivered).toEqual([{ status: "failed", output: null, error: EMPTY_REPLY_ERROR }]);
+    } finally {
+      await queue.close();
+    }
+  });
+
   it("delivers exactly one failure notice for a nonzero direct failure and keeps the job failed", async () => {
     const delivered: string[] = [];
     const queue = createQueue({
@@ -792,6 +848,109 @@ describe("RelayQueue", () => {
       await expect.poll(() => queue.get(submitted.id)?.deliveryStatus).toBe("delivered");
       expect(queue.get(submitted.id)?.status).toBe("failed");
       expect(delivered).toEqual(["failed:codex exec exited with code 2"]);
+    } finally {
+      await queue.close();
+    }
+  });
+
+  it("keeps a distinctive submitted prompt marker out of failure-notice copy handed to Photon", async () => {
+    const promptMarker = "LIM136_PROMPT_MARKER_a8f3e2c1_DO_NOT_LEAK";
+    const sent: string[] = [];
+    const queue = createQueue({
+      dbPath: tempDb(),
+      targets: {
+        fable: {
+          hostId: "cc-lhc",
+          threadId: "th_fable",
+          cwd: "/tmp",
+          command: "unused",
+          args: [],
+        },
+      },
+      isBusy: () => false,
+      execute: async () => {
+        throw new Error("codex exec exited with code 2");
+      },
+      deliver: async (job) => {
+        await deliverRelayJob(job, {
+          agents: [],
+          consoleHome: "/tmp",
+          photonConnectors: {
+            send: async (_agentId: string, _spaceId: string, text: string) => {
+              sent.push(text);
+            },
+          } as Parameters<typeof deliverRelayJob>[1]["photonConnectors"],
+        });
+      },
+    });
+
+    try {
+      const submitted = queue.enqueue({
+        target: "fable",
+        prompt: `please investigate ${promptMarker} immediately`,
+        notify: "photon",
+        delivery: { channel: "photon", destination: { spaceId: "chat-1" } },
+      });
+      const settled = await queue.wait(submitted.id);
+      expect(settled.status).toBe("failed");
+      await expect.poll(() => queue.get(submitted.id)?.deliveryStatus).toBe("delivered");
+      expect(sent).toHaveLength(1);
+      expect(sent[0]).toMatch(/failed/i);
+      expect(sent[0]).toContain(submitted.id);
+      expect(sent[0]).toContain("codex exec exited with code 2");
+      expect(sent[0]).not.toContain(promptMarker);
+      expect(sent[0]).not.toContain("please investigate");
+    } finally {
+      await queue.close();
+    }
+  });
+
+  it("delivers code-3 capture-degraded stdout as a completed result without a failure notice", async () => {
+    const delivered: Array<{ status: string; output: string | null; error: string | null }> = [];
+    const queue = createQueue({
+      dbPath: tempDb(),
+      targets: {
+        fable: {
+          hostId: "cc-lhc",
+          threadId: "th_fable",
+          cwd: process.cwd(),
+          command: process.execPath,
+          args: [
+            "-e",
+            [
+              "process.stdout.write('agent result after degraded capture')",
+              "process.stderr.write('wrapper noise\\nCC_LHC_CAPTURE_DEGRADED: jsonl truncated\\n')",
+              "process.exit(3)",
+            ].join(";"),
+          ],
+        },
+      },
+      isBusy: () => false,
+      execute: (target, prompt, signal) =>
+        executeRelayTarget(target, prompt, { signal, timeoutMs: 1000 }),
+      deliver: async (job) => {
+        delivered.push({ status: job.status, output: job.output, error: job.error });
+      },
+    });
+
+    try {
+      const submitted = queue.enqueue({
+        target: "fable",
+        prompt: "please fix it",
+        notify: "photon",
+      });
+      const settled = await queue.wait(submitted.id);
+      expect(settled.status).toBe("completed");
+      expect(settled.output).toBe("agent result after degraded capture");
+      expect(settled.error).toBeNull();
+      await expect.poll(() => queue.get(submitted.id)?.deliveryStatus).toBe("delivered");
+      expect(delivered).toEqual([
+        {
+          status: "completed",
+          output: "agent result after degraded capture",
+          error: null,
+        },
+      ]);
     } finally {
       await queue.close();
     }
@@ -1095,6 +1254,77 @@ describe("RelayQueue", () => {
       await expect.poll(() => second.get(submitted.id)?.deliveryStatus).toBe("delivered");
       expect(delivered).toEqual([{ spaceId: "chat-originating", text: "saved reply" }]);
       expect(executeCalls).toBe(1);
+    } finally {
+      await second.close();
+    }
+  });
+
+  it("recovers failed-job failure-notice delivery after restart without rerunning execution", async () => {
+    const dbPath = tempDb();
+    const target = {
+      hostId: "pi-lhc",
+      threadId: "th_fable",
+      cwd: "/tmp",
+      command: "unused",
+      args: [],
+    };
+    let executeCalls = 0;
+    const first = new RelayQueue({
+      dbPath,
+      targets: { fable: target },
+      isBusy: () => false,
+      execute: async () => {
+        executeCalls += 1;
+        throw new Error("codex exec exited with code 2");
+      },
+    });
+    first.start();
+    const submitted = first.enqueue({
+      target: "fable",
+      prompt: "please fix it",
+      delivery: { channel: "photon", destination: { spaceId: "chat-originating" } },
+    });
+    await first.wait(submitted.id);
+    expect(first.get(submitted.id)?.status).toBe("failed");
+    expect(first.get(submitted.id)?.deliveryStatus).toBe("pending");
+    expect(durableDeliveryIntents(dbPath)).toEqual([
+      { id: submitted.id, status: "failed", delivery_status: "pending" },
+    ]);
+    await first.close();
+
+    const delivered: Array<{ status: string; spaceId: string; error: string | null }> = [];
+    const second = new RelayQueue({
+      dbPath,
+      targets: { fable: target },
+      isBusy: () => false,
+      execute: async () => {
+        executeCalls += 1;
+        return "should-not-run";
+      },
+      deliver: async (job) => {
+        delivered.push({
+          status: job.status,
+          spaceId: job.delivery?.destination.spaceId ?? "",
+          error: job.error,
+        });
+      },
+      busyPollMs: 5,
+    });
+    second.start();
+    try {
+      await expect.poll(() => second.get(submitted.id)?.deliveryStatus).toBe("delivered");
+      expect(second.get(submitted.id)?.status).toBe("failed");
+      expect(delivered).toEqual([
+        {
+          status: "failed",
+          spaceId: "chat-originating",
+          error: "codex exec exited with code 2",
+        },
+      ]);
+      expect(executeCalls).toBe(1);
+      expect(durableDeliveryIntents(dbPath)).toEqual([
+        { id: submitted.id, status: "failed", delivery_status: "delivered" },
+      ]);
     } finally {
       await second.close();
     }
@@ -1553,6 +1783,79 @@ describe("RelayQueue", () => {
         .poll(() => queue.get("stale-delivery")?.deliveryStatus, { timeout: 1_000 })
         .toBe("delivered");
       expect(sends).toBe(1);
+    } finally {
+      await queue.close();
+    }
+  });
+
+  it("reclaims failed-job delivery after a stale lease and dead owner", async () => {
+    const dbPath = tempDb();
+    const target = {
+      hostId: "pi-lhc",
+      threadId: "th_fable",
+      cwd: "/tmp",
+      command: "unused",
+      args: [],
+    };
+    const seed = new DatabaseSync(dbPath);
+    seed.exec(`
+      CREATE TABLE relay_jobs (
+        id TEXT PRIMARY KEY, target TEXT NOT NULL, prompt TEXT NOT NULL,
+        status TEXT NOT NULL, output TEXT, error TEXT, created_at TEXT NOT NULL,
+        started_at TEXT, finished_at TEXT, notify TEXT, delivery_status TEXT,
+        delivery_error TEXT, owner_pid INTEGER, delivery_channel TEXT,
+        delivery_destination TEXT, delivery_metadata TEXT, delivery_owner_pid INTEGER,
+        delivery_owner_token TEXT, delivery_lease_expires_at TEXT,
+        failure_fallback_applied INTEGER NOT NULL DEFAULT 0
+      )
+    `);
+    const now = new Date().toISOString();
+    seed
+      .prepare(
+        `INSERT INTO relay_jobs
+         (id, target, prompt, status, error, created_at, finished_at, delivery_status,
+          delivery_channel, delivery_destination, delivery_owner_pid, delivery_owner_token,
+          delivery_lease_expires_at, failure_fallback_applied)
+         VALUES (?, ?, ?, 'failed', ?, ?, ?, 'delivering', ?, ?, ?, ?, ?, 0)`,
+      )
+      .run(
+        "stale-failed-delivery",
+        "fable",
+        "please fix it",
+        "codex exec exited with code 2",
+        now,
+        now,
+        "photon",
+        JSON.stringify({ spaceId: "chat-1" }),
+        999_999_999,
+        "dead-owner",
+        new Date(Date.now() - 60_000).toISOString(),
+      );
+    seed.close();
+
+    let sends = 0;
+    const delivered: Array<{ status: string; error: string | null }> = [];
+    const queue = createQueue({
+      dbPath,
+      targets: { fable: target },
+      isBusy: () => false,
+      execute: async () => "unused",
+      deliver: async (job) => {
+        sends += 1;
+        delivered.push({ status: job.status, error: job.error });
+      },
+      busyPollMs: 5,
+    });
+    try {
+      await expect
+        .poll(() => queue.get("stale-failed-delivery")?.deliveryStatus, { timeout: 1_000 })
+        .toBe("delivered");
+      expect(queue.get("stale-failed-delivery")?.status).toBe("failed");
+      expect(sends).toBe(1);
+      expect(delivered).toEqual([{ status: "failed", error: "codex exec exited with code 2" }]);
+      expect(durableDeliveryIntents(dbPath)).toEqual([
+        { id: "stale-failed-delivery", status: "failed", delivery_status: "delivered" },
+      ]);
     } finally {
       await queue.close();
     }

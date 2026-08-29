@@ -1,5 +1,33 @@
-import { describe, expect, it } from "vite-plus/test";
-import { executeRelayTarget } from "../src/relay-process.ts";
+import { describe, expect, it, vi } from "vite-plus/test";
+import { formatFailureNotice } from "../src/relay-delivery.ts";
+import {
+  executeRelayTarget,
+  relayProcessFailureMessage,
+  RelayProcessError,
+} from "../src/relay-process.ts";
+import type { RelayJob } from "../src/relay.ts";
+
+function noticeFromError(error: Error, prompt: string): string {
+  const job: RelayJob = {
+    id: "job-blank-stderr",
+    target: "fable",
+    prompt,
+    status: "failed",
+    jobClass: "deprioritized",
+    jobKind: "agent",
+    sender: null,
+    output: null,
+    error: error.message,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:00:00.000Z",
+    notify: "photon",
+    delivery: { channel: "photon", destination: { spaceId: "chat-1" } },
+    deliveryStatus: "pending",
+    deliveryError: null,
+  };
+  return formatFailureNotice(job);
+}
 
 const target = {
   hostId: "pi-lhc",
@@ -197,7 +225,7 @@ describe("executeRelayTarget", () => {
       signal: controller.signal,
     });
     controller.abort();
-    await expect(running).rejects.toThrow("aborted");
+    await expect(running).rejects.toThrow("relay process exited with code ABORT_ERR");
   });
 
   it("injects LHC_AGENT_ID for durable agent self-identification", async () => {
@@ -223,5 +251,243 @@ describe("executeRelayTarget", () => {
     await expect(executeRelayTarget(withTargetEnv, "ignored", { timeoutMs: 1000 })).resolves.toBe(
       `${process.env.PATH}:fable`,
     );
+  });
+
+  it("rejects a structured process error that preserves code, stdout, and stderr", async () => {
+    const failedTarget = {
+      ...target,
+      args: [
+        "-e",
+        [
+          "process.stdout.write('partial-out')",
+          "process.stderr.write('boom-stderr\\n')",
+          "process.exit(2)",
+        ].join(";"),
+      ],
+    };
+    const error = await executeRelayTarget(failedTarget, "harmless", { timeoutMs: 1000 }).then(
+      () => {
+        throw new Error("expected rejection");
+      },
+      (reason: unknown) => reason,
+    );
+    expect(error).toBeInstanceOf(RelayProcessError);
+    const processError = error as RelayProcessError;
+    expect(processError.code).toBe(2);
+    expect(processError.stdout).toBe("partial-out");
+    expect(processError.stderr).toBe("boom-stderr\n");
+    expect(processError.message).toBe("boom-stderr");
+  });
+
+  it("delivers nonblank stdout when exit code is 3 and stderr has a capture-degraded line", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const degradedTarget = {
+      ...target,
+      hostId: "cc-lhc",
+      args: [
+        "-e",
+        [
+          "process.stdout.write('agent result after degraded capture')",
+          "process.stderr.write('wrapper noise\\nCC_LHC_CAPTURE_DEGRADED: jsonl truncated\\nmore noise\\n')",
+          "process.exit(3)",
+        ].join(";"),
+      ],
+    };
+    try {
+      await expect(
+        executeRelayTarget(degradedTarget, "harmless", { timeoutMs: 1000 }),
+      ).resolves.toBe("agent result after degraded capture");
+      const diagnostics = warn.mock.calls
+        .map((args) => String(args[0] ?? ""))
+        .filter((line) => line.includes("relay_capture_degraded"));
+      expect(diagnostics).toHaveLength(1);
+      expect(diagnostics[0]).toContain("CC_LHC_CAPTURE_DEGRADED: jsonl truncated");
+      expect(diagnostics[0]).not.toContain("harmless");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("records exactly one bounded diagnostic even when stderr has several degraded lines", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const longDetail = "x".repeat(800);
+    const degradedTarget = {
+      ...target,
+      args: [
+        "-e",
+        [
+          "process.stdout.write('kept result')",
+          `process.stderr.write(${JSON.stringify(
+            `CC_LHC_CAPTURE_DEGRADED: first ${longDetail}\nCC_LHC_CAPTURE_DEGRADED: second\n`,
+          )})`,
+          "process.exit(3)",
+        ].join(";"),
+      ],
+    };
+    try {
+      await expect(
+        executeRelayTarget(degradedTarget, "harmless", { timeoutMs: 1000 }),
+      ).resolves.toBe("kept result");
+      const diagnostics = warn.mock.calls
+        .map((args) => String(args[0] ?? ""))
+        .filter((line) => line.includes("relay_capture_degraded"));
+      expect(diagnostics).toHaveLength(1);
+      expect(diagnostics[0]).toContain("CC_LHC_CAPTURE_DEGRADED: first");
+      expect(diagnostics[0]).not.toContain("second");
+      expect(JSON.parse(diagnostics[0] as string).diagnostic.endsWith("…")).toBe(true);
+      expect(JSON.parse(diagnostics[0] as string).diagnostic.length).toBeLessThanOrEqual(601);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("does not treat code 3 with blank stdout as capture-degraded", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const blankTarget = {
+      ...target,
+      args: [
+        "-e",
+        [
+          "process.stdout.write('  \\n\\t')",
+          "process.stderr.write('CC_LHC_CAPTURE_DEGRADED: empty stdout\\n')",
+          "process.exit(3)",
+        ].join(";"),
+      ],
+    };
+    try {
+      await expect(
+        executeRelayTarget(blankTarget, "harmless", { timeoutMs: 1000 }),
+      ).rejects.toThrow("CC_LHC_CAPTURE_DEGRADED: empty stdout");
+      expect(
+        warn.mock.calls
+          .map((args) => String(args[0] ?? ""))
+          .filter((line) => line.includes("relay_capture_degraded")),
+      ).toEqual([]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("does not treat a nonzero code other than 3 as capture-degraded", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const otherCode = {
+      ...target,
+      args: [
+        "-e",
+        [
+          "process.stdout.write('would-be-result')",
+          "process.stderr.write('CC_LHC_CAPTURE_DEGRADED: ignored\\n')",
+          "process.exit(1)",
+        ].join(";"),
+      ],
+    };
+    try {
+      await expect(executeRelayTarget(otherCode, "harmless", { timeoutMs: 1000 })).rejects.toThrow(
+        "CC_LHC_CAPTURE_DEGRADED: ignored",
+      );
+      expect(
+        warn.mock.calls
+          .map((args) => String(args[0] ?? ""))
+          .filter((line) => line.includes("relay_capture_degraded")),
+      ).toEqual([]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("does not treat code 3 without the exact degraded prefix as capture-degraded", async () => {
+    const otherStderr = {
+      ...target,
+      args: [
+        "-e",
+        [
+          "process.stdout.write('would-be-result')",
+          "process.stderr.write('note CC_LHC_CAPTURE_DEGRADED: not a prefix\\n')",
+          "process.exit(3)",
+        ].join(";"),
+      ],
+    };
+    await expect(executeRelayTarget(otherStderr, "harmless", { timeoutMs: 1000 })).rejects.toThrow(
+      "note CC_LHC_CAPTURE_DEGRADED: not a prefix",
+    );
+  });
+
+  it("does not put the prompt into the rejection message when stderr is blank", async () => {
+    const promptMarker = "LIM136_BLANK_STDERR_PROMPT_MARKER_c4d91a02";
+    const blankStderrTarget = {
+      ...target,
+      args: ["-e", "process.exit(2)"],
+    };
+    const error = await executeRelayTarget(blankStderrTarget, promptMarker, {
+      timeoutMs: 1000,
+    }).then(
+      () => {
+        throw new Error("expected rejection");
+      },
+      (reason: unknown) => reason,
+    );
+    expect(error).toBeInstanceOf(RelayProcessError);
+    const processError = error as RelayProcessError;
+    expect(processError.stderr.trim()).toBe("");
+    expect(processError.message).toBe("relay process exited with code 2");
+    expect(processError.message).not.toContain(promptMarker);
+    const notice = noticeFromError(processError, promptMarker);
+    expect(notice).toContain("relay process exited with code 2");
+    expect(notice).not.toContain(promptMarker);
+  });
+
+  it("does not treat CSI-only stdout as capture-degraded", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const framingOnly = {
+      ...target,
+      args: [
+        "-e",
+        [
+          `process.stdout.write(${JSON.stringify("\u001b[?25l\u001b]0;title\u0007\u001b[?25h\r")})`,
+          "process.stderr.write('CC_LHC_CAPTURE_DEGRADED: jsonl truncated\\n')",
+          "process.exit(3)",
+        ].join(";"),
+      ],
+    };
+    try {
+      await expect(
+        executeRelayTarget(framingOnly, "harmless", { timeoutMs: 1000 }),
+      ).rejects.toThrow("CC_LHC_CAPTURE_DEGRADED: jsonl truncated");
+      expect(
+        warn.mock.calls
+          .map((args) => String(args[0] ?? ""))
+          .filter((line) => line.includes("relay_capture_degraded")),
+      ).toEqual([]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("synthesizes a prompt-free message for a child that kills itself with SIGKILL", async () => {
+    const promptMarker = "LIM136_BLANK_STDERR_PROMPT_MARKER_c4d91a02";
+    const killTarget = {
+      ...target,
+      args: ["-e", "process.kill(process.pid, 'SIGKILL')"],
+    };
+    const error = await executeRelayTarget(killTarget, promptMarker, { timeoutMs: 2000 }).then(
+      () => {
+        throw new Error("expected rejection");
+      },
+      (reason: unknown) => reason,
+    );
+    expect(error).toBeInstanceOf(RelayProcessError);
+    const processError = error as RelayProcessError;
+    expect(processError.message).toBe("relay process terminated by signal SIGKILL");
+    expect(processError.message).not.toContain(promptMarker);
+    expect(noticeFromError(processError, promptMarker)).not.toContain(promptMarker);
+  });
+});
+
+describe("relayProcessFailureMessage", () => {
+  it("names the terminating signal without using execFile's argv message", () => {
+    expect(relayProcessFailureMessage({ code: null, signal: "SIGKILL" })).toBe(
+      "relay process terminated by signal SIGKILL",
+    );
+    expect(relayProcessFailureMessage({ code: 2 })).toBe("relay process exited with code 2");
   });
 });

@@ -209,6 +209,36 @@ describe("deliverRelayJob", () => {
     expect(sent[0]?.length).toBeLessThanOrEqual(1_000);
   });
 
+  it("keeps a distinctive submitted prompt marker out of the failure-notice copy handed to Photon", async () => {
+    const promptMarker = "LIM136_PROMPT_MARKER_a8f3e2c1_DO_NOT_LEAK";
+    const sent: string[] = [];
+    await deliverRelayJob(
+      job({
+        id: "job-redact",
+        status: "failed",
+        output: null,
+        prompt: `please investigate ${promptMarker} immediately`,
+        error: "codex exec exited with code 2",
+      }),
+      {
+        agents: [],
+        consoleHome: "/tmp",
+        photonConnectors: {
+          send: async (_agentId: string, _spaceId: string, text: string) => {
+            sent.push(text);
+          },
+        } as RelayDeliveryContext["photonConnectors"],
+      },
+    );
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatch(/failed/i);
+    expect(sent[0]).toContain("job-redact");
+    expect(sent[0]).toContain("codex exec exited with code 2");
+    expect(sent[0]).not.toContain(promptMarker);
+    expect(sent[0]).not.toContain("please investigate");
+  });
+
   it("does not send an empty Markdown payload when an agent returns an empty string", async () => {
     const sent: string[] = [];
     await deliverRelayJob(job({ output: "" }), {

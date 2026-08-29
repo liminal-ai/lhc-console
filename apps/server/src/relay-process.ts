@@ -26,8 +26,16 @@ interface ExecuteOptions {
 // oxlint-disable-next-line no-control-regex -- ESC/BEL are the subject here
 const PTY_FRAMING = /\u001b\[[0-?]*[ -/]*[@-~]|\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)|\r/g;
 
-function stripPtyFraming(stdout: string): string {
+export function stripPtyFraming(stdout: string): string {
   return stdout.replace(PTY_FRAMING, "");
+}
+
+export function relayProcessFailureMessage(error: {
+  code?: string | number | null;
+  signal?: string | number | null;
+}): string {
+  if (error.signal) return `relay process terminated by signal ${error.signal}`;
+  return `relay process exited with code ${error.code}`;
 }
 
 /**
@@ -52,6 +60,61 @@ function formatClaudeProviderRefusal(stdout: string): string | null {
     `Request ID: ${requestId}`,
     "No model change or prompt replay occurred.",
   ].join("\n");
+}
+
+const CAPTURE_DEGRADED_PREFIX = "CC_LHC_CAPTURE_DEGRADED:";
+const MAX_DEGRADED_DIAGNOSTIC_LENGTH = 600;
+
+export interface RelayProcessResult {
+  code: string | number | null | undefined;
+  stdout: string;
+  stderr: string;
+}
+
+export class RelayProcessError extends Error implements RelayProcessResult {
+  readonly code: string | number | null | undefined;
+  readonly stdout: string;
+  readonly stderr: string;
+
+  constructor(result: RelayProcessResult, message: string) {
+    super(message);
+    this.name = "RelayProcessError";
+    this.code = result.code;
+    this.stdout = result.stdout;
+    this.stderr = result.stderr;
+  }
+}
+
+function captureDegradedLine(stderr: string): string | null {
+  for (const line of stderr.split(/\r?\n/)) {
+    if (line.startsWith(CAPTURE_DEGRADED_PREFIX)) return line;
+  }
+  return null;
+}
+
+function isDeliveredWithDegradation(
+  code: string | number | null | undefined,
+  stdout: string,
+  stderr: string,
+): boolean {
+  return (
+    code === 3 && stripPtyFraming(stdout).trim() !== "" && captureDegradedLine(stderr) !== null
+  );
+}
+
+function recordCaptureDegradedDiagnostic(target: RelayTarget, line: string): void {
+  const bounded =
+    line.length > MAX_DEGRADED_DIAGNOSTIC_LENGTH
+      ? `${line.slice(0, MAX_DEGRADED_DIAGNOSTIC_LENGTH)}…`
+      : line;
+  console.warn(
+    JSON.stringify({
+      event: "relay_capture_degraded",
+      hostId: target.hostId,
+      threadId: target.threadId,
+      diagnostic: bounded,
+    }),
+  );
 }
 
 export function executeRelayTarget(
@@ -91,7 +154,18 @@ export function executeRelayTarget(
             return;
           }
         }
-        reject(new Error(stderr.trim() || error.message));
+        if (isDeliveredWithDegradation(error.code, stdout, stderr)) {
+          const line = captureDegradedLine(stderr);
+          if (line !== null) recordCaptureDegradedDiagnostic(target, line);
+          resolve(stdout);
+          return;
+        }
+        reject(
+          new RelayProcessError(
+            { code: error.code, stdout, stderr },
+            stderr.trim() || relayProcessFailureMessage(error),
+          ),
+        );
       },
     );
     const emitter = child as unknown as EventEmitter;

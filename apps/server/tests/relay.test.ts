@@ -680,6 +680,129 @@ describe("RelayQueue", () => {
     }
   });
 
+  it("runs jobs for a concurrent target in parallel and passes the job to execute", async () => {
+    let active = 0;
+    let maxActive = 0;
+    const seen: Array<{
+      prompt: string;
+      jobClass: string | undefined;
+      sender: string | null | undefined;
+    }> = [];
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const queue = createQueue({
+      dbPath: tempDb(),
+      targets: {
+        wren: {
+          hostId: "t3code",
+          threadId: "thread_wren",
+          cwd: "/tmp",
+          command: "t3code-inject",
+          args: ["--thread", "thread_wren"],
+          concurrent: true,
+        },
+        fable: {
+          hostId: "pi-lhc",
+          threadId: "th_fable",
+          cwd: "/srv/work/long-horizon-context",
+          command: "pi-lhc",
+          args: ["--lhc-thread", "th_fable", "-p"],
+        },
+      },
+      isBusy: () => false,
+      execute: async (_target, prompt, _signal, _lifecycle, _lock, job) => {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        seen.push({ prompt, jobClass: job?.jobClass, sender: job?.sender });
+        if (seen.length >= 3) release();
+        await gate;
+        active -= 1;
+        return `reply:${prompt}`;
+      },
+      busyPollMs: 5,
+    });
+
+    try {
+      const a = queue.enqueue({ target: "wren", prompt: "a", sender: "alpha" });
+      const b = queue.enqueue({ target: "wren", prompt: "b", sender: "beta" });
+      const c = queue.enqueue({ target: "wren", prompt: "c", jobClass: "prioritized" });
+      const [ja, jb, jc] = await Promise.all([
+        queue.wait(a.id),
+        queue.wait(b.id),
+        queue.wait(c.id),
+      ]);
+
+      expect(maxActive).toBe(3);
+      expect(seen.map((entry) => entry.prompt).sort()).toEqual(["a", "b", "c"]);
+      expect(seen.find((entry) => entry.prompt === "a")).toMatchObject({
+        jobClass: "deprioritized",
+        sender: "alpha",
+      });
+      expect(seen.find((entry) => entry.prompt === "b")).toMatchObject({ sender: "beta" });
+      expect(seen.find((entry) => entry.prompt === "c")).toMatchObject({
+        jobClass: "prioritized",
+        sender: null,
+      });
+      expect(ja).toMatchObject({ status: "completed", output: "reply:a" });
+      expect(jb).toMatchObject({ status: "completed", output: "reply:b" });
+      expect(jc).toMatchObject({ status: "completed", output: "reply:c" });
+    } finally {
+      release();
+      await queue.close();
+    }
+  });
+
+  it("fails only the dead-owner rows of a concurrent target on restart", async () => {
+    const dbPath = tempDb();
+    const target = {
+      hostId: "t3code",
+      threadId: "thread_wren",
+      cwd: "/tmp",
+      command: "t3code-inject",
+      args: [] as string[],
+      concurrent: true,
+    };
+    const db = new DatabaseSync(dbPath);
+    const seed = new RelayQueue({
+      dbPath,
+      targets: { wren: target },
+      isBusy: () => false,
+      execute: async () => "unused",
+    });
+    await seed.close();
+    const now = new Date().toISOString();
+    db.exec("PRAGMA busy_timeout = 5000");
+    db.prepare(
+      `INSERT INTO relay_jobs (id, target, prompt, status, created_at, started_at, owner_pid, job_class, job_kind)
+       VALUES (?, 'wren', 'dead', 'running', ?, ?, 999999999, 'deprioritized', 'agent')`,
+    ).run("job-dead", now, now);
+    db.prepare(
+      `INSERT INTO relay_jobs (id, target, prompt, status, created_at, started_at, owner_pid, job_class, job_kind)
+       VALUES (?, 'wren', 'alive', 'running', ?, ?, ?, 'deprioritized', 'agent')`,
+    ).run("job-alive", now, now, process.pid);
+    db.close();
+
+    const queue = createQueue({
+      dbPath,
+      targets: { wren: target },
+      isBusy: () => false,
+      execute: async (_target, prompt) => `reply:${prompt}`,
+      busyPollMs: 5,
+    });
+    try {
+      await expect.poll(() => queue.get("job-dead")?.status, { timeout: 1000 }).toBe("failed");
+      expect(queue.get("job-alive")?.status).toBe("running");
+      const fresh = queue.enqueue({ target: "wren", prompt: "next" });
+      const done = await queue.wait(fresh.id);
+      expect(done).toMatchObject({ status: "completed", output: "reply:next" });
+      expect(queue.get("job-alive")?.status).toBe("running");
+    } finally {
+      await queue.close();
+    }
+  });
+
   it("surfaces a busy thread and runs the queued job after it is released", async () => {
     let busy = true;
     const queue = createQueue({

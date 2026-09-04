@@ -61,6 +61,13 @@ export interface RelayTarget {
   /** Maximum wall-clock time for one turn. */
   timeoutMs?: number;
   env?: NodeJS.ProcessEnv;
+  /**
+   * Run this target's jobs concurrently instead of one at a time. For hosts whose
+   * seat command owns its own serialization (the t3code injector queues per
+   * sender and steers a busy thread), the relay's one-running-job claim would
+   * only defeat that. Default off.
+   */
+  concurrent?: boolean;
 }
 
 export interface RelayDelivery {
@@ -110,6 +117,7 @@ interface RelayQueueOptions {
     signal: AbortSignal,
     lifecycle?: RelayExecuteLifecycle,
     writerLock?: unknown,
+    job?: RelayJob,
   ) => Promise<string>;
   /**
    * Optional V2-opted launch fence. Returning "blocked" defers the job the
@@ -578,8 +586,16 @@ export class RelayQueue {
     }
   }
 
+  #isConcurrent(target: string): boolean {
+    return this.#targets[target]?.concurrent === true;
+  }
+
   #schedule(target: string): void {
-    if (this.#closed || !this.#started || this.#runningTargets.has(target)) return;
+    if (this.#closed || !this.#started) return;
+    // A concurrent target gets a runner per wake: each runner claims one job at a
+    // time, so N pending wakes give up to N jobs in flight. A runner that finds
+    // nothing to claim simply exits.
+    if (!this.#isConcurrent(target) && this.#runningTargets.has(target)) return;
     queueMicrotask(() => {
       if (this.#closed || !this.#started) return;
       const run = this.#runTarget(target);
@@ -589,17 +605,24 @@ export class RelayQueue {
   }
 
   async #runTarget(targetName: string): Promise<void> {
-    if (this.#closed || !this.#started || this.#runningTargets.has(targetName)) return;
-    this.#runningTargets.add(targetName);
+    if (this.#closed || !this.#started) return;
+    const concurrent = this.#isConcurrent(targetName);
+    if (!concurrent) {
+      if (this.#runningTargets.has(targetName)) return;
+      this.#runningTargets.add(targetName);
+    }
     this.#outstandingRuns += 1;
     try {
       const target = this.#targets[targetName];
       if (!target) return;
-      const interrupted = this.#db
-        .prepare(
-          "SELECT id, owner_pid FROM relay_jobs WHERE target = ? AND status = 'running' LIMIT 1",
-        )
-        .get(targetName) as { id: string; owner_pid: number | null } | undefined;
+      if (concurrent) this.#failOrphanedRunning(targetName);
+      const interrupted = concurrent
+        ? undefined
+        : (this.#db
+            .prepare(
+              "SELECT id, owner_pid FROM relay_jobs WHERE target = ? AND status = 'running' LIMIT 1",
+            )
+            .get(targetName) as { id: string; owner_pid: number | null } | undefined);
       if (interrupted) {
         if (interrupted.owner_pid !== null && processIsAlive(interrupted.owner_pid)) {
           this.#defer(targetName);
@@ -710,14 +733,31 @@ export class RelayQueue {
                  LIMIT 1
                )
                AND status IN ('queued', 'blocked')
-               AND NOT EXISTS (
+               AND (? = 1 OR NOT EXISTS (
                  SELECT 1 FROM relay_jobs AS active
                  WHERE active.target = ? AND active.status = 'running'
-               )`,
+               ))`,
           )
-          .run(startedAt, process.pid, targetName, targetName, targetName);
+          .run(startedAt, process.pid, targetName, targetName, concurrent ? 1 : 0, targetName);
         if (claim.changes !== 1) {
           this.#dropLaunchFence(launchFence);
+          if (concurrent) {
+            // Another runner took the row between our select and update; if
+            // anything is still pending, try again, else this runner is done.
+            const pendingRow = this.#db
+              .prepare(
+                `SELECT 1 FROM relay_jobs
+                 WHERE target = ? AND status IN ('queued', 'blocked')
+                   AND NOT EXISTS (
+                     SELECT 1 FROM relay_cancelled_jobs AS c WHERE c.id = relay_jobs.id
+                   )
+                 LIMIT 1`,
+              )
+              .get(targetName);
+            if (!pendingRow) return;
+            await sleep(0);
+            continue;
+          }
           const activeRun = this.#db
             .prepare(
               "SELECT id, owner_pid FROM relay_jobs WHERE target = ? AND status = 'running' LIMIT 1",
@@ -757,9 +797,11 @@ export class RelayQueue {
         }
         const running = this.#db
           .prepare(
-            "SELECT * FROM relay_jobs WHERE target = ? AND status = 'running' AND owner_pid = ? LIMIT 1",
+            `SELECT * FROM relay_jobs
+             WHERE target = ? AND status = 'running' AND owner_pid = ? AND started_at = ?
+             ORDER BY rowid LIMIT 1`,
           )
-          .get(targetName, process.pid) as unknown as RelayRow | undefined;
+          .get(targetName, process.pid, startedAt) as unknown as RelayRow | undefined;
         if (!running) {
           this.#dropLaunchFence(launchFence);
           continue;
@@ -791,6 +833,7 @@ export class RelayQueue {
             controller.signal,
             executeLifecycle,
             launchFence,
+            job,
           );
           if (
             isDirectAgentJob(job) &&
@@ -836,9 +879,30 @@ export class RelayQueue {
         this.#emitSettled(job.id);
       }
     } finally {
-      this.#runningTargets.delete(targetName);
+      if (!concurrent) this.#runningTargets.delete(targetName);
       this.#outstandingRuns -= 1;
       this.#notifyOutstandingDrain();
+    }
+  }
+
+  /** Concurrent target: several rows may be running; fail only those whose owner died. */
+  #failOrphanedRunning(targetName: string): void {
+    const rows = this.#db
+      .prepare("SELECT id, owner_pid FROM relay_jobs WHERE target = ? AND status = 'running'")
+      .all(targetName) as Array<{ id: string; owner_pid: number | null }>;
+    for (const row of rows) {
+      if (row.owner_pid !== null && processIsAlive(row.owner_pid)) continue;
+      this.#db
+        .prepare(
+          `UPDATE relay_jobs
+           SET status = 'failed',
+               error = 'relay lost track of this job after restart; the turn may have completed — check the durable thread',
+               finished_at = ?
+           WHERE id = ? AND status = 'running'`,
+        )
+        .run(new Date().toISOString(), row.id);
+      this.#notify(row.id);
+      this.#emitSettled(row.id);
     }
   }
 

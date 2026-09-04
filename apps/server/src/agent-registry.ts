@@ -62,6 +62,7 @@ interface RawRelayConfig {
   args?: unknown;
   timeoutMs?: unknown;
   env?: unknown;
+  concurrent?: unknown;
 }
 
 interface RawPhotonChannel {
@@ -236,6 +237,12 @@ function parseRelay(id: string, raw: RawRelayConfig | undefined): RelayTarget {
       throw new Error(`${id}.relay.timeoutMs must be a positive number`);
     }
     target.timeoutMs = raw.timeoutMs;
+  }
+  if (raw.concurrent !== undefined) {
+    if (typeof raw.concurrent !== "boolean") {
+      throw new Error(`${id}.relay.concurrent must be a boolean`);
+    }
+    if (raw.concurrent) target.concurrent = true;
   }
   if (raw.env !== undefined) {
     if (!raw.env || typeof raw.env !== "object" || Array.isArray(raw.env)) {

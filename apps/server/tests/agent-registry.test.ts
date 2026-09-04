@@ -110,6 +110,34 @@ describe("loadAgentRegistry", () => {
     });
   });
 
+  it("parses relay.concurrent and rejects a non-boolean value", () => {
+    const home = mkdtempSync(join(tmpdir(), "lhc-agents-"));
+    dirs.push(home);
+    const relay = {
+      hostId: "t3code",
+      threadId: "thread_wren",
+      cwd: "/tmp",
+      command: "t3code-inject",
+      args: ["--thread", "thread_wren"],
+    };
+    writeRegistry(home, {
+      version: 1,
+      agents: {
+        plain: { ownerSenderIds: ["owner"], relay },
+        wren: { ownerSenderIds: ["owner"], relay: { ...relay, concurrent: true } },
+      },
+    });
+    const loaded = loadAgentRegistry(home);
+    expect(loaded.relayTargets.plain?.concurrent).toBeUndefined();
+    expect(loaded.relayTargets.wren?.concurrent).toBe(true);
+
+    writeRegistry(home, {
+      version: 1,
+      agents: { wren: { ownerSenderIds: ["owner"], relay: { ...relay, concurrent: "yes" } } },
+    });
+    expect(() => loadAgentRegistry(home)).toThrow(/wren\.relay\.concurrent must be a boolean/);
+  });
+
   it("rejects an incomplete canonical health reference", () => {
     const home = mkdtempSync(join(tmpdir(), "lhc-agents-"));
     dirs.push(home);

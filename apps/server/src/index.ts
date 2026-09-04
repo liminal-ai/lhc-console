@@ -201,11 +201,17 @@ const relayQueue = new RelayQueue({
   acquireWriterLock: (target) => v1Admission.acquireForLaunch(target),
   releaseWriterLock: (held) =>
     releaseLaunchLock(held as import("./v2/writer-lock.ts").HeldWriterLock, v2Manager),
-  execute: (target, prompt, signal, lifecycle, writerLock) =>
+  execute: (target, prompt, signal, lifecycle, writerLock, job) =>
     executeRelayTarget(target, prompt, {
       signal,
       onSpawn: lifecycle?.onSpawn,
       writerLock: writerLock as import("./v2/writer-lock.ts").HeldWriterLock | undefined,
+      // The seat command learns the job's class and declared sender; the
+      // t3code injector reads these to pick steer-vs-queue and the queue key.
+      env: {
+        ...(job ? { LHC_RELAY_JOB_CLASS: job.jobClass } : {}),
+        ...(job?.sender ? { LHC_RELAY_SENDER: job.sender } : {}),
+      },
     }),
   deliver: async (job) => {
     await deliverRelayJob(job, {

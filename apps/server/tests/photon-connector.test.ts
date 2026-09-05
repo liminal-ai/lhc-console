@@ -16,8 +16,8 @@ const dirs: string[] = [];
 const servers: Server[] = [];
 const queues: RelayQueue[] = [];
 const connectors: PhotonConnector[] = [];
-const PHONE_REPLY_GUIDANCE_FOR_TEST =
-  "[Response style for iMessage: write for a phone screen. Use controlled English inspired by ASD-STE100 as a general default, not as strict compliance. Answer first. Use short sentences and one idea per sentence. Prefer active voice, concrete words, and explicit subjects. Keep established project terms unchanged. Use short paragraphs, compact bullets only when they improve scanning, simple headings, and restrained bold. Keep code blocks brief. Avoid long preambles, raw IDs, internal jargon, narrative, reassurance, and background unless needed for the current request. For status updates, state the current state, the next action, and whether Lee must act. Use emojis sparingly and only when they add useful status or tone.]";
+const PHONE_HEADER_FOR_TEST = "[from: lee, channel: iMessage]";
+const PHONE_REPLY_GUIDANCE_FOR_TEST = "[reply for iPhone on the go]";
 
 afterEach(async () => {
   await Promise.all(connectors.splice(0).map((connector) => connector.stop()));
@@ -277,7 +277,7 @@ describe("PhotonConnector", () => {
     sidecar.pushInbound(dmEvent({ text: "status?" }));
     await expect
       .poll(() => prompts, { timeout: 1_000 })
-      .toEqual([`status?\n\n${PHONE_REPLY_GUIDANCE_FOR_TEST}`]);
+      .toEqual([`${PHONE_HEADER_FOR_TEST}\nstatus?\n\n${PHONE_REPLY_GUIDANCE_FOR_TEST}`]);
     await expect
       .poll(() => sidecar.sent, { timeout: 1_000 })
       .toEqual([{ spaceId: dmEvent().space.id, text: "agent reply" }]);
@@ -322,7 +322,7 @@ describe("PhotonConnector", () => {
       .toEqual([
         {
           spaceId: dmEvent().space.id,
-          text: `reply:once\n\n${PHONE_REPLY_GUIDANCE_FOR_TEST}`,
+          text: `reply:${PHONE_HEADER_FOR_TEST}\nonce\n\n${PHONE_REPLY_GUIDANCE_FOR_TEST}`,
         },
       ]);
   });

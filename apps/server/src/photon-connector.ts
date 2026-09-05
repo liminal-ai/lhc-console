@@ -27,8 +27,12 @@ const MAX_SIDECAR_BACKOFF_MS = 30_000;
 const STOP_TIMEOUT_MS = 2_000;
 const INBOUND_SETTLE_TIMEOUT_MS = STOP_TIMEOUT_MS;
 const INBOUND_RECONNECT_MS = 250;
-const PHONE_REPLY_GUIDANCE =
-  "[Response style for iMessage: write for a phone screen. Use controlled English inspired by ASD-STE100 as a general default, not as strict compliance. Answer first. Use short sentences and one idea per sentence. Prefer active voice, concrete words, and explicit subjects. Keep established project terms unchanged. Use short paragraphs, compact bullets only when they improve scanning, simple headings, and restrained bold. Keep code blocks brief. Avoid long preambles, raw IDs, internal jargon, narrative, reassurance, and background unless needed for the current request. For status updates, state the current state, the next action, and whether Lee must act. Use emojis sparingly and only when they add useful status or tone.]";
+// Owner phone path envelope. Header first line: the injector and PTY seats read the
+// sender and the channel from it. Trailer: one short reminder per message, because
+// a thread outlives its opening instructions. Keep both short; they land in the record.
+const PHONE_HEADER = "[from: lee, channel: iMessage]";
+const GROUP_HEADER = "[channel: iMessage group]";
+const PHONE_REPLY_GUIDANCE = "[reply for iPhone on the go]";
 const URL_PATTERN = /https?:\/\/\S+/i;
 
 function plainTextForPhoton(markdown: string): string {
@@ -441,9 +445,10 @@ export class PhotonConnector {
   }
 
   #enqueueRelay(spaceId: string, prompt: string, groupWake?: GroupWakeMetadata): void {
+    const header = groupWake ? GROUP_HEADER : PHONE_HEADER;
     this.#queue.enqueue({
       target: this.#agent.id,
-      prompt: `${prompt}\n\n${PHONE_REPLY_GUIDANCE}`,
+      prompt: `${header}\n${prompt}\n\n${PHONE_REPLY_GUIDANCE}`,
       jobClass: "prioritized",
       delivery: {
         channel: "photon",

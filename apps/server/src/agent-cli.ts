@@ -3,6 +3,7 @@ import { chmodSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { loadAgentRegistry } from "./agent-registry.ts";
 import type { PublicAgent } from "./agent-routes.ts";
 import { isRelayJobWaitSettled, type RelayJob } from "./relay.ts";
 
@@ -12,6 +13,10 @@ interface CliDeps {
   v2Token?: string | null;
   baseUrl: string;
   agentId: string | null;
+  /** T3CODE_THREAD_ID from a t3code-hosted shell; resolves the sender when LHC_AGENT_ID is unset. */
+  t3codeThreadId?: string | null;
+  /** Console home holding agents.json; needed only for t3codeThreadId resolution. */
+  consoleHome?: string | null;
   readStdin: () => Promise<string>;
   stdout: (line: string) => void;
   stderr: (line: string) => void;
@@ -46,8 +51,10 @@ Peer calls that may provoke a reply must use start (detached):
   lhc-agent start <agent> "Message"
 Blocking mutual peer calls can deadlock until timeout.
 
-Sender attribution (--from or LHC_AGENT_ID) is trusted only at the relay
-token boundary. Recipients see a compact [from: agent] envelope when declared.
+Every send carries a sender: --from, LHC_AGENT_ID, or (t3code-hosted seats)
+the registered agent whose relay thread matches T3CODE_THREAD_ID. Attribution
+is trusted only at the relay token boundary; recipients see a compact
+[from: agent] envelope.
 
 Examples:
   lhc-agent fable "Review this design."
@@ -120,10 +127,10 @@ async function call(args: string[], deps: CliDeps, detached: boolean): Promise<n
     : normalizeInlineLeeMessage(target, promptArgs.join(" "));
   if (!prompt.trim()) throw new Error("prompt is required");
 
-  const sender = from ?? deps.agentId;
-  if (target === "lee" && !sender) {
+  const sender = from ?? deps.agentId ?? resolveT3codeSender(deps);
+  if (!sender) {
     throw new Error(
-      "lee requires a sender: set LHC_AGENT_ID in the environment or pass --from <registered-agent-key>",
+      `${target} requires a sender: set LHC_AGENT_ID in the environment or pass --from <registered-agent-key>`,
     );
   }
 
@@ -144,6 +151,26 @@ async function call(args: string[], deps: CliDeps, detached: boolean): Promise<n
     return 0;
   }
   return printSettled(result, deps);
+}
+
+/**
+ * A t3code-hosted seat's shell has no LHC_AGENT_ID; its identity is the thread
+ * it runs on. Resolve the sender from the registry entry whose relay points at
+ * T3CODE_THREAD_ID on host "t3code". No match is an error, never a fallback.
+ */
+function resolveT3codeSender(deps: CliDeps): string | null {
+  const threadId = deps.t3codeThreadId?.trim();
+  if (!threadId) return null;
+  if (!deps.consoleHome) throw new Error("T3CODE_THREAD_ID is set but the console home is unknown");
+  const match = loadAgentRegistry(deps.consoleHome).agents.filter(
+    (agent) => agent.relay.hostId === "t3code" && agent.relay.threadId === threadId,
+  );
+  if (match.length === 1) return match[0]!.id;
+  throw new Error(
+    match.length === 0
+      ? `no registered agent has relay.hostId "t3code" and relay.threadId ${threadId} (from T3CODE_THREAD_ID); set LHC_AGENT_ID or pass --from <registered-agent-key>`
+      : `T3CODE_THREAD_ID ${threadId} matches several registered agents (${match.map((agent) => agent.id).join(", ")}); set LHC_AGENT_ID or pass --from`,
+  );
 }
 
 function normalizeInlineLeeMessage(target: string, prompt: string): string {
@@ -462,6 +489,8 @@ function productionDeps(): CliDeps {
     v2Token,
     baseUrl: process.env.LHC_CONSOLE_URL ?? `http://127.0.0.1:${port}`,
     agentId,
+    t3codeThreadId: process.env.T3CODE_THREAD_ID?.trim() || null,
+    consoleHome: home,
     readStdin: async () => {
       const chunks: Buffer[] = [];
       for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk));

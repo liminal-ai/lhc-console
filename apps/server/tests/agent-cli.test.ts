@@ -1,4 +1,7 @@
-import { describe, expect, it } from "vite-plus/test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vite-plus/test";
 import { runAgentCli } from "../src/agent-cli.ts";
 
 function response(status: number, body?: unknown): Response {
@@ -16,8 +19,8 @@ function requestUrl(input: string | URL | Request): string {
 function deps(
   fetchImpl: typeof fetch,
   stdin = "",
-  agentId: string | null = null,
-  extras: { v2Token?: string } = {},
+  agentId: string | null = "caller",
+  extras: { v2Token?: string; t3codeThreadId?: string | null; consoleHome?: string | null } = {},
 ) {
   const stdout: string[] = [];
   const stderr: string[] = [];
@@ -28,6 +31,8 @@ function deps(
       v2Token: extras.v2Token,
       baseUrl: "http://127.0.0.1:5959",
       agentId,
+      t3codeThreadId: extras.t3codeThreadId ?? null,
+      consoleHome: extras.consoleHome ?? null,
       readStdin: async () => stdin,
       stdout: (line: string) => stdout.push(line),
       stderr: (line: string) => stderr.push(line),
@@ -73,7 +78,7 @@ describe("lhc-agent CLI", () => {
     expect(requests[0]?.url).toBe("http://127.0.0.1:5959/api/relay/targets/fable/jobs");
     expect(requests[0]?.init).toMatchObject({
       method: "POST",
-      body: JSON.stringify({ prompt: "Review this" }),
+      body: JSON.stringify({ prompt: "Review this", sender: "caller" }),
     });
     expect(new Headers(requests[0]?.init?.headers).get("authorization")).toBe("Bearer test-secret");
   });
@@ -107,7 +112,7 @@ describe("lhc-agent CLI", () => {
         return response(200, { id: "job-1", status: "completed", output: "Fable reply" });
       },
       "",
-      null,
+      "caller",
       { v2Token: "owner-only-v2" },
     );
     expect(await runAgentCli(["fable", "Review"], state.value)).toBe(0);
@@ -131,7 +136,7 @@ describe("lhc-agent CLI", () => {
 
   it("accepts a prompt from stdin", async () => {
     const state = deps(async (_input, init) => {
-      expect(init?.body).toBe(JSON.stringify({ prompt: "Message from stdin" }));
+      expect(init?.body).toBe(JSON.stringify({ prompt: "Message from stdin", sender: "caller" }));
       return response(200, { id: "job-1", status: "completed", output: "done" });
     }, "Message from stdin\n");
     expect(await runAgentCli(["fable", "-"], state.value)).toBe(0);
@@ -173,6 +178,7 @@ describe("lhc-agent CLI", () => {
     expect(JSON.parse(String(requests[0]?.init?.body))).toEqual({
       prompt: "Urgent",
       jobClass: "prioritized",
+      sender: "caller",
     });
   });
 
@@ -357,10 +363,14 @@ describe("lhc-agent CLI", () => {
 
   it("requires an explicit sender for lee when LHC_AGENT_ID is absent", async () => {
     let calls = 0;
-    const state = deps(async () => {
-      calls += 1;
-      return response(500);
-    });
+    const state = deps(
+      async () => {
+        calls += 1;
+        return response(500);
+      },
+      "",
+      null,
+    );
     expect(await runAgentCli(["lee", "ping"], state.value)).toBe(1);
     expect(calls).toBe(0);
     expect(state.stderr.join("\n")).toMatch(/sender|--from|LHC_AGENT_ID/i);
@@ -380,6 +390,117 @@ describe("lhc-agent CLI", () => {
     expect(JSON.parse(String(requests[0]?.init?.body))).toEqual({
       prompt: "hello",
       sender: "fable",
+    });
+  });
+
+  it("refuses a send to any target with no sender", async () => {
+    let calls = 0;
+    const state = deps(
+      async () => {
+        calls += 1;
+        return response(500);
+      },
+      "",
+      null,
+    );
+    expect(await runAgentCli(["scribe", "hello"], state.value)).toBe(1);
+    expect(await runAgentCli(["start", "scribe", "hello"], state.value)).toBe(1);
+    expect(calls).toBe(0);
+    expect(state.stderr[0]).toBe(
+      "scribe requires a sender: set LHC_AGENT_ID in the environment or pass --from <registered-agent-key>",
+    );
+  });
+
+  describe("t3code-hosted seats", () => {
+    const homes: string[] = [];
+    afterEach(() => {
+      for (const home of homes.splice(0)) rmSync(home, { recursive: true, force: true });
+    });
+
+    function registryHome(agents: Record<string, { hostId: string; threadId: string }>): string {
+      const home = mkdtempSync(join(tmpdir(), "lhc-agent-cli-"));
+      homes.push(home);
+      const body = {
+        version: 1,
+        agents: Object.fromEntries(
+          Object.entries(agents).map(([id, relay]) => [
+            id,
+            {
+              ownerSenderIds: ["+15550000000"],
+              channels: {},
+              relay: { ...relay, cwd: home, command: "true", args: [] },
+            },
+          ]),
+        ),
+      };
+      writeFileSync(join(home, "agents.json"), `${JSON.stringify(body)}\n`, { mode: 0o600 });
+      return home;
+    }
+
+    it("resolves the sender from T3CODE_THREAD_ID against the registry when LHC_AGENT_ID is unset", async () => {
+      const home = registryHome({
+        "t3code-wren": { hostId: "t3code", threadId: "thread-wren" },
+        "t3code-reed": { hostId: "t3code", threadId: "thread-reed" },
+        wren: { hostId: "local", threadId: "thread-wren" },
+      });
+      const requests: Array<{ init?: RequestInit }> = [];
+      const state = deps(
+        async (_input, init) => {
+          requests.push({ init });
+          return response(200, { id: "job-1", status: "completed", output: "ok" });
+        },
+        "",
+        null,
+        { t3codeThreadId: "thread-reed", consoleHome: home },
+      );
+      expect(await runAgentCli(["scribe", "hello"], state.value)).toBe(0);
+      expect(JSON.parse(String(requests[0]?.init?.body))).toEqual({
+        prompt: "hello",
+        sender: "t3code-reed",
+      });
+    });
+
+    it("prefers LHC_AGENT_ID and --from over the thread lookup", async () => {
+      const home = registryHome({ "t3code-reed": { hostId: "t3code", threadId: "thread-reed" } });
+      const bodies: unknown[] = [];
+      const make = (agentId: string | null) =>
+        deps(
+          async (_input, init) => {
+            bodies.push(JSON.parse(String(init?.body)));
+            return response(200, { id: "job-1", status: "completed", output: "ok" });
+          },
+          "",
+          agentId,
+          { t3codeThreadId: "thread-reed", consoleHome: home },
+        );
+      expect(await runAgentCli(["scribe", "hello"], make("fable").value)).toBe(0);
+      expect(await runAgentCli(["--from", "scribe", "scribe", "hello"], make(null).value)).toBe(0);
+      expect(bodies).toEqual([
+        { prompt: "hello", sender: "fable" },
+        { prompt: "hello", sender: "scribe" },
+      ]);
+    });
+
+    it("errors when no registered agent matches the thread, with no fallback", async () => {
+      const home = registryHome({
+        "t3code-reed": { hostId: "t3code", threadId: "thread-reed" },
+        wren: { hostId: "local", threadId: "thread-unknown" },
+      });
+      let calls = 0;
+      const state = deps(
+        async () => {
+          calls += 1;
+          return response(500);
+        },
+        "",
+        null,
+        { t3codeThreadId: "thread-unknown", consoleHome: home },
+      );
+      expect(await runAgentCli(["scribe", "hello"], state.value)).toBe(1);
+      expect(calls).toBe(0);
+      expect(state.stderr[0]).toBe(
+        'no registered agent has relay.hostId "t3code" and relay.threadId thread-unknown (from T3CODE_THREAD_ID); set LHC_AGENT_ID or pass --from <registered-agent-key>',
+      );
     });
   });
 });

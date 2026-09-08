@@ -32,7 +32,7 @@ produced_by:            upstream-owner
 
 | Field                    | Meaning                                                                                                                                             |
 | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `behind` / `ahead`       | Counts of commits between `origin/lhc` and `upstream/main` after fetch                                                                              |
+| `behind` / `ahead`       | Counts of commits between `origin/<product_branch>` (`origin/main`) and `upstream/main` after fetch                                                                              |
 | `action=none`            | No change vs last-seen, or behind=0 and no release event                                                                                            |
 | `action=assess`          | New upstream tip and/or official release/tag event; human/agent should read themes                                                                  |
 | `action=sync_candidate`  | Weekly reconcile or policy threshold: fork should run sync drill (still **no auto-merge**)                                                          |

@@ -13,7 +13,7 @@ CANDIDATE_HANDOFF v1
 fork:             codex-lhc | grok-build-lhc
 repo:             liminal-ai/codex-lhc | liminal-ai/grok-build-lhc
 branch:           <product_branch from forks.json; main>
-candidate_sha:    <full 40-char sha of origin/lhc tip to qualify>
+candidate_sha:    <full 40-char sha of the origin/<product_branch> tip to qualify (main)>
 upstream_remote:  <fetch URL of upstream remote>
 upstream_base:    <public-git upstream tip merged into candidate; often equals patches_base>
 upstream_range:   <old_public_upstream_sha>..<upstream_base>
@@ -40,7 +40,7 @@ public-git bases are **invalid** and will falsely fail candidate workflows.
 
 | Field                            | Grok source                                           | Role                                                   |
 | -------------------------------- | ----------------------------------------------------- | ------------------------------------------------------ |
-| `candidate_sha`                  | `git rev-parse origin/lhc` (full)                     | Exact product tree to check out and build              |
+| `candidate_sha`                  | `git rev-parse origin/<product_branch>` (full; `origin/main`) | Exact product tree to check out and build              |
 | `source_rev`                     | repo file `SOURCE_REV`                                | **xAI monorepo** source revision (e.g. `27b3c666…`)    |
 | `patches_base` / `upstream_base` | `patches/BASE` / public `upstream/main` tip merged in | **Public git** recovery / patch base (e.g. `8a14c91…`) |
 

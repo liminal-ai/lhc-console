@@ -144,6 +144,30 @@ class UpstreamWatchTests(unittest.TestCase):
         stub = uw.emit_handoff_stub(cfg, do_fetch=False)
         self.assertIn("branch: lhc\n", stub)
 
+    def test_handoff_and_watch_follow_configured_main_product_branch(self) -> None:
+        # Give the fixture origin a main branch at the upstream tip, distinct from lhc,
+        # so a product_branch=main config is observable (a literal lhc would not pass).
+        git(self.origin, "branch", "main", self.up_main, env=self.env)
+        git(self.fork, "fetch", "origin", env=self.env)
+        cfg = dict(self.fork_cfg)
+        cfg.pop("mirror_branch")
+        cfg["product_branch"] = "main"
+        stub = uw.emit_handoff_stub(cfg, do_fetch=False)
+        self.assertIn("branch: main\n", stub)
+        self.assertIn(f"candidate_sha: {self.up_main}\n", stub)
+        with mock.patch.dict(os.environ, self.env, clear=False):
+            r = uw.watch_one(
+                cfg,
+                check_kind="daily",
+                state_dir=self.state_dir,
+                do_fetch=False,
+                update_state=False,
+                notes="none",
+            )
+        self.assertEqual(r.fields["origin_lhc_sha"], self.up_main)
+        self.assertEqual(r.fields["origin_main_sha"], self.up_main)
+        self.assertNotEqual(self.up_main, git(self.origin, "rev-parse", "lhc", env=self.env))
+
     def test_watch_behind_and_state_update(self) -> None:
         (self.upstream / "README").write_text("b\n", encoding="utf-8")
         git(self.upstream, "add", "README", env=self.env)

@@ -11,7 +11,7 @@ PROMOTION_READY v1
 fork:                 codex-lhc | grok-build-lhc
 repo:                 liminal-ai/codex-lhc | liminal-ai/grok-build-lhc
 product_version:      <SemVer without v>
-source_sha:           <full 40-char candidate_sha / origin/lhc tip qualified>
+source_sha:           <full 40-char candidate_sha / origin/<product_branch> tip qualified (main)>
 upstream_base:        <public-git base; Grok: patches/BASE>
 source_rev:           <Grok SOURCE_REV monorepo id | none>
 lhc_sdk_pin:          <vendor submodule sha>

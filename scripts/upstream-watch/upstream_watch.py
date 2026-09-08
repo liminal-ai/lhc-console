@@ -230,8 +230,10 @@ def watch_one(
 
     origin = fork.get("origin", "origin")
     upstream = fork.get("upstream", "upstream")
-    product = fork.get("product_branch", "lhc")
-    mirror = fork.get("mirror_branch", "main")
+    product = fork.get("product_branch", "main")
+    # A mirror branch is optional (2026-09-08: main is the product branch on both
+    # forks; no mirror). Without one, origin_main_sha reports the product branch.
+    mirror = fork.get("mirror_branch") or None
     up_branch = fork.get("upstream_branch", "main")
 
     st_path = state_path(state_dir, fork_id)
@@ -249,11 +251,12 @@ def watch_one(
 
     up_ref = f"{upstream}/{up_branch}"
     lhc_ref = f"{origin}/{product}"
-    main_ref = f"{origin}/{mirror}"
 
     upstream_sha = rev_parse(repo, up_ref)
+    # Report keys keep their WATCH_REPORT v1 names: origin_lhc_sha is the product
+    # branch, origin_main_sha the mirror when one is configured.
     origin_lhc = rev_parse(repo, lhc_ref)
-    origin_main = rev_parse(repo, main_ref)
+    origin_main = rev_parse(repo, f"{origin}/{mirror}") if mirror else origin_lhc
 
     if not upstream_sha or not origin_lhc:
         raise SystemExit(
@@ -343,7 +346,7 @@ def emit_handoff_stub(fork: dict[str, Any], *, do_fetch: bool) -> str:
     repo = Path(fork["path"])
     origin = fork.get("origin", "origin")
     upstream = fork.get("upstream", "upstream")
-    product = fork.get("product_branch", "lhc")
+    product = fork.get("product_branch", "main")
     up_branch = fork.get("upstream_branch", "main")
     if do_fetch:
         run_git(repo, "fetch", origin, "--prune", check=False)
@@ -379,7 +382,7 @@ def emit_handoff_stub(fork: dict[str, Any], *, do_fetch: bool) -> str:
         SCHEMA_VERSION_HANDOFF,
         f"fork: {fork['id']}",
         f"repo: {fork['repo']}",
-        "branch: lhc",
+        f"branch: {product}",
         f"candidate_sha: {candidate}",
         f"upstream_remote: {remote_url(repo, upstream)}",
         f"upstream_base: {up}",

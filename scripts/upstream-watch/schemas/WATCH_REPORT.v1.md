@@ -16,10 +16,10 @@ checked_at:             <ISO-8601 UTC>
 check_kind:             daily | release_event | weekly_reconcile | manual
 last_seen_upstream_sha: <40-char sha or none>
 upstream_sha:           <40-char sha of upstream/main after fetch>
-origin_lhc_sha:         <40-char sha of origin/lhc>
-origin_main_sha:        <40-char sha of origin/main or none>
-behind:                 <non-negative integer: origin/lhc..upstream/main>
-ahead:                  <non-negative integer: upstream/main..origin/lhc>
+origin_lhc_sha:         <40-char sha of origin/<product_branch> (main since 2026-09-08; v1 key name kept)>
+origin_main_sha:        <40-char sha of origin/<mirror_branch> when one is configured, else the product branch>
+behind:                 <non-negative integer: origin/<product_branch>..upstream/main>
+ahead:                  <non-negative integer: upstream/main..origin/<product_branch>>
 upstream_release_event: none | tag:<name> | release:<tag>
 changed_paths_themes:   <shortstat and/or path themes; or none>
 action:                 none | assess | sync_candidate

@@ -12,7 +12,7 @@ Releases or run promote workflows.
 CANDIDATE_HANDOFF v1
 fork:             codex-lhc | grok-build-lhc
 repo:             liminal-ai/codex-lhc | liminal-ai/grok-build-lhc
-branch:           lhc
+branch:           <product_branch from forks.json; main>
 candidate_sha:    <full 40-char sha of origin/lhc tip to qualify>
 upstream_remote:  <fetch URL of upstream remote>
 upstream_base:    <public-git upstream tip merged into candidate; often equals patches_base>

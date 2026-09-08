@@ -125,6 +125,25 @@ class UpstreamWatchTests(unittest.TestCase):
         with mock.patch.dict(os.environ, self.env, clear=False):
             return uw.watch_one(self.fork_cfg, **defaults)
 
+    def test_watch_without_mirror_reports_product_branch_as_main(self) -> None:
+        cfg = dict(self.fork_cfg)
+        cfg.pop("mirror_branch")
+        cfg["product_branch"] = "lhc"  # the fixture's product branch name
+        with mock.patch.dict(os.environ, self.env, clear=False):
+            r = uw.watch_one(
+                cfg,
+                check_kind="daily",
+                state_dir=self.state_dir,
+                do_fetch=True,
+                update_state=False,
+                notes="none",
+            )
+        product = git(self.origin, "rev-parse", "lhc", env=self.env)
+        self.assertEqual(r.fields["origin_lhc_sha"], product)
+        self.assertEqual(r.fields["origin_main_sha"], product)
+        stub = uw.emit_handoff_stub(cfg, do_fetch=False)
+        self.assertIn("branch: lhc\n", stub)
+
     def test_watch_behind_and_state_update(self) -> None:
         (self.upstream / "README").write_text("b\n", encoding="utf-8")
         git(self.upstream, "add", "README", env=self.env)

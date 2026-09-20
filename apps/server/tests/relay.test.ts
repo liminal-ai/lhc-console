@@ -2304,3 +2304,144 @@ describe("RelayQueue outbound lee jobs", () => {
     }
   });
 });
+
+describe("RelayQueue delivery failure classes", () => {
+  function permanentError(message: string): Error {
+    return Object.assign(new Error(message), { permanent: true });
+  }
+
+  it("settles a permanent delivery error as failed-final after one attempt and never resumes it", async () => {
+    const dbPath = tempDb();
+    let attempts = 0;
+    const first = createQueue({
+      dbPath,
+      targets: { lee: leeTarget },
+      isBusy: () => false,
+      execute: async () => "unused",
+      deliver: async () => {
+        attempts += 1;
+        throw permanentError("sidecar /send failed with 500 (target_not_allowed)");
+      },
+      busyPollMs: 5,
+    });
+    const submitted = first.enqueue({
+      target: "lee",
+      prompt: "permanent",
+      jobKind: "outbound",
+      sender: "fable",
+      delivery: {
+        channel: "photon",
+        destination: { spaceId: "fable-home" },
+        metadata: { kind: "outbound_lee", senderAgentId: "fable", connectorAgentId: "fable" },
+      },
+    });
+    await expect
+      .poll(() => first.get(submitted.id)?.deliveryStatus, { timeout: 2_000 })
+      .toBe("failed-final");
+    const settled = await first.wait(submitted.id);
+    expect(settled?.deliveryError).toBe("sidecar /send failed with 500 (target_not_allowed)");
+    await new Promise((resolve) => setTimeout(resolve, DELIVERY_RETRY_BASE_MS * 4));
+    expect(attempts).toBe(1);
+    await first.close();
+
+    const second = createQueue({
+      dbPath,
+      targets: { lee: leeTarget },
+      isBusy: () => false,
+      execute: async () => "unused",
+      deliver: async () => {
+        attempts += 1;
+      },
+      busyPollMs: 5,
+    });
+    await new Promise((resolve) => setTimeout(resolve, DELIVERY_RETRY_BASE_MS * 2));
+    expect(attempts).toBe(1);
+    expect(second.get(submitted.id)?.deliveryStatus).toBe("failed-final");
+    await second.close();
+  });
+
+  it("caps transient delivery retries, persisting the attempt count across restart", async () => {
+    const dbPath = tempDb();
+    let attempts = 0;
+    const first = createQueue({
+      dbPath,
+      targets: { lee: leeTarget },
+      isBusy: () => false,
+      execute: async () => "unused",
+      deliver: async () => {
+        attempts += 1;
+        throw new Error("sidecar /send failed with 503");
+      },
+      busyPollMs: 5,
+      maxDeliveryAttempts: 3,
+    });
+    const submitted = first.enqueue({
+      target: "lee",
+      prompt: "transient",
+      jobKind: "outbound",
+      sender: "fable",
+      delivery: {
+        channel: "photon",
+        destination: { spaceId: "fable-home" },
+        metadata: { kind: "outbound_lee", senderAgentId: "fable", connectorAgentId: "fable" },
+      },
+    });
+    await expect
+      .poll(() => first.get(submitted.id)?.deliveryStatus, { timeout: 1_000 })
+      .toBe("failed");
+    await first.close();
+    expect(attempts).toBeGreaterThanOrEqual(1);
+    expect(attempts).toBeLessThan(3);
+
+    const second = createQueue({
+      dbPath,
+      targets: { lee: leeTarget },
+      isBusy: () => false,
+      execute: async () => "unused",
+      deliver: async () => {
+        attempts += 1;
+        throw new Error("sidecar /send failed with 503");
+      },
+      busyPollMs: 5,
+      maxDeliveryAttempts: 3,
+    });
+    await expect
+      .poll(() => second.get(submitted.id)?.deliveryStatus, { timeout: 5_000 })
+      .toBe("failed-final");
+    expect(attempts).toBe(3);
+    expect(second.get(submitted.id)?.deliveryError).toMatch(/gave up after 3 attempts/);
+    await new Promise((resolve) => setTimeout(resolve, DELIVERY_RETRY_BASE_MS * 8));
+    expect(attempts).toBe(3);
+    await second.close();
+  });
+
+  it("records the identity that carried a delivery on the job's delivery metadata", async () => {
+    const queue = createQueue({
+      dbPath: tempDb(),
+      targets: { lee: leeTarget },
+      isBusy: () => false,
+      execute: async () => "unused",
+      deliver: async () => ({ deliveredVia: "console" }),
+      busyPollMs: 5,
+    });
+    const submitted = queue.enqueue({
+      target: "lee",
+      prompt: "carried",
+      jobKind: "outbound",
+      sender: "fable",
+      delivery: {
+        channel: "photon",
+        destination: { spaceId: "fable-home" },
+        metadata: { kind: "outbound_lee", senderAgentId: "fable", connectorAgentId: "fable" },
+      },
+    });
+    const settled = await queue.wait(submitted.id);
+    expect(settled?.deliveryStatus).toBe("delivered");
+    expect(settled?.delivery?.metadata).toMatchObject({
+      kind: "outbound_lee",
+      senderAgentId: "fable",
+      deliveredVia: "console",
+    });
+    await queue.close();
+  });
+});

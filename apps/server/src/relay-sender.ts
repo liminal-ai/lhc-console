@@ -64,6 +64,22 @@ export function resolveLeePhotonRoute(
   throw new Error("no photon connector is configured to deliver messages to Lee");
 }
 
+/**
+ * Console's own Photon identity as a one-shot fallback when the sender's line
+ * cannot deliver (permanent sidecar failure such as target not allowed). Null
+ * when Console has no line or already is the sender's line.
+ */
+export function resolveConsoleFallbackRoute(
+  agents: AgentRecord[],
+  senderConnectorAgentId: string,
+): LeePhotonRoute | null {
+  const consoleAgent = agents.find((agent) => agent.id === "console");
+  const spaceId = consoleAgent?.channels.photon?.notifySpaceId;
+  if (!consoleAgent?.channels.photon || !spaceId) return null;
+  if (consoleAgent.id === senderConnectorAgentId) return null;
+  return { connectorAgentId: consoleAgent.id, spaceId };
+}
+
 export function latestPhotonDestination(consoleHome: string, target: string): string | null {
   const db = new DatabaseSync(join(consoleHome, "relay.sqlite"), { readOnly: true });
   try {

@@ -11,6 +11,21 @@ function response(status: number, body?: unknown): Response {
   });
 }
 
+function deliveredLeeJob(id: string, deliveredVia: string) {
+  return {
+    id,
+    status: "completed",
+    jobKind: "outbound",
+    deliveryStatus: "delivered",
+    deliveryError: null,
+    delivery: {
+      channel: "photon",
+      destination: { spaceId: "home" },
+      metadata: { kind: "outbound_lee", deliveredVia },
+    },
+  };
+}
+
 function requestUrl(input: string | URL | Request): string {
   if (typeof input === "string") return input;
   return input instanceof URL ? input.href : input.url;
@@ -36,6 +51,8 @@ function deps(
       readStdin: async () => stdin,
       stdout: (line: string) => stdout.push(line),
       stderr: (line: string) => stderr.push(line),
+      sleep: undefined as ((ms: number) => Promise<void>) | undefined,
+      leeWaitMs: undefined as number | undefined,
     },
     stdout,
     stderr,
@@ -310,13 +327,18 @@ describe("lhc-agent CLI", () => {
     const requests: Array<{ url: string; init?: RequestInit }> = [];
     const state = deps(async (input, init) => {
       requests.push({ url: requestUrl(input), init });
-      return response(202, { id: "lee-job-1", status: "queued", jobKind: "outbound" });
+      if (init?.method === "POST") {
+        return response(202, { id: "lee-job-1", status: "queued", jobKind: "outbound" });
+      }
+      return response(200, deliveredLeeJob("lee-job-1", "fable"));
     });
     state.value.readStdin = async () => "stdin body";
+    state.value.sleep = async () => undefined;
 
     expect(await runAgentCli(["--from", "fable", "lee", "-"], state.value)).toBe(0);
-    expect(state.stdout).toEqual(["lee-job-1"]);
-    expect(requests).toHaveLength(1);
+    expect(state.stdout).toEqual(["lee-job-1", "delivered via fable"]);
+    expect(requests).toHaveLength(2);
+    expect(requests[1]?.url).toBe("http://127.0.0.1:5959/api/relay/jobs/lee-job-1");
     expect(requests[0]?.url).toBe("http://127.0.0.1:5959/api/relay/targets/lee/jobs");
     expect(new Headers(requests[0]?.init?.headers).get("prefer")).toBe("respond-async");
     expect(JSON.parse(String(requests[0]?.init?.body))).toEqual({
@@ -329,8 +351,12 @@ describe("lhc-agent CLI", () => {
     const requests: Array<{ init?: RequestInit }> = [];
     const state = deps(async (_input, init) => {
       requests.push({ init });
-      return response(202, { id: "lee-job-2", status: "queued", jobKind: "outbound" });
+      if (init?.method === "POST") {
+        return response(202, { id: "lee-job-2", status: "queued", jobKind: "outbound" });
+      }
+      return response(200, deliveredLeeJob("lee-job-2", "cto"));
     });
+    state.value.sleep = async () => undefined;
 
     expect(
       await runAgentCli(
@@ -349,11 +375,13 @@ describe("lhc-agent CLI", () => {
     const state = deps(
       async (_input, init) => {
         requests.push({ init });
-        return response(202, { id: "lee-job-2", status: "queued" });
+        if (init?.method === "POST") return response(202, { id: "lee-job-2", status: "queued" });
+        return response(200, deliveredLeeJob("lee-job-2", "fable"));
       },
       "",
       "fable",
     );
+    state.value.sleep = async () => undefined;
     expect(await runAgentCli(["lee", "ping"], state.value)).toBe(0);
     expect(JSON.parse(String(requests[0]?.init?.body))).toEqual({
       prompt: "ping",
@@ -502,5 +530,70 @@ describe("lhc-agent CLI", () => {
         'no registered agent has relay.hostId "t3code" and relay.threadId thread-unknown (from T3CODE_THREAD_ID); set LHC_AGENT_ID or pass --from <registered-agent-key>',
       );
     });
+  });
+});
+
+describe("lhc-agent lee delivery outcome", () => {
+  it("exits non-zero with the delivery error when delivery failed", async () => {
+    const state = deps(async (_input, init) => {
+      if (init?.method === "POST") {
+        return response(202, { id: "lee-job-9", status: "queued", jobKind: "outbound" });
+      }
+      return response(200, {
+        id: "lee-job-9",
+        status: "completed",
+        jobKind: "outbound",
+        deliveryStatus: "failed-final",
+        deliveryError: "sidecar /send failed with 500 (target_not_allowed)",
+      });
+    });
+    state.value.sleep = async () => undefined;
+    expect(await runAgentCli(["--from", "fable", "lee", "ping"], state.value)).toBe(2);
+    expect(state.stdout).toEqual(["lee-job-9"]);
+    expect(state.stderr).toEqual([
+      "delivery failed: sidecar /send failed with 500 (target_not_allowed)",
+    ]);
+  });
+
+  it("reports pending with the follow-up command when delivery has not settled in time", async () => {
+    let polls = 0;
+    const state = deps(async (_input, init) => {
+      if (init?.method === "POST") {
+        return response(202, { id: "lee-job-10", status: "queued", jobKind: "outbound" });
+      }
+      polls += 1;
+      return response(200, {
+        id: "lee-job-10",
+        status: "completed",
+        jobKind: "outbound",
+        deliveryStatus: "delivering",
+        deliveryError: null,
+      });
+    });
+    state.value.sleep = async () => undefined;
+    state.value.leeWaitMs = 0;
+    expect(await runAgentCli(["--from", "fable", "lee", "ping"], state.value)).toBe(3);
+    expect(state.stdout).toEqual([
+      "lee-job-10",
+      "delivery pending; check with: lhc-agent job lee-job-10",
+    ]);
+    expect(polls).toBe(0);
+  });
+
+  it("shows the delivery outcome for outbound jobs in lhc-agent job", async () => {
+    const failed = deps(async () =>
+      response(200, {
+        id: "lee-job-11",
+        status: "completed",
+        jobKind: "outbound",
+        deliveryStatus: "failed-final",
+        deliveryError: "sidecar /send failed with 401",
+      }),
+    );
+    expect(await runAgentCli(["job", "lee-job-11"], failed.value)).toBe(2);
+    expect(failed.stderr).toEqual(["delivery failed: sidecar /send failed with 401"]);
+    const ok = deps(async () => response(200, deliveredLeeJob("lee-job-12", "console")));
+    expect(await runAgentCli(["job", "lee-job-12"], ok.value)).toBe(0);
+    expect(ok.stdout).toEqual(["delivered via console"]);
   });
 });

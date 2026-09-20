@@ -597,8 +597,53 @@ export class PhotonConnector {
       signal,
     });
     if (!response.ok) {
-      throw new Error(`sidecar ${path} failed with ${response.status}`);
+      throw await PhotonSidecarError.fromResponse(path, response);
     }
+  }
+}
+
+/** Sidecar error classes that no retry can fix (the sidecar reports retryable=false for these). */
+const PERMANENT_SIDECAR_ERROR_CLASSES = new Set(["target_not_allowed", "auth_or_config"]);
+
+/**
+ * A failed sidecar call with the retry decision attached. 4xx and any body the
+ * sidecar marks non-retryable (target not allowed, auth or config) are permanent;
+ * everything else (5xx transient classes, unreadable bodies) is transient.
+ */
+export class PhotonSidecarError extends Error {
+  readonly permanent: boolean;
+  readonly status: number;
+  readonly errorClass: string | null;
+
+  constructor(input: {
+    path: string;
+    status: number;
+    errorClass: string | null;
+    permanent: boolean;
+  }) {
+    const suffix = input.errorClass ? ` (${input.errorClass})` : "";
+    super(`sidecar ${input.path} failed with ${input.status}${suffix}`);
+    this.name = "PhotonSidecarError";
+    this.permanent = input.permanent;
+    this.status = input.status;
+    this.errorClass = input.errorClass;
+  }
+
+  static async fromResponse(path: string, response: Response): Promise<PhotonSidecarError> {
+    let errorClass: string | null = null;
+    let retryable: boolean | null = null;
+    try {
+      const body = (await response.json()) as { error_class?: unknown; retryable?: unknown };
+      if (typeof body.error_class === "string") errorClass = body.error_class;
+      if (typeof body.retryable === "boolean") retryable = body.retryable;
+    } catch {
+      // Non-JSON body: classify on status alone.
+    }
+    const permanent =
+      (response.status >= 400 && response.status < 500) ||
+      retryable === false ||
+      (errorClass !== null && PERMANENT_SIDECAR_ERROR_CLASSES.has(errorClass));
+    return new PhotonSidecarError({ path, status: response.status, errorClass, permanent });
   }
 }
 

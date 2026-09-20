@@ -6,8 +6,12 @@ import {
   type GroupWakeDeliveryMetadata,
 } from "./group-catch-up.ts";
 import type { PhotonConnectorManager } from "./photon-connector.ts";
-import { latestPhotonDestination, resolveLeePhotonRoute } from "./relay-sender.ts";
-import type { RelayJob } from "./relay.ts";
+import {
+  latestPhotonDestination,
+  resolveConsoleFallbackRoute,
+  resolveLeePhotonRoute,
+} from "./relay-sender.ts";
+import { type DeliveryReceipt, isPermanentDeliveryError, type RelayJob } from "./relay.ts";
 
 const MAX_PHOTON_MESSAGE_LENGTH = 8_000;
 
@@ -30,23 +34,28 @@ export function resolvePhotonDeliveryRoute(
   return spaceId ? { agentId: job.target, spaceId } : null;
 }
 
-export async function deliverRelayJob(job: RelayJob, context: RelayDeliveryContext): Promise<void> {
+export async function deliverRelayJob(
+  job: RelayJob,
+  context: RelayDeliveryContext,
+): Promise<DeliveryReceipt | undefined> {
   const channel = job.delivery?.channel ?? (job.notify === "photon" ? "photon" : null);
-  if (!channel) return;
+  if (!channel) return undefined;
   switch (channel) {
     case "photon":
       if (job.jobKind === "outbound" || job.target === "lee") {
-        await deliverOutboundLee(job, context);
-        return;
+        return await deliverOutboundLee(job, context);
       }
       await deliverPhoton(job, context);
-      return;
+      return undefined;
     default:
       throw new Error(`unsupported delivery channel: ${channel}`);
   }
 }
 
-async function deliverOutboundLee(job: RelayJob, context: RelayDeliveryContext): Promise<void> {
+async function deliverOutboundLee(
+  job: RelayJob,
+  context: RelayDeliveryContext,
+): Promise<DeliveryReceipt> {
   const metadata = job.delivery?.metadata ?? {};
   const senderAgentId =
     (typeof metadata.senderAgentId === "string" && metadata.senderAgentId) || job.sender || null;
@@ -62,7 +71,18 @@ async function deliverOutboundLee(job: RelayJob, context: RelayDeliveryContext):
   }
   const message = formatPhotonMessage(job.output ?? job.prompt, job.id);
   if (!message.trim()) throw new Error("outbound lee job has no message to deliver");
-  await context.photonConnectors.send(route.connectorAgentId, route.spaceId, message);
+  try {
+    await context.photonConnectors.send(route.connectorAgentId, route.spaceId, message);
+    return { deliveredVia: route.connectorAgentId };
+  } catch (error) {
+    // The sender's line cannot deliver (target not allowed, auth): one retry
+    // through Console's identity, recorded on the receipt. Transient errors
+    // stay with the sender's line and the queue's retry schedule.
+    const fallback = resolveConsoleFallbackRoute(context.agents, route.connectorAgentId);
+    if (!fallback || !isPermanentDeliveryError(error)) throw error;
+    await context.photonConnectors.send(fallback.connectorAgentId, fallback.spaceId, message);
+    return { deliveredVia: fallback.connectorAgentId };
+  }
 }
 
 async function deliverPhoton(job: RelayJob, context: RelayDeliveryContext): Promise<void> {

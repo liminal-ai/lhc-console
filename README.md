@@ -43,8 +43,12 @@ Agent-to-agent calls that may provoke a reply must use `start` so the caller
 does not hold its own thread while waiting on the recipient; blocking mutual
 calls can deadlock until timeout. `--from <agent>` or `LHC_AGENT_ID` adds a
 compact sender envelope. The special `lee` destination is always detached and
-delivers one-way through the sending agent's Photon identity, falling back to
-Console's configured identity when needed.
+delivers one-way through the sending agent's Photon identity. When that line
+cannot deliver (a permanent sidecar failure such as "target not allowed"), the
+delivery retries once through Console's identity and the job records which
+identity carried it. Transient failures retry with backoff for at most 8
+attempts, then settle as `failed-final`; `lhc-agent lee` waits for the outcome
+and exits non-zero when delivery failed (3 when still pending).
 
 The command discovers the loopback endpoint and owner-only token itself. Callers
 use stable agent keys; URLs, credentials, thread IDs, phone numbers, working

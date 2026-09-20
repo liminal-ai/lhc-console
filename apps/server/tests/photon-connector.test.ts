@@ -6,7 +6,11 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import type { AgentRecord } from "../src/agent-registry.ts";
 import { GroupCatchUpStore } from "../src/group-catch-up.ts";
-import { PhotonConnector, type PhotonConnectorManager } from "../src/photon-connector.ts";
+import {
+  PhotonConnector,
+  type PhotonConnectorManager,
+  PhotonSidecarError,
+} from "../src/photon-connector.ts";
 import { deliverRelayJob } from "../src/relay-delivery.ts";
 import { RelayQueue, type RelayTarget } from "../src/relay.ts";
 
@@ -610,5 +614,46 @@ describe("PhotonConnector", () => {
           text: "group backlog has 2 messages, exceeding the safety limit of 1; wake refused; backlog retained.",
         },
       ]);
+  });
+});
+
+describe("PhotonSidecarError classification", () => {
+  function sidecarResponse(status: number, body?: unknown): Response {
+    return new Response(body === undefined ? "upstream down" : JSON.stringify(body), {
+      status,
+      headers: { "content-type": body === undefined ? "text/plain" : "application/json" },
+    });
+  }
+
+  it("treats target-not-allowed and auth/config sidecar failures as permanent", async () => {
+    const notAllowed = await PhotonSidecarError.fromResponse(
+      "/send",
+      sidecarResponse(500, {
+        ok: false,
+        error: "internal sidecar error",
+        error_class: "target_not_allowed",
+        retryable: false,
+      }),
+    );
+    expect(notAllowed.permanent).toBe(true);
+    expect(notAllowed.message).toBe("sidecar /send failed with 500 (target_not_allowed)");
+    const auth = await PhotonSidecarError.fromResponse(
+      "/send",
+      sidecarResponse(500, { ok: false, error_class: "auth_or_config", retryable: false }),
+    );
+    expect(auth.permanent).toBe(true);
+    const unauthorized = await PhotonSidecarError.fromResponse("/send", sidecarResponse(401));
+    expect(unauthorized.permanent).toBe(true);
+  });
+
+  it("keeps upstream-transient and unclassified 5xx failures retryable", async () => {
+    const transient = await PhotonSidecarError.fromResponse(
+      "/send",
+      sidecarResponse(500, { ok: false, error_class: "upstream_transient", retryable: true }),
+    );
+    expect(transient.permanent).toBe(false);
+    const opaque = await PhotonSidecarError.fromResponse("/send", sidecarResponse(502));
+    expect(opaque.permanent).toBe(false);
+    expect(opaque.message).toBe("sidecar /send failed with 502");
   });
 });

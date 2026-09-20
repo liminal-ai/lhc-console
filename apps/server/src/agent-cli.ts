@@ -20,7 +20,13 @@ interface CliDeps {
   readStdin: () => Promise<string>;
   stdout: (line: string) => void;
   stderr: (line: string) => void;
+  /** How long `lhc-agent lee` waits for delivery to settle before reporting pending (default 30s). */
+  leeWaitMs?: number;
+  sleep?: (ms: number) => Promise<void>;
 }
+
+const DEFAULT_LEE_WAIT_MS = 30_000;
+const LEE_POLL_MS = 500;
 
 const LEE_DESCRIPTION = 'One-way message to Lee (no reply; use lhc-agent lee "message")';
 
@@ -33,7 +39,7 @@ Usage:
   lhc-agent <agent> "Your message"
   lhc-agent <agent> -                 Read the message from stdin
   lhc-agent [--from <agent>] [--priority] <agent> "Message"
-  lhc-agent lee "Message"             One-way message to Lee (always async)
+  lhc-agent lee "Message"             One-way message to Lee; prints the job id, then delivered / delivery failed
   lhc-agent start <agent> "Message"  Start a long call; print its job key
   lhc-agent start [--from <agent>] [--priority] <agent> "Message"
   lhc-agent job <job>                 Check a job; print its reply when done
@@ -146,11 +152,49 @@ async function call(args: string[], deps: CliDeps, detached: boolean): Promise<n
     }),
   })) as RelayJob;
 
-  if (detached || target === "lee" || !isRelayJobWaitSettled(result)) {
+  if (target === "lee") return await reportLeeDelivery(result, deps);
+  if (detached || !isRelayJobWaitSettled(result)) {
     deps.stdout(result.id);
     return 0;
   }
   return printSettled(result, deps);
+}
+
+/**
+ * A lee message is only "sent" once its delivery settles. Print the job id,
+ * then wait briefly for delivery: delivered (0, names the line that carried
+ * it), failed (2, with the delivery error), or still pending (3, check later
+ * with `lhc-agent job <id>`). Never reports success on a failed delivery.
+ */
+async function reportLeeDelivery(submitted: RelayJob, deps: CliDeps): Promise<number> {
+  deps.stdout(submitted.id);
+  const waitMs = deps.leeWaitMs ?? DEFAULT_LEE_WAIT_MS;
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const deadline = Date.now() + waitMs;
+  let job = submitted;
+  while (!isRelayJobWaitSettled(job)) {
+    if (Date.now() >= deadline) {
+      deps.stdout(`delivery pending; check with: lhc-agent job ${submitted.id}`);
+      return 3;
+    }
+    await sleep(Math.min(LEE_POLL_MS, Math.max(0, deadline - Date.now())));
+    job = (await api(deps, `/api/relay/jobs/${encodeURIComponent(submitted.id)}`)) as RelayJob;
+  }
+  return printDeliveryOutcome(job, deps);
+}
+
+function printDeliveryOutcome(job: RelayJob, deps: CliDeps): number {
+  if (job.status === "failed" || job.status === "cancelled") {
+    deps.stderr(job.error ?? `message ${job.status}`);
+    return 2;
+  }
+  if (job.deliveryStatus === "failed" || job.deliveryStatus === "failed-final") {
+    deps.stderr(`delivery failed: ${job.deliveryError ?? "message delivery failed"}`);
+    return 2;
+  }
+  const via = job.delivery?.metadata?.deliveredVia;
+  deps.stdout(typeof via === "string" ? `delivered via ${via}` : "delivered");
+  return 0;
 }
 
 /**
@@ -453,10 +497,7 @@ function printSettled(job: RelayJob, deps: CliDeps): number {
     );
     return 2;
   }
-  if (job.jobKind === "outbound" && job.deliveryStatus === "failed") {
-    deps.stderr(job.deliveryError ?? "message delivery failed");
-    return 2;
-  }
+  if (job.jobKind === "outbound") return printDeliveryOutcome(job, deps);
   deps.stdout(job.output ?? "");
   return 0;
 }

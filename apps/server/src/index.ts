@@ -213,13 +213,12 @@ const relayQueue = new RelayQueue({
         ...(job?.sender ? { LHC_RELAY_SENDER: job.sender } : {}),
       },
     }),
-  deliver: async (job) => {
-    await deliverRelayJob(job, {
+  deliver: (job) =>
+    deliverRelayJob(job, {
       agents: agentRegistry.agents,
       consoleHome,
       photonConnectors: photonRef.current,
-    });
-  },
+    }),
   jobLifecycle: {
     onRunning: (job) => photonTypingRef.current?.onRunning(job),
     onSpawn: (job) => photonTypingRef.current?.onSpawn(job),

@@ -254,3 +254,120 @@ describe("deliverRelayJob", () => {
     expect(sent).toEqual(["(empty reply)"]);
   });
 });
+
+function consoleAndFable(): RelayDeliveryContext["agents"] {
+  const relay = { hostId: "pi", threadId: "th", cwd: "/tmp", command: "true", args: [] };
+  const base = { description: "agent", duties: [], ownerSenderIds: ["owner"], mentionPatterns: [] };
+  return [
+    {
+      ...base,
+      id: "fable",
+      name: "Fable",
+      channels: {
+        photon: { address: "http://127.0.0.1:1", envFile: ".env", notifySpaceId: "fable-home" },
+      },
+      relay,
+    },
+    {
+      ...base,
+      id: "console",
+      name: "Console",
+      channels: {
+        photon: { address: "http://127.0.0.1:2", envFile: ".env", notifySpaceId: "console-home" },
+      },
+      relay,
+    },
+  ];
+}
+
+function leeJob(): RelayJob {
+  return job({
+    target: "lee",
+    prompt: "ping",
+    output: "ping",
+    jobKind: "outbound",
+    delivery: {
+      channel: "photon",
+      destination: { spaceId: "fable-home" },
+      metadata: { kind: "outbound_lee", senderAgentId: "fable", connectorAgentId: "fable" },
+    },
+  });
+}
+
+describe("deliverRelayJob lee fallback", () => {
+  it("retries once through Console's identity when the sender's line fails permanently", async () => {
+    const sent: Array<{ agentId: string; spaceId: string }> = [];
+    const receipt = await deliverRelayJob(leeJob(), {
+      agents: consoleAndFable(),
+      consoleHome: "/tmp",
+      photonConnectors: {
+        send: async (agentId: string, spaceId: string) => {
+          sent.push({ agentId, spaceId });
+          if (agentId === "fable") {
+            throw Object.assign(new Error("sidecar /send failed with 500 (target_not_allowed)"), {
+              permanent: true,
+            });
+          }
+        },
+      } as unknown as RelayDeliveryContext["photonConnectors"],
+    });
+    expect(sent).toEqual([
+      { agentId: "fable", spaceId: "fable-home" },
+      { agentId: "console", spaceId: "console-home" },
+    ]);
+    expect(receipt).toEqual({ deliveredVia: "console" });
+  });
+
+  it("reports the sender's own line on a first-try success", async () => {
+    const receipt = await deliverRelayJob(leeJob(), {
+      agents: consoleAndFable(),
+      consoleHome: "/tmp",
+      photonConnectors: {
+        send: async () => undefined,
+      } as unknown as RelayDeliveryContext["photonConnectors"],
+    });
+    expect(receipt).toEqual({ deliveredVia: "fable" });
+  });
+
+  it("leaves transient sender failures to the queue's retry schedule, no fallback", async () => {
+    const sent: string[] = [];
+    await expect(
+      deliverRelayJob(leeJob(), {
+        agents: consoleAndFable(),
+        consoleHome: "/tmp",
+        photonConnectors: {
+          send: async (agentId: string) => {
+            sent.push(agentId);
+            throw new Error("sidecar /send failed with 503");
+          },
+        } as unknown as RelayDeliveryContext["photonConnectors"],
+      }),
+    ).rejects.toThrow(/503/);
+    expect(sent).toEqual(["fable"]);
+  });
+
+  it("does not fall back when Console is already the sender's line", async () => {
+    const sent: string[] = [];
+    const consoleJob = job({
+      ...leeJob(),
+      delivery: {
+        channel: "photon",
+        destination: { spaceId: "console-home" },
+        metadata: { kind: "outbound_lee", senderAgentId: "console", connectorAgentId: "console" },
+      },
+    });
+    await expect(
+      deliverRelayJob(consoleJob, {
+        agents: consoleAndFable(),
+        consoleHome: "/tmp",
+        photonConnectors: {
+          send: async (agentId: string) => {
+            sent.push(agentId);
+            throw Object.assign(new Error("sidecar /send failed with 401"), { permanent: true });
+          },
+        } as unknown as RelayDeliveryContext["photonConnectors"],
+      }),
+    ).rejects.toThrow(/401/);
+    expect(sent).toEqual(["console"]);
+  });
+});

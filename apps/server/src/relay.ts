@@ -40,7 +40,7 @@ export function normalizeRelayJobKind(value: string | null | undefined): RelayJo
 export function isRelayJobWaitSettled(job: RelayJob): boolean {
   if (job.jobKind === "outbound") {
     if (job.status === "failed" || job.status === "cancelled") return true;
-    return job.deliveryStatus === "delivered";
+    return job.deliveryStatus === "delivered" || job.deliveryStatus === "failed-final";
   }
   return isSettledStatus(job.status);
 }
@@ -49,6 +49,26 @@ export const DELIVERY_LEASE_MS = 60_000;
 export const DELIVERY_HEARTBEAT_MS = 15_000;
 export const DELIVERY_RETRY_BASE_MS = 250;
 export const DELIVERY_RETRY_MAX_MS = 30_000;
+/** Transient delivery failures retry up to this many attempts, then settle as failed-final. */
+export const MAX_DELIVERY_ATTEMPTS = 8;
+
+/** What a delivery reports back on success; recorded on the job's delivery metadata. */
+export interface DeliveryReceipt {
+  /** Agent identity whose Photon line carried the message (sender or console fallback). */
+  deliveredVia?: string;
+}
+
+/**
+ * A delivery error that no retry can fix (sidecar 4xx, target not allowed,
+ * auth or config). Duck-typed so the connector does not import this module.
+ */
+export function isPermanentDeliveryError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { permanent?: unknown }).permanent === true
+  );
+}
 export const CLOSE_TIMEOUT_MS = 5_000;
 
 export interface RelayTarget {
@@ -91,7 +111,8 @@ export interface RelayJob {
   finishedAt: string | null;
   notify: "photon" | null;
   delivery: RelayDelivery | null;
-  deliveryStatus: "pending" | "delivering" | "delivered" | "failed" | null;
+  /** failed: transient, retried; failed-final: permanent or retries exhausted, never resumed. */
+  deliveryStatus: "pending" | "delivering" | "delivered" | "failed" | "failed-final" | null;
   deliveryError: string | null;
 }
 
@@ -126,10 +147,12 @@ interface RelayQueueOptions {
    */
   acquireWriterLock?: (target: RelayTarget) => unknown;
   releaseWriterLock?: (held: unknown) => void;
-  deliver?: (job: RelayJob) => Promise<void>;
+  deliver?: (job: RelayJob) => Promise<void | DeliveryReceipt>;
   jobLifecycle?: RelayJobLifecycle;
   busyPollMs?: number;
   deliveryLeaseMs?: number;
+  /** Override MAX_DELIVERY_ATTEMPTS (tests). */
+  maxDeliveryAttempts?: number;
   deliveryHeartbeatMs?: number;
   closeTimeoutMs?: number;
   consoleHome?: string;
@@ -150,6 +173,7 @@ export class RelayQueue {
   readonly #jobLifecycle: RelayQueueOptions["jobLifecycle"];
   readonly #busyPollMs: number;
   readonly #deliveryLeaseMs: number;
+  readonly #maxDeliveryAttempts: number;
   readonly #deliveryHeartbeatMs: number;
   readonly #closeTimeoutMs: number;
   readonly #consoleHome?: string;
@@ -183,6 +207,7 @@ export class RelayQueue {
     this.#jobLifecycle = options.jobLifecycle;
     this.#busyPollMs = options.busyPollMs ?? 2000;
     this.#deliveryLeaseMs = options.deliveryLeaseMs ?? DELIVERY_LEASE_MS;
+    this.#maxDeliveryAttempts = options.maxDeliveryAttempts ?? MAX_DELIVERY_ATTEMPTS;
     this.#deliveryHeartbeatMs = options.deliveryHeartbeatMs ?? DELIVERY_HEARTBEAT_MS;
     this.#closeTimeoutMs = options.closeTimeoutMs ?? CLOSE_TIMEOUT_MS;
     this.#consoleHome = options.consoleHome;
@@ -536,6 +561,12 @@ export class RelayQueue {
         "relay_jobs",
         "sender",
         "ALTER TABLE relay_jobs ADD COLUMN sender TEXT",
+      );
+      ensureColumn(
+        this.#db,
+        "relay_jobs",
+        "delivery_attempts",
+        "ALTER TABLE relay_jobs ADD COLUMN delivery_attempts INTEGER NOT NULL DEFAULT 0",
       );
       this.#db.exec(
         `UPDATE relay_jobs
@@ -1041,10 +1072,19 @@ export class RelayQueue {
     return renewed.changes === 1;
   }
 
+  #deliveryAttempts(id: string): number {
+    const row = this.#db
+      .prepare("SELECT delivery_attempts FROM relay_jobs WHERE id = ?")
+      .get(id) as { delivery_attempts: number | null } | undefined;
+    return row?.delivery_attempts ?? 0;
+  }
+
   #finalizeDelivery(
     id: string,
     token: string,
-    outcome: { status: "delivered" } | { status: "failed"; error: string },
+    outcome:
+      | { status: "delivered"; deliveredVia?: string }
+      | { status: "failed"; error: string; final: boolean },
   ): boolean {
     if (outcome.status === "delivered") {
       const updated = this.#db
@@ -1052,25 +1092,28 @@ export class RelayQueue {
           `UPDATE relay_jobs
            SET delivery_status = 'delivered',
                delivery_error = NULL,
+               delivery_metadata = CASE WHEN ? IS NULL THEN delivery_metadata
+                 ELSE json_set(COALESCE(delivery_metadata, '{}'), '$.deliveredVia', ?) END,
                delivery_owner_pid = NULL,
                delivery_owner_token = NULL,
                delivery_lease_expires_at = NULL
            WHERE id = ? AND delivery_owner_token = ? AND delivery_status = 'delivering'`,
         )
-        .run(id, token);
+        .run(outcome.deliveredVia ?? null, outcome.deliveredVia ?? null, id, token);
       return updated.changes === 1;
     }
     const updated = this.#db
       .prepare(
         `UPDATE relay_jobs
-         SET delivery_status = 'failed',
+         SET delivery_status = ?,
              delivery_error = ?,
+             delivery_attempts = delivery_attempts + 1,
              delivery_owner_pid = NULL,
              delivery_owner_token = NULL,
              delivery_lease_expires_at = NULL
          WHERE id = ? AND delivery_owner_token = ? AND delivery_status = 'delivering'`,
       )
-      .run(outcome.error, id, token);
+      .run(outcome.final ? "failed-final" : "failed", outcome.error, id, token);
     return updated.changes === 1;
   }
 
@@ -1089,16 +1132,31 @@ export class RelayQueue {
         }
       }, this.#deliveryHeartbeatMs);
       try {
-        await this.#deliver(this.get(id)!);
+        const receipt = await this.#deliver(this.get(id)!);
         if (leaseLost || !this.#renewDeliveryLease(id, token)) return;
-        if (this.#finalizeDelivery(id, token, { status: "delivered" })) {
+        const deliveredVia = receipt?.deliveredVia;
+        if (
+          this.#finalizeDelivery(id, token, {
+            status: "delivered",
+            ...(deliveredVia ? { deliveredVia } : {}),
+          })
+        ) {
           this.#deliveryRetryTimers.delete(id);
         }
       } catch (error) {
         if (leaseLost) return;
         const message = error instanceof Error ? error.message : String(error);
-        if (this.#finalizeDelivery(id, token, { status: "failed", error: message })) {
-          this.#scheduleDeliveryRetry(id, attempt + 1);
+        // Permanent errors and exhausted retries settle as failed-final: no
+        // retry timer, and #deliverPending never resumes them at boot.
+        const attempts = this.#deliveryAttempts(id) + 1;
+        const permanent = isPermanentDeliveryError(error);
+        const exhausted = attempts >= this.#maxDeliveryAttempts;
+        const detail =
+          !permanent && exhausted ? `${message} (gave up after ${attempts} attempts)` : message;
+        const final = permanent || exhausted;
+        if (this.#finalizeDelivery(id, token, { status: "failed", error: detail, final })) {
+          if (final) this.#deliveryRetryTimers.delete(id);
+          else this.#scheduleDeliveryRetry(id, attempt + 1);
         }
       } finally {
         clearInterval(heartbeat);

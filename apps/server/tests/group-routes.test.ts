@@ -42,6 +42,7 @@ function setup() {
   registerGroupRoutes(app, {
     groups: [group],
     agents: [seat("sable", "Sable"), seat("flint", "Flint")],
+    token: "test-secret",
     openTranscript: () => transcript,
     queue: {
       enqueue: (input) => {
@@ -52,9 +53,53 @@ function setup() {
   });
   return { app, transcript, jobs };
 }
-const auth = {};
+const auth = { authorization: "Bearer test-secret" };
 
 describe("group line web API", () => {
+  it("requires the owner bearer on every route", async () => {
+    const { app } = setup();
+    for (const [method, url] of [
+      ["GET", "/api/groups"],
+      ["GET", "/api/groups/spec-group"],
+      ["GET", "/api/groups/spec-group/messages"],
+      ["POST", "/api/groups/spec-group/messages"],
+    ] as const) {
+      const response = await app.inject({ method, url, payload: { text: "x" } });
+      expect(response.statusCode).toBe(401);
+      const wrong = await app.inject({
+        method,
+        url,
+        payload: { text: "x" },
+        headers: { authorization: "Bearer nope" },
+      });
+      expect(wrong.statusCode).toBe(401);
+    }
+  });
+
+  it("describes one group with member cursors and the last seq", async () => {
+    const { app, transcript } = setup();
+    transcript.append({ senderId: "lee", senderLabel: "Lee", text: "one", inboundMessageId: "a" });
+    transcript.append({ senderId: "lee", senderLabel: "Lee", text: "two", inboundMessageId: "b" });
+    transcript.advanceCursor("flint", 2);
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/groups/spec-group",
+      headers: auth,
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      id: "spec-group",
+      lastSeq: 2,
+      members: [
+        { id: "sable", label: "Sable", cursorSeq: 0 },
+        { id: "flint", label: "Flint", cursorSeq: 2 },
+      ],
+    });
+    expect(
+      (await app.inject({ method: "GET", url: "/api/groups/nope", headers: auth })).statusCode,
+    ).toBe(404);
+  });
+
   it("lists groups with member labels and no channel secrets", async () => {
     const { app } = setup();
     const response = await app.inject({ method: "GET", url: "/api/groups", headers: auth });

@@ -1,11 +1,10 @@
-// Group-line web transport: read the transcript, post an owner message into
-// the same router the Photon line uses. Reached only through the web app's
-// /api proxy on the owner's tailnet, so it carries no bearer token: the same
-// trust boundary as /api/threads and the console terminals, which already act
-// on the owner's behalf. Pull-based: the page polls `since`; member replies
-// still fan in to every transport the group enables (iMessage); the web reads.
-import { randomUUID } from "node:crypto";
-import type { FastifyInstance } from "fastify";
+// Group-line HTTP transport: read the transcript, post an owner message into
+// the same router the Photon line uses. Owner bearer (the relay token) on every
+// route; the t3code fork proxies these with the token from its own server, so
+// no browser ever holds it. Pull-based: the page polls `since`; member replies
+// still fan in to every transport the group enables (iMessage); readers poll.
+import { randomUUID, timingSafeEqual } from "node:crypto";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { AgentRecord, GroupRecord } from "./agent-registry.ts";
 import { handleGroupOwnerMessage, resolveGroupMembers } from "./group-line.ts";
 import type { GroupTranscript, TranscriptMessage } from "./group-transcript.ts";
@@ -14,6 +13,7 @@ import type { RelayQueue } from "./relay.ts";
 export interface GroupRouteOptions {
   groups: GroupRecord[];
   agents: AgentRecord[];
+  token: string;
   queue: Pick<RelayQueue, "enqueue">;
   openTranscript: (groupId: string) => GroupTranscript;
 }
@@ -25,6 +25,12 @@ export interface PublicGroup {
   members: Array<{ id: string; label: string }>;
   catchUp: GroupRecord["group"]["catchUp"];
   channels: string[];
+}
+
+export interface PublicGroupDetail extends PublicGroup {
+  /** Each member's cursor: the last transcript seq it has been shown. */
+  members: Array<{ id: string; label: string; cursorSeq: number }>;
+  lastSeq: number;
 }
 
 export interface PublicGroupMessage {
@@ -39,15 +45,42 @@ const MAX_MESSAGE_LENGTH = 8_000;
 const LIST_LIMIT = 500;
 
 export function registerGroupRoutes(app: FastifyInstance, options: GroupRouteOptions): void {
+  const authorize = async (request: FastifyRequest, reply: FastifyReply) => {
+    const supplied = request.headers.authorization?.replace(/^Bearer\s+/i, "") ?? "";
+    if (!sameToken(supplied, options.token)) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+  };
   const find = (id: string): GroupRecord | undefined =>
     options.groups.find((group) => group.id === id);
 
-  app.get("/api/groups", async () =>
+  app.get("/api/groups", { preHandler: authorize }, async () =>
     options.groups.map((group) => toPublicGroup(group, options.agents)),
+  );
+
+  app.get<{ Params: { id: string } }>(
+    "/api/groups/:id",
+    { preHandler: authorize },
+    async (request, reply) => {
+      const group = find(request.params.id);
+      if (!group) return reply.code(404).send({ error: `unknown group: ${request.params.id}` });
+      const transcript = options.openTranscript(group.id);
+      const base = toPublicGroup(group, options.agents);
+      const detail: PublicGroupDetail = {
+        ...base,
+        members: base.members.map((member) => ({
+          ...member,
+          cursorSeq: transcript.cursor(member.id),
+        })),
+        lastSeq: transcript.lastSeq(),
+      };
+      return detail;
+    },
   );
 
   app.get<{ Params: { id: string }; Querystring: { since?: string } }>(
     "/api/groups/:id/messages",
+    { preHandler: authorize },
     async (request, reply) => {
       const group = find(request.params.id);
       if (!group) return reply.code(404).send({ error: `unknown group: ${request.params.id}` });
@@ -62,6 +95,7 @@ export function registerGroupRoutes(app: FastifyInstance, options: GroupRouteOpt
 
   app.post<{ Params: { id: string }; Body: { text?: unknown; id?: unknown } }>(
     "/api/groups/:id/messages",
+    { preHandler: authorize },
     async (request, reply) => {
       const group = find(request.params.id);
       if (!group) return reply.code(404).send({ error: `unknown group: ${request.params.id}` });
@@ -125,4 +159,10 @@ function toPublicMessage(message: TranscriptMessage): PublicGroupMessage {
     text: message.text,
     at: message.at,
   };
+}
+
+function sameToken(supplied: string, expected: string): boolean {
+  const a = Buffer.from(supplied);
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
 }

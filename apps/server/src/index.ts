@@ -438,6 +438,7 @@ registerAgentRoutes(app, { agents: agentRegistry.agents, token: relayToken });
 registerGroupRoutes(app, {
   groups: agentRegistry.groups,
   agents: agentRegistry.agents,
+  token: relayToken,
   queue: relayQueue,
   openTranscript: openGroupTranscript,
 });

@@ -142,10 +142,6 @@ export async function renderList(app: HTMLElement): Promise<void> {
   newBtn.title = "start a new session or shell (n)";
   newBtn.onclick = () => openNewSessionModal();
   titleRow.append(newBtn);
-  const groupsLink = el("a", "chip groups-link", "groups") as HTMLAnchorElement;
-  groupsLink.href = "#/groups";
-  groupsLink.title = "group lines (owner + members)";
-  titleRow.append(groupsLink);
   header.append(titleRow);
   const sub = el("div", "subtitle");
   header.append(sub);

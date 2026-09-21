@@ -27,7 +27,7 @@ All of this is the `lhc-agent` CLI, on PATH inside your thread. It discovers the
 - `printf '...' | lhc-agent <key> -` reads the message from stdin (multi-line, quotes, code).
 - `lhc-agent lee "message"` texts Lee from your line. It prints the job id, then waits up to 30 seconds and prints `delivered via <line>` (exit 0), `delivery failed: ...` (exit 2), or `delivery pending; check with: lhc-agent job <id>` (exit 3). **Exit 0 is the only proof Lee got it.** Until Lee has texted your number once, your line is closed and every send fails with "target not allowed"; that is a Photon rule, not a bug you can fix.
 
-Sender attribution: pass `--from <your key>` on every `lhc-agent` call, or start each shell command with `export LHC_AGENT_ID=<your key>`. Automatic resolution from the thread id works only for Claude LHC seats (one process per thread); Codex seats share one app-server, so your shell cannot know its thread and a send without a sender is rejected with `requires a sender`. Put the export in your project's AGENTS.md so it survives compaction. Never pass another seat's key.
+Sender attribution: pass `--from <your key>` on every `lhc-agent` call, or start each shell command with `export LHC_AGENT_ID=<your key>`. Automatic resolution from the thread id does not work on any t3code-hosted seat today (Claude LHC: the wrapper does not pass T3CODE_THREAD_ID to the tool shell; Codex: one shared app-server), so always send with --from or LHC_AGENT_ID. Put the export in your project's AGENTS.md so it survives compaction. Never pass another seat's key.
 
 ## 4. Keeping work going: the actual problem
 

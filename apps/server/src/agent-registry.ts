@@ -42,8 +42,34 @@ export interface AgentRecord {
   v2?: AgentV2Config;
 }
 
+export type GroupCatchUp =
+  | { mode: "all" }
+  | { mode: "last" }
+  | { mode: "window"; messages: number };
+
+export interface AgentGroupConfig {
+  members: string[];
+  catchUp: GroupCatchUp;
+}
+
+/**
+ * A group line: one owner-facing Photon DM whose tagged members (seats) answer
+ * in-thread. Never a relay target, never a V2 target; it owns a transcript.
+ */
+export interface GroupRecord {
+  id: string;
+  name: string;
+  description: string;
+  duties: string[];
+  ownerSenderIds: string[];
+  mentionPatterns: string[];
+  channels: AgentChannels;
+  group: AgentGroupConfig;
+}
+
 export interface LoadedAgentRegistry {
   agents: AgentRecord[];
+  groups: GroupRecord[];
   relayTargets: Record<string, RelayTarget>;
 }
 
@@ -99,6 +125,12 @@ interface RawAgentConfig {
   channels?: RawChannels;
   relay?: RawRelayConfig;
   v2?: RawV2Config;
+  group?: RawGroupConfig;
+}
+
+interface RawGroupConfig {
+  members?: unknown;
+  catchUp?: unknown;
 }
 
 interface RawRegistry {
@@ -118,7 +150,7 @@ export function loadAgentRegistry(consoleHome: string): LoadedAgentRegistry {
     parsed = JSON.parse(readFileSync(path, "utf8")) as RawRegistry;
     assertOwnerOnlyFile(path, "agents.json");
   } catch (error) {
-    if (isMissingFile(error)) return { agents: [], relayTargets: {} };
+    if (isMissingFile(error)) return { agents: [], groups: [], relayTargets: {} };
     throw new Error(
       `could not read agent registry at ${path}: ${error instanceof Error ? error.message : String(error)}`,
     );
@@ -127,13 +159,87 @@ export function loadAgentRegistry(consoleHome: string): LoadedAgentRegistry {
     throw new Error(`agent registry version must be 1 (got ${String(parsed.version)})`);
   }
   const agents: AgentRecord[] = [];
+  const groups: GroupRecord[] = [];
   const relayTargets: Record<string, RelayTarget> = {};
   for (const [id, raw] of Object.entries(parsed.agents ?? {})) {
+    if (raw?.group !== undefined) {
+      groups.push(parseGroupRecord(id, raw, consoleHome));
+      continue;
+    }
     const record = parseAgent(id, raw, consoleHome);
     agents.push(record);
     relayTargets[id] = record.relay;
   }
-  return { agents, relayTargets };
+  for (const group of groups) validateGroupMembers(group, agents, groups);
+  return { agents, groups, relayTargets };
+}
+
+function parseGroupRecord(id: string, raw: RawAgentConfig, consoleHome: string): GroupRecord {
+  if (!/^[a-z][a-z0-9-]*$/.test(id)) {
+    throw new Error(`agent key must match [a-z][a-z0-9-]*: ${id}`);
+  }
+  if (reservedAgentKeys(true).has(id)) throw new Error(`reserved agent key: ${id}`);
+  if (raw.relay !== undefined) throw new Error(`${id}.relay is not allowed on a group line`);
+  if (raw.v2 !== undefined) throw new Error(`${id}.v2 is not allowed on a group line`);
+  if (raw.health !== undefined) throw new Error(`${id}.health is not allowed on a group line`);
+  const name = optionalString(raw.name) ?? id;
+  const description = optionalString(raw.description) ?? `${name} group line`;
+  const duties = raw.duties === undefined ? [] : requireStringArray(raw.duties, `${id}.duties`);
+  const ownerSenderIds = requireStringArray(raw.ownerSenderIds, `${id}.ownerSenderIds`);
+  if (!ownerSenderIds.length) {
+    throw new Error(`${id}.ownerSenderIds must include at least one sender id`);
+  }
+  const mentionPatterns =
+    raw.mentionPatterns === undefined ? [] : parseMentionPatterns(raw.mentionPatterns);
+  const channels = parseChannels(id, raw.channels, consoleHome);
+  if (!channels.photon) throw new Error(`${id}.channels.photon is required on a group line`);
+  return {
+    id,
+    name,
+    description,
+    duties,
+    ownerSenderIds,
+    mentionPatterns,
+    channels,
+    group: parseGroup(id, raw.group),
+  };
+}
+
+function parseGroup(id: string, raw: RawGroupConfig | undefined): AgentGroupConfig {
+  if (!raw || typeof raw !== "object") throw new Error(`${id}.group must be an object`);
+  const members = requireStringArray(raw.members, `${id}.group.members`);
+  if (members.length < 2) throw new Error(`${id}.group.members must list at least two seats`);
+  if (new Set(members).size !== members.length) {
+    throw new Error(`${id}.group.members must not repeat a seat`);
+  }
+  return { members, catchUp: parseGroupCatchUp(id, raw.catchUp) };
+}
+
+function parseGroupCatchUp(id: string, raw: unknown): GroupCatchUp {
+  if (raw === undefined || raw === "all") return { mode: "all" };
+  if (raw === "last") return { mode: "last" };
+  if (raw && typeof raw === "object" && "messages" in raw) {
+    const messages = (raw as { messages: unknown }).messages;
+    if (typeof messages === "number" && Number.isInteger(messages) && messages > 0) {
+      return { mode: "window", messages };
+    }
+  }
+  throw new Error(`${id}.group.catchUp must be "all", "last", or { "messages": N } with N >= 1`);
+}
+
+function validateGroupMembers(
+  group: GroupRecord,
+  agents: AgentRecord[],
+  groups: GroupRecord[],
+): void {
+  for (const member of group.group.members) {
+    if (groups.some((other) => other.id === member)) {
+      throw new Error(`${group.id}.group.members: ${member} is a group line, not a seat`);
+    }
+    const seat = agents.find((agent) => agent.id === member);
+    if (!seat) throw new Error(`${group.id}.group.members: unknown agent ${member}`);
+    if (!seat.relay) throw new Error(`${group.id}.group.members: ${member} has no relay target`);
+  }
 }
 
 const ALWAYS_RESERVED_AGENT_KEYS = new Set(["help", "list", "start", "job", "goal", "lee"]);

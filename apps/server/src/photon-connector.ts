@@ -3,7 +3,7 @@ import { EventEmitter } from "node:events";
 import { randomBytes } from "node:crypto";
 import { createServer as createTcpServer } from "node:net";
 import { join } from "node:path";
-import type { AgentRecord } from "./agent-registry.ts";
+import type { AgentRecord, AgentV2Config, GroupRecord } from "./agent-registry.ts";
 import { loadPhotonEnvFile } from "./env-file.ts";
 import {
   GroupCatchUpStore,
@@ -75,8 +75,25 @@ interface PhotonInboundEvent {
 
 interface GroupWakeMetadata extends GroupWakeDeliveryMetadata {}
 
+/** What a connector needs from its registry entry: a seat or a group line. */
+export type PhotonLineRecord = Pick<
+  AgentRecord,
+  "id" | "name" | "channels" | "ownerSenderIds" | "mentionPatterns"
+> & { v2?: AgentV2Config; group?: GroupRecord["group"] };
+
+/** Group-line transport hook: an owner DM on a group connector goes here, not to the relay. */
+export interface GroupLineOwnerMessage {
+  spaceId: string;
+  messageId: string;
+  text: string;
+  timestamp: string;
+}
+export type GroupLineHandler = (group: PhotonLineRecord, input: GroupLineOwnerMessage) => void;
+
 export interface PhotonConnectorOptions {
-  agent: AgentRecord;
+  agent: PhotonLineRecord;
+  /** Required when `agent.group` is set; owner DMs are routed through it. */
+  groupLine?: GroupLineHandler;
   consoleHome: string;
   queue: RelayQueue;
   v2?: RuntimeManager | null;
@@ -97,7 +114,8 @@ export interface PhotonConnectorOptions {
 
 export class PhotonConnector {
   readonly agentId: string;
-  readonly #agent: AgentRecord;
+  readonly #agent: PhotonLineRecord;
+  readonly #groupLine: GroupLineHandler | null;
   readonly #queue: RelayQueue;
   readonly #v2: RuntimeManager | null;
   readonly #sidecarPath: string;
@@ -128,6 +146,10 @@ export class PhotonConnector {
       throw new Error(`agent ${options.agent.id} has no channels.photon configuration`);
     }
     this.#agent = options.agent;
+    this.#groupLine = options.groupLine ?? null;
+    if (options.agent.group && !this.#groupLine) {
+      throw new Error(`group line ${options.agent.id} needs a groupLine handler`);
+    }
     this.agentId = options.agent.id;
     this.#queue = options.queue;
     this.#v2 = options.v2 ?? null;
@@ -284,6 +306,16 @@ export class PhotonConnector {
     if (!this.#isOwner(senderId)) return;
     const claim = this.#dedupe.begin(spaceId, messageId);
     if (claim.gate === "skip") return;
+    if (this.#agent.group && this.#groupLine) {
+      try {
+        this.#groupLine(this.#agent, { spaceId, messageId, text, timestamp });
+        this.#dedupe.complete(spaceId, messageId, claim.token);
+      } catch (error) {
+        this.#dedupe.release(spaceId, messageId, claim.token);
+        throw error;
+      }
+      return;
+    }
     try {
       if (await this.#handleV2Control(spaceId, text)) {
         this.#dedupe.complete(spaceId, messageId, claim.token);
@@ -650,21 +682,23 @@ export class PhotonSidecarError extends Error {
 export class PhotonConnectorManager {
   readonly #connectors = new Map<string, PhotonConnector>();
   readonly #options: {
-    agents: AgentRecord[];
+    agents: PhotonLineRecord[];
     consoleHome: string;
     queue: RelayQueue;
     sidecarPath?: string;
     onError?: (message: string) => void;
     v2?: RuntimeManager | null;
+    groupLine?: GroupLineHandler;
   };
 
   constructor(options: {
-    agents: AgentRecord[];
+    agents: PhotonLineRecord[];
     consoleHome: string;
     queue: RelayQueue;
     sidecarPath?: string;
     onError?: (message: string) => void;
     v2?: RuntimeManager | null;
+    groupLine?: GroupLineHandler;
   }) {
     this.#options = options;
   }
@@ -679,6 +713,7 @@ export class PhotonConnectorManager {
         sidecarPath: this.#options.sidecarPath,
         onError: this.#options.onError,
         v2: this.#options.v2,
+        groupLine: this.#options.groupLine,
       });
       await connector.start();
       this.#connectors.set(agent.id, connector);

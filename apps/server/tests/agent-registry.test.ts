@@ -345,3 +345,116 @@ describe("loadAgentRegistry", () => {
     expect(loaded.relayTargets).toEqual({});
   });
 });
+
+describe("group lines", () => {
+  function seat(threadId: string) {
+    return {
+      ownerSenderIds: ["+1555"],
+      relay: { hostId: "t3code", threadId, cwd: "/tmp", command: "true", args: [] },
+    };
+  }
+  function home(): string {
+    const dir = mkdtempSync(join(tmpdir(), "lhc-agents-"));
+    dirs.push(dir);
+    mkdirSync(join(dir, "agents"), { recursive: true });
+    writeFileSync(join(dir, "agents", "spec-group.env"), "PHOTON_PROJECT_ID=p\n", { mode: 0o600 });
+    return dir;
+  }
+  function groupEntry(members: string[], extra: Record<string, unknown> = {}) {
+    return {
+      ownerSenderIds: ["+1555"],
+      channels: {
+        photon: { address: "+1999", envFile: "agents/spec-group.env", notifySpaceId: "d" },
+      },
+      group: { members },
+      ...extra,
+    };
+  }
+
+  it("loads a group line separately from seats and never as a relay target", () => {
+    const dir = home();
+    writeRegistry(dir, {
+      version: 1,
+      agents: {
+        sable: seat("th_s"),
+        flint: seat("th_f"),
+        "spec-group": groupEntry(["sable", "flint"], {
+          mentionPatterns: ["(?<![\\w@])@all\\b"],
+          group: { members: ["sable", "flint"], catchUp: { messages: 5 } },
+        }),
+      },
+    });
+    const registry = loadAgentRegistry(dir);
+    expect(registry.agents.map((agent) => agent.id)).toEqual(["sable", "flint"]);
+    expect(Object.keys(registry.relayTargets)).toEqual(["sable", "flint"]);
+    expect(registry.groups).toHaveLength(1);
+    expect(registry.groups[0]).toMatchObject({
+      id: "spec-group",
+      mentionPatterns: ["(?<![\\w@])@all\\b"],
+      group: { members: ["sable", "flint"], catchUp: { mode: "window", messages: 5 } },
+    });
+  });
+
+  it("defaults catchUp to all and accepts last", () => {
+    const dir = home();
+    writeRegistry(dir, {
+      version: 1,
+      agents: {
+        a: seat("1"),
+        b: seat("2"),
+        g1: groupEntry(["a", "b"]),
+        g2: groupEntry(["a", "b"], { group: { members: ["a", "b"], catchUp: "last" } }),
+      },
+    });
+    const groups = loadAgentRegistry(dir).groups;
+    expect(groups.map((group) => group.group.catchUp)).toEqual([{ mode: "all" }, { mode: "last" }]);
+  });
+
+  it.each([
+    ["unknown member", ["sable", "ghost"], {}, /unknown agent ghost/],
+    ["fewer than two", ["sable"], {}, /at least two/],
+    ["duplicate", ["sable", "sable"], {}, /must not repeat/],
+    ["relay on a group", ["sable", "flint"], { relay: { hostId: "x" } }, /relay is not allowed/],
+    ["v2 on a group", ["sable", "flint"], { v2: { provider: "hermes" } }, /v2 is not allowed/],
+    [
+      "bad catchUp",
+      ["sable", "flint"],
+      { group: { members: ["sable", "flint"], catchUp: "some" } },
+      /catchUp/,
+    ],
+  ])("rejects %s", (_label, members, extra, pattern) => {
+    const dir = home();
+    writeRegistry(dir, {
+      version: 1,
+      agents: {
+        sable: seat("th_s"),
+        flint: seat("th_f"),
+        "spec-group": groupEntry(members, extra),
+      },
+    });
+    expect(() => loadAgentRegistry(dir)).toThrow(pattern);
+  });
+
+  it("rejects a member that is itself a group line, and a group without a photon channel", () => {
+    const dir = home();
+    writeRegistry(dir, {
+      version: 1,
+      agents: {
+        sable: seat("th_s"),
+        flint: seat("th_f"),
+        inner: groupEntry(["sable", "flint"]),
+        outer: groupEntry(["sable", "inner"]),
+      },
+    });
+    expect(() => loadAgentRegistry(dir)).toThrow(/inner is a group line/);
+    writeRegistry(dir, {
+      version: 1,
+      agents: {
+        sable: seat("th_s"),
+        flint: seat("th_f"),
+        g: { ownerSenderIds: ["+1"], group: { members: ["sable", "flint"] } },
+      },
+    });
+    expect(() => loadAgentRegistry(dir)).toThrow(/channels.photon is required/);
+  });
+});

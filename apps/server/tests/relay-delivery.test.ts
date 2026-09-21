@@ -2,7 +2,12 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
-import { deliverRelayJob, type RelayDeliveryContext } from "../src/relay-delivery.ts";
+import { GroupTranscript } from "../src/group-transcript.ts";
+import {
+  deliverRelayJob,
+  resolvePhotonDeliveryRoute,
+  type RelayDeliveryContext,
+} from "../src/relay-delivery.ts";
 import { RelayQueue, type RelayJob } from "../src/relay.ts";
 
 function job(overrides: Partial<RelayJob> = {}): RelayJob {
@@ -369,5 +374,99 @@ describe("deliverRelayJob lee fallback", () => {
       }),
     ).rejects.toThrow(/401/);
     expect(sent).toEqual(["console"]);
+  });
+});
+
+describe("deliverRelayJob group line", () => {
+  const meta = {
+    kind: "group_line",
+    groupId: "spec-group",
+    memberId: "flint",
+    memberLabel: "Flint",
+    wakeSeq: 1,
+    channel: "iMessage",
+  };
+  function groupJob(overrides: Partial<RelayJob> = {}): RelayJob {
+    return job({
+      target: "flint",
+      prompt: "wake",
+      output: "Green.",
+      status: "completed",
+      delivery: { channel: "photon", destination: { spaceId: "dm-space" }, metadata: meta },
+      ...overrides,
+    });
+  }
+
+  it("writes the reply to the transcript, advances only that member's cursor, delivers prefixed on the group line", async () => {
+    const transcript = new GroupTranscript(":memory:");
+    transcript.append({
+      senderId: "lee",
+      senderLabel: "Lee",
+      text: "@flint hi",
+      inboundMessageId: "m1",
+    });
+    const sent: Array<{ agentId: string; spaceId: string; text: string }> = [];
+    await deliverRelayJob(groupJob(), {
+      agents: [],
+      consoleHome: "/tmp",
+      openTranscript: () => transcript,
+      photonConnectors: {
+        send: async (agentId: string, spaceId: string, text: string) => {
+          sent.push({ agentId, spaceId, text });
+        },
+      } as unknown as RelayDeliveryContext["photonConnectors"],
+    });
+    expect(sent).toEqual([
+      { agentId: "spec-group", spaceId: "dm-space", text: "**Flint:** Green." },
+    ]);
+    expect(transcript.list().map((line) => [line.senderLabel, line.text])).toEqual([
+      ["Lee", "@flint hi"],
+      ["Flint", "Green."],
+    ]);
+    expect(transcript.cursor("flint")).toBe(1);
+    expect(transcript.cursor("sable")).toBe(0);
+  });
+
+  it("delivers a prefixed failure notice without writing it to the transcript", async () => {
+    const transcript = new GroupTranscript(":memory:");
+    const sent: string[] = [];
+    await deliverRelayJob(groupJob({ status: "failed", output: null, error: "turn exploded" }), {
+      agents: [],
+      consoleHome: "/tmp",
+      openTranscript: () => transcript,
+      photonConnectors: {
+        send: async (_agentId: string, _spaceId: string, text: string) => {
+          sent.push(text);
+        },
+      } as unknown as RelayDeliveryContext["photonConnectors"],
+    });
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatch(
+      /^\*\*Flint:\*\* ⚠️ flint failed to complete your request\.\nturn exploded/,
+    );
+    expect(transcript.list()).toEqual([]);
+    expect(transcript.cursor("flint")).toBe(0);
+  });
+
+  it("redelivery of the same job writes one transcript line", async () => {
+    const transcript = new GroupTranscript(":memory:");
+    const context = {
+      agents: [],
+      consoleHome: "/tmp",
+      openTranscript: () => transcript,
+      photonConnectors: {
+        send: async () => undefined,
+      } as unknown as RelayDeliveryContext["photonConnectors"],
+    };
+    await deliverRelayJob(groupJob({ id: "job-same" }), context);
+    await deliverRelayJob(groupJob({ id: "job-same" }), context);
+    expect(transcript.list()).toHaveLength(1);
+  });
+
+  it("routes typing and delivery for a group wake to the group's connector", () => {
+    expect(resolvePhotonDeliveryRoute(groupJob(), { agents: [], consoleHome: "/tmp" })).toEqual({
+      agentId: "spec-group",
+      spaceId: "dm-space",
+    });
   });
 });

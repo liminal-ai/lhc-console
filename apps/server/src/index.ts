@@ -58,6 +58,8 @@ import { RelayQueue } from "./relay.ts";
 import { deliverRelayJob, resolvePhotonDeliveryRoute } from "./relay-delivery.ts";
 import { isRegisteredRelayTarget, loadAgentRegistry } from "./agent-registry.ts";
 import { PhotonConnectorManager } from "./photon-connector.ts";
+import { handleGroupOwnerMessage, resolveGroupMembers } from "./group-line.ts";
+import { GroupTranscript } from "./group-transcript.ts";
 import { PhotonTypingCoordinator } from "./photon-typing.ts";
 import { MonitorService } from "./monitor.ts";
 import { registerMonitorRoutes } from "./monitor-routes.ts";
@@ -218,6 +220,7 @@ const relayQueue = new RelayQueue({
       agents: agentRegistry.agents,
       consoleHome,
       photonConnectors: photonRef.current,
+      openTranscript: openGroupTranscript,
     }),
   jobLifecycle: {
     onRunning: (job) => photonTypingRef.current?.onRunning(job),
@@ -245,11 +248,37 @@ const removeGoalSettledListener = relayQueue.addSettledListener((job) =>
   goalService.notifyJobSettled(job),
 );
 
+// Group lines: one transcript per group, opened once; owner DMs on the group's
+// line fan out to tagged members through the core router.
+const groupTranscripts = new Map<string, GroupTranscript>();
+const openGroupTranscript = (groupId: string): GroupTranscript => {
+  let transcript = groupTranscripts.get(groupId);
+  if (!transcript) {
+    transcript = new GroupTranscript(join(consoleHome, "agents", groupId, "transcript.sqlite"));
+    groupTranscripts.set(groupId, transcript);
+  }
+  return transcript;
+};
 const photonConnectors = new PhotonConnectorManager({
-  agents: agentRegistry.agents,
+  agents: [...agentRegistry.agents, ...agentRegistry.groups],
   consoleHome,
   queue: relayQueue,
   v2: v2Manager,
+  groupLine: (line, input) => {
+    const group = agentRegistry.groups.find((entry) => entry.id === line.id);
+    if (!group) return;
+    handleGroupOwnerMessage({
+      group,
+      members: resolveGroupMembers(group, agentRegistry.agents),
+      transcript: openGroupTranscript(group.id),
+      queue: relayQueue,
+      text: input.text,
+      channel: "iMessage",
+      inboundMessageId: input.messageId,
+      destination: { spaceId: input.spaceId },
+      at: input.timestamp,
+    });
+  },
 });
 photonRef.current = photonConnectors;
 photonTypingRef.current = new PhotonTypingCoordinator(photonConnectors, (job) =>

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 import type { AgentRecord, GroupRecord } from "../src/agent-registry.ts";
 import {
   buildGroupWakePrompt,
+  deriveMemberActivity,
   fanInGroupReply,
   formatGroupReply,
   handleGroupOwnerMessage,
@@ -136,9 +137,56 @@ describe("routeGroupMessage", () => {
     expect(routeGroupMessage(custom, members, "@all go").wakes).toEqual([]);
   });
 
+  it("unions explicit wake ids with the tags; unknown ids are ignored; nothing without either", () => {
+    expect(routeGroupMessage(group(), members, "no tags here", ["sable"]).wakes).toEqual(["sable"]);
+    const both = routeGroupMessage(group(), members, "@flint look", ["sable"]);
+    expect(both.wakes).toEqual(["sable", "flint"]);
+    expect(both.stripped.get("flint")).toBe("look");
+    expect(routeGroupMessage(group(), members, "@flint look", ["flint"]).wakes).toEqual(["flint"]);
+    expect(routeGroupMessage(group(), members, "plain", ["reed"]).wakes).toEqual([]);
+    expect(routeGroupMessage(group(), members, "plain", []).wakes).toEqual([]);
+  });
+
   it("wakes nobody on untagged text or an unknown tag", () => {
     expect(routeGroupMessage(group(), members, "just thinking out loud").wakes).toEqual([]);
     expect(routeGroupMessage(group(), members, "@reed are you there?").wakes).toEqual([]);
+  });
+});
+
+describe("deriveMemberActivity", () => {
+  const job = (memberId: string, wakeSeq: number, createdAt: string) => ({
+    target: memberId,
+    createdAt,
+    delivery: {
+      channel: "photon" as const,
+      destination: {},
+      metadata: {
+        kind: "group_line",
+        groupId: "spec-group",
+        memberId,
+        memberLabel: memberId,
+        wakeSeq,
+        channel: "web",
+      } satisfies GroupLineWakeMetadata,
+    },
+  });
+
+  it("marks members with an unsettled wake as working since their oldest wake, others idle", () => {
+    const activity = deriveMemberActivity(members, [
+      job("flint", 9, "2026-09-21T16:00:09Z"),
+      job("flint", 7, "2026-09-21T16:00:07Z"),
+      job("reed", 8, "2026-09-21T16:00:08Z"),
+    ]);
+    expect(activity).toEqual({
+      sable: { state: "idle" },
+      flint: { state: "working", wakeSeq: 7, since: "2026-09-21T16:00:07Z" },
+    });
+  });
+
+  it("ignores jobs without group-line metadata", () => {
+    expect(
+      deriveMemberActivity(members, [{ target: "sable", createdAt: "x", delivery: null }]),
+    ).toEqual({ sable: { state: "idle" }, flint: { state: "idle" } });
   });
 });
 

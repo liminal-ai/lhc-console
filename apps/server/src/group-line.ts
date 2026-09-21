@@ -76,6 +76,7 @@ export function routeGroupMessage(
   group: Pick<GroupRecord, "mentionPatterns">,
   members: GroupMember[],
   text: string,
+  wake: readonly string[] = [],
 ): GroupRoute {
   const broadcast = compileMentionPatterns(
     group.mentionPatterns.length ? group.mentionPatterns : DEFAULT_BROADCAST_PATTERNS,
@@ -84,7 +85,7 @@ export function routeGroupMessage(
   const wakes: string[] = [];
   const stripped = new Map<string, string>();
   for (const member of members) {
-    if (!all && !matchesMention(text, member.patterns)) continue;
+    if (!all && !wake.includes(member.id) && !matchesMention(text, member.patterns)) continue;
     wakes.push(member.id);
     stripped.set(member.id, stripOwnTag(text, member.patterns));
   }
@@ -155,6 +156,29 @@ export interface OwnerMessageInput {
   /** Destination the member replies are delivered to (Photon space id). */
   destination: Record<string, string>;
   at?: string;
+  /** Members to wake regardless of tags (web default recipients); unioned with the tags. */
+  wake?: readonly string[];
+}
+
+export type MemberActivity =
+  | { state: "working"; wakeSeq: number; since: string }
+  | { state: "idle" };
+
+/** Per-member activity from the group's unsettled wake jobs (oldest wake wins). */
+export function deriveMemberActivity(
+  members: readonly Pick<GroupMember, "id">[],
+  unsettled: readonly Pick<RelayJob, "target" | "createdAt" | "delivery">[],
+): Record<string, MemberActivity> {
+  const out: Record<string, MemberActivity> = {};
+  for (const member of members) out[member.id] = { state: "idle" };
+  for (const job of unsettled) {
+    const metadata = job.delivery?.metadata;
+    if (!isGroupLineMetadata(metadata) || !(metadata.memberId in out)) continue;
+    const current = out[metadata.memberId];
+    if (current?.state === "working" && current.since <= job.createdAt) continue;
+    out[metadata.memberId] = { state: "working", wakeSeq: metadata.wakeSeq, since: job.createdAt };
+  }
+  return out;
 }
 
 /**
@@ -172,7 +196,7 @@ export function handleGroupOwnerMessage(input: OwnerMessageInput): RelayJob[] {
     inboundMessageId: input.inboundMessageId ?? null,
   });
   if (!inserted) return [];
-  const route = routeGroupMessage(input.group, input.members, text);
+  const route = routeGroupMessage(input.group, input.members, text, input.wake ?? []);
   const jobs: RelayJob[] = [];
   const window = historyWindow(input.group.group.catchUp);
   for (const memberId of route.wakes) {

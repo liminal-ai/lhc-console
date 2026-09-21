@@ -6,7 +6,12 @@
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { AgentRecord, GroupRecord } from "./agent-registry.ts";
-import { handleGroupOwnerMessage, resolveGroupMembers } from "./group-line.ts";
+import {
+  deriveMemberActivity,
+  handleGroupOwnerMessage,
+  resolveGroupMembers,
+  type MemberActivity,
+} from "./group-line.ts";
 import type { GroupTranscript, TranscriptMessage } from "./group-transcript.ts";
 import type { RelayQueue } from "./relay.ts";
 
@@ -14,7 +19,7 @@ export interface GroupRouteOptions {
   groups: GroupRecord[];
   agents: AgentRecord[];
   token: string;
-  queue: Pick<RelayQueue, "enqueue">;
+  queue: Pick<RelayQueue, "enqueue" | "listUnsettledGroupJobs">;
   openTranscript: (groupId: string) => GroupTranscript;
 }
 
@@ -29,7 +34,7 @@ export interface PublicGroup {
 
 export interface PublicGroupDetail extends PublicGroup {
   /** Each member's cursor: the last transcript seq it has been shown. */
-  members: Array<{ id: string; label: string; cursorSeq: number }>;
+  members: Array<{ id: string; label: string; cursorSeq: number; activity: MemberActivity }>;
   lastSeq: number;
 }
 
@@ -66,11 +71,16 @@ export function registerGroupRoutes(app: FastifyInstance, options: GroupRouteOpt
       if (!group) return reply.code(404).send({ error: `unknown group: ${request.params.id}` });
       const transcript = options.openTranscript(group.id);
       const base = toPublicGroup(group, options.agents);
+      const activity = deriveMemberActivity(
+        base.members,
+        options.queue.listUnsettledGroupJobs(group.id),
+      );
       const detail: PublicGroupDetail = {
         ...base,
         members: base.members.map((member) => ({
           ...member,
           cursorSeq: transcript.cursor(member.id),
+          activity: activity[member.id] ?? { state: "idle" },
         })),
         lastSeq: transcript.lastSeq(),
       };
@@ -93,7 +103,7 @@ export function registerGroupRoutes(app: FastifyInstance, options: GroupRouteOpt
     },
   );
 
-  app.post<{ Params: { id: string }; Body: { text?: unknown; id?: unknown } }>(
+  app.post<{ Params: { id: string }; Body: { text?: unknown; id?: unknown; wake?: unknown } }>(
     "/api/groups/:id/messages",
     { preHandler: authorize },
     async (request, reply) => {
@@ -108,17 +118,30 @@ export function registerGroupRoutes(app: FastifyInstance, options: GroupRouteOpt
       }
       const clientId = typeof request.body?.id === "string" && request.body.id.trim();
       const inboundMessageId = `web:${clientId || randomUUID()}`;
+      const members = resolveGroupMembers(group, options.agents);
+      const rawWake = request.body?.wake;
+      if (rawWake !== undefined && !Array.isArray(rawWake)) {
+        return reply.code(400).send({ error: "wake must be an array of member ids" });
+      }
+      const wake = (rawWake ?? []) as unknown[];
+      const unknown = wake.filter(
+        (id) => typeof id !== "string" || !members.some((member) => member.id === id),
+      );
+      if (unknown.length) {
+        return reply.code(400).send({ error: `wake: unknown member(s): ${unknown.join(", ")}` });
+      }
       const transcript = options.openTranscript(group.id);
       const spaceId = group.channels.photon?.notifySpaceId;
       const jobs = handleGroupOwnerMessage({
         group,
-        members: resolveGroupMembers(group, options.agents),
+        members,
         transcript,
         queue: options.queue,
         text,
         channel: "web",
         inboundMessageId,
         destination: spaceId ? { spaceId } : {},
+        wake: wake as string[],
       });
       const line = transcript
         .list(0, LIST_LIMIT)

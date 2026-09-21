@@ -39,6 +39,7 @@ function setup() {
   apps.push(app);
   const transcript = new GroupTranscript(":memory:");
   const jobs: Array<{ target: string; prompt: string; delivery: RelayJob["delivery"] }> = [];
+  const unsettled: RelayJob[] = [];
   registerGroupRoutes(app, {
     groups: [group],
     agents: [seat("sable", "Sable"), seat("flint", "Flint")],
@@ -49,9 +50,10 @@ function setup() {
         jobs.push({ target: input.target, prompt: input.prompt, delivery: input.delivery ?? null });
         return { id: `job-${jobs.length}`, target: input.target } as RelayJob;
       },
+      listUnsettledGroupJobs: () => unsettled,
     },
   });
-  return { app, transcript, jobs };
+  return { app, transcript, jobs, unsettled };
 }
 const auth = { authorization: "Bearer test-secret" };
 
@@ -91,8 +93,8 @@ describe("group line web API", () => {
       id: "spec-group",
       lastSeq: 2,
       members: [
-        { id: "sable", label: "Sable", cursorSeq: 0 },
-        { id: "flint", label: "Flint", cursorSeq: 2 },
+        { id: "sable", label: "Sable", cursorSeq: 0, activity: { state: "idle" } },
+        { id: "flint", label: "Flint", cursorSeq: 2, activity: { state: "idle" } },
       ],
     });
     expect(
@@ -119,6 +121,77 @@ describe("group line web API", () => {
     ]);
     expect(response.body).not.toContain("secret.env");
     expect(response.body).not.toContain("+1999");
+  });
+
+  it("reports a member as working while its wake job is unsettled", async () => {
+    const { app, unsettled } = setup();
+    unsettled.push({
+      target: "sable",
+      createdAt: "2026-09-21T16:00:00Z",
+      delivery: {
+        channel: "photon",
+        destination: {},
+        metadata: {
+          kind: "group_line",
+          groupId: "spec-group",
+          memberId: "sable",
+          memberLabel: "Sable",
+          wakeSeq: 3,
+          channel: "web",
+        },
+      },
+    } as unknown as RelayJob);
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/groups/spec-group",
+      headers: auth,
+    });
+    expect(response.json().members).toEqual([
+      expect.objectContaining({
+        id: "sable",
+        activity: { state: "working", wakeSeq: 3, since: "2026-09-21T16:00:00Z" },
+      }),
+      expect.objectContaining({ id: "flint", activity: { state: "idle" } }),
+    ]);
+  });
+
+  it("wakes the wake[] members without tags, unions with tags, and rejects unknown ids", async () => {
+    const { app, jobs } = setup();
+    const first = await app.inject({
+      method: "POST",
+      url: "/api/groups/spec-group/messages",
+      headers: auth,
+      payload: { text: "no tags", id: "w1", wake: ["sable"] },
+    });
+    expect(first.statusCode).toBe(202);
+    expect(first.json().wakes).toEqual([{ jobId: "job-1", memberId: "sable" }]);
+    const second = await app.inject({
+      method: "POST",
+      url: "/api/groups/spec-group/messages",
+      headers: auth,
+      payload: { text: "@flint and", id: "w2", wake: ["sable"] },
+    });
+    expect(second.json().wakes.map((w: { memberId: string }) => w.memberId)).toEqual([
+      "sable",
+      "flint",
+    ]);
+    expect(jobs).toHaveLength(3);
+    const bad = await app.inject({
+      method: "POST",
+      url: "/api/groups/spec-group/messages",
+      headers: auth,
+      payload: { text: "x", id: "w3", wake: ["reed"] },
+    });
+    expect(bad.statusCode).toBe(400);
+    expect(bad.json().error).toMatch(/unknown member/);
+    const notArray = await app.inject({
+      method: "POST",
+      url: "/api/groups/spec-group/messages",
+      headers: auth,
+      payload: { text: "x", id: "w4", wake: "sable" },
+    });
+    expect(notArray.statusCode).toBe(400);
+    expect(jobs).toHaveLength(3);
   });
 
   it("posts an owner message through the router: transcript line, wakes, and the same delivery target", async () => {

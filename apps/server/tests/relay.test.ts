@@ -2445,3 +2445,57 @@ describe("RelayQueue delivery failure classes", () => {
     await queue.close();
   });
 });
+
+describe("listUnsettledGroupJobs", () => {
+  it("returns group-line jobs for the group that are queued, running, or completed with delivery in flight", async () => {
+    const dbPath = tempDb();
+    const queue = createQueue({
+      dbPath,
+      targets: {
+        sable: { hostId: "h", threadId: "t1", cwd: "/tmp", command: "unused", args: [] },
+        flint: { hostId: "h", threadId: "t2", cwd: "/tmp", command: "unused", args: [] },
+      },
+      isBusy: () => true,
+      execute: async () => "unused",
+    });
+    try {
+      const meta = (memberId: string, groupId = "spec-group") => ({
+        channel: "photon" as const,
+        destination: {},
+        metadata: {
+          kind: "group_line",
+          groupId,
+          memberId,
+          memberLabel: memberId,
+          wakeSeq: 1,
+          channel: "web",
+        },
+      });
+      const queued = queue.enqueue({ target: "sable", prompt: "a", delivery: meta("sable") });
+      const running = queue.enqueue({ target: "flint", prompt: "b", delivery: meta("flint") });
+      const pending = queue.enqueue({ target: "flint", prompt: "c", delivery: meta("flint") });
+      const delivered = queue.enqueue({ target: "sable", prompt: "d", delivery: meta("sable") });
+      const otherGroup = queue.enqueue({
+        target: "sable",
+        prompt: "e",
+        delivery: meta("sable", "other"),
+      });
+      queue.enqueue({ target: "sable", prompt: "f" });
+      const db = new DatabaseSync(dbPath);
+      db.prepare("UPDATE relay_jobs SET status = 'running' WHERE id = ?").run(running.id);
+      db.prepare(
+        "UPDATE relay_jobs SET status = 'completed', delivery_status = 'pending' WHERE id = ?",
+      ).run(pending.id);
+      db.prepare(
+        "UPDATE relay_jobs SET status = 'completed', delivery_status = 'delivered' WHERE id = ?",
+      ).run(delivered.id);
+      db.close();
+      const ids = queue.listUnsettledGroupJobs("spec-group").map((job) => job.id);
+      expect(ids).toEqual([queued.id, running.id, pending.id]);
+      expect(ids).not.toContain(otherGroup.id);
+      expect(queue.listUnsettledGroupJobs("other").map((job) => job.id)).toEqual([otherGroup.id]);
+    } finally {
+      await queue.close();
+    }
+  });
+});

@@ -407,6 +407,28 @@ export class RelayQueue {
     }
   }
 
+  /**
+   * Group-line wake jobs for one group whose reply has not settled: queued,
+   * blocked or running, or completed with the delivery still in flight. This
+   * is what "the member is working" means on the group page.
+   */
+  listUnsettledGroupJobs(groupId: string): RelayJob[] {
+    return this.#withDb(() => {
+      const rows = this.#db
+        .prepare(
+          `SELECT * FROM relay_jobs
+           WHERE delivery_metadata IS NOT NULL
+             AND json_extract(delivery_metadata, '$.kind') = 'group_line'
+             AND json_extract(delivery_metadata, '$.groupId') = ?
+             AND (status IN ('queued', 'blocked', 'running')
+                  OR (status = 'completed' AND delivery_status IN ('pending', 'delivering')))
+           ORDER BY created_at`,
+        )
+        .all(groupId) as unknown as RelayRow[];
+      return rows.map((row) => rowToJob(row));
+    }, []);
+  }
+
   listRunningJobs(): RelayJob[] {
     return this.#withDb(() => {
       const rows = this.#db

@@ -33,9 +33,10 @@ relay target. Reject unknown members, members that are groups, members without a
 Every owner message and every member reply is written here first. Idempotent on inbound message id and on job id.
 Byte cap with trim-oldest and one `[N earlier messages trimmed]` marker line; never refuse a wake for size.
 
-**Router (core, no channel knowledge).** `routeGroupMessage(group, members, text) -> { wakes: memberId[], stripped: Map }`
+**Router (core, no channel knowledge).** `routeGroupMessage(group, members, text, wake?) -> { wakes: memberId[] }`
 as a pure function with tests. On an owner message: append to transcript; for each woken member build the prompt
-(history since cursor via the existing `renderRelayPrompt` shape, own tag stripped, other tags left) and enqueue one relay
+(history since cursor via the existing `renderRelayPrompt` shape, Lee's text verbatim: no tag stripping, since removing
+a member's own name from "Sable, Flint ..." made it read as addressed to the other one) and enqueue one relay
 job `target = member`, prioritized, header `[from: lee, channel: iMessage group spec-group]` (or `web group spec-group`),
 existing phone-reply trailer, delivery metadata `{ kind: "group_line", groupId, memberId, memberLabel, wakeSeq }`.
 

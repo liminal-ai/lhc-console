@@ -110,25 +110,40 @@ function reply(transcript: GroupTranscript, job: RelayJob, output: string): void
 }
 
 describe("routeGroupMessage", () => {
-  it("wakes only the tagged member and strips its own tag", () => {
+  it("wakes only the tagged member", () => {
     const route = routeGroupMessage(group(), members, "@flint what is the status?");
     expect(route.wakes).toEqual(["flint"]);
-    expect(route.stripped.get("flint")).toBe("what is the status?");
   });
 
-  it("wakes both when both are tagged, leaving the other member's tag in place", () => {
+  it("wakes both when both are tagged", () => {
     const route = routeGroupMessage(group(), members, "@flint @sable we're in a group, respond");
     expect(route.wakes).toEqual(["sable", "flint"]);
-    expect(route.stripped.get("sable")).toBe("@flint we're in a group, respond");
-    expect(route.stripped.get("flint")).toBe("@sable we're in a group, respond");
+  });
+
+  it("delivers the owner's text verbatim to every woken member (regression: 'Sable, Flint ...' read as addressed to the other)", () => {
+    const transcript = new GroupTranscript(":memory:");
+    const queue = fakeQueue();
+    const jobs = handleGroupOwnerMessage({
+      group: group(),
+      members,
+      transcript,
+      queue,
+      text: "Sable, Flint this is a test of the group line",
+      channel: "iMessage",
+      inboundMessageId: "verbatim-1",
+      destination: {},
+    });
+    expect(jobs.map((job) => job.target)).toEqual(["sable", "flint"]);
+    for (const job of jobs) {
+      expect(job.prompt).toContain(
+        "[from: lee, channel: iMessage group spec-group]\nSable, Flint this is a test of the group line",
+      );
+    }
   });
 
   it("wakes everyone on @all and @everyone", () => {
     expect(routeGroupMessage(group(), members, "@all status?").wakes).toEqual(["sable", "flint"]);
     expect(routeGroupMessage(group(), members, "hey @everyone").wakes).toEqual(["sable", "flint"]);
-    expect(routeGroupMessage(group(), members, "@all status?").stripped.get("flint")).toBe(
-      "@all status?",
-    );
   });
 
   it("uses the group's own broadcast patterns when configured", () => {
@@ -141,7 +156,6 @@ describe("routeGroupMessage", () => {
     expect(routeGroupMessage(group(), members, "no tags here", ["sable"]).wakes).toEqual(["sable"]);
     const both = routeGroupMessage(group(), members, "@flint look", ["sable"]);
     expect(both.wakes).toEqual(["sable", "flint"]);
-    expect(both.stripped.get("flint")).toBe("look");
     expect(routeGroupMessage(group(), members, "@flint look", ["flint"]).wakes).toEqual(["flint"]);
     expect(routeGroupMessage(group(), members, "plain", ["reed"]).wakes).toEqual([]);
     expect(routeGroupMessage(group(), members, "plain", []).wakes).toEqual([]);
@@ -264,7 +278,7 @@ describe("handleGroupOwnerMessage + fanInGroupReply", () => {
     expect(first[0]!.jobClass).toBe("prioritized");
     // First wake: nothing to catch up on, so no history block and no [New message] label.
     expect(first[0]!.prompt).toBe(
-      "[from: lee, channel: iMessage group spec-group]\n@flint we're in a group, respond\n\n[reply for iPhone on the go]",
+      "[from: lee, channel: iMessage group spec-group]\n@flint @sable we're in a group, respond\n\n[reply for iPhone on the go]",
     );
     reply(transcript, first[0]!, "Sable here.");
     reply(transcript, first[1]!, "Flint here.");
@@ -273,7 +287,7 @@ describe("handleGroupOwnerMessage + fanInGroupReply", () => {
     expect(second.map((job) => job.target)).toEqual(["flint"]);
     // Flint's history: Sable's reply only (his own is excluded, Lee's first line was his wake).
     expect(second[0]!.prompt).toContain(
-      "[spec-group messages since your last reply]\nSable: Sable here.\n\n[New message]\nhow is the build?",
+      "[spec-group messages since your last reply]\nSable: Sable here.\n\n[New message]\n@flint how is the build?",
     );
     expect(second[0]!.prompt).not.toContain("Flint: Flint here.");
     reply(transcript, second[0]!, "Green.");
@@ -294,7 +308,7 @@ describe("handleGroupOwnerMessage + fanInGroupReply", () => {
         "Flint: Shipped.",
         "",
         "[New message]",
-        "your view?",
+        "@sable your view?",
       ].join("\n"),
     );
     expect(prompt).not.toContain("Sable: Sable here.");
@@ -306,7 +320,7 @@ describe("handleGroupOwnerMessage + fanInGroupReply", () => {
     const queue = fakeQueue();
     expect(owner(transcript, queue, "thinking out loud", "m1")).toEqual([]);
     const wake = owner(transcript, queue, "@sable thoughts?", "m2");
-    expect(wake[0]!.prompt).toContain("Lee: thinking out loud\n\n[New message]\nthoughts?");
+    expect(wake[0]!.prompt).toContain("Lee: thinking out loud\n\n[New message]\n@sable thoughts?");
   });
 
   it("is idempotent on the inbound message id and on the reply job id", () => {
@@ -359,7 +373,7 @@ describe("handleGroupOwnerMessage + fanInGroupReply", () => {
     expect(last[0]!.prompt).not.toContain("since your last reply");
     const windowed = owner(transcript, queue, "@sable now", "m5", { mode: "window", messages: 2 });
     expect(windowed[0]!.prompt).toContain(
-      "[2 earlier messages trimmed]\nLee: three\nLee: @flint now\n\n[New message]\nnow",
+      "[2 earlier messages trimmed]\nLee: three\nLee: @flint now\n\n[New message]\n@sable now",
     );
   });
 });

@@ -62,15 +62,13 @@ export function resolveGroupMembers(group: GroupRecord, agents: AgentRecord[]): 
 export interface GroupRoute {
   /** Member ids to wake, in group order. Empty when nobody was tagged. */
   wakes: string[];
-  /** Per woken member: the owner's text with that member's own tag removed. */
-  stripped: Map<string, string>;
 }
 
 /**
- * Pure: who does this owner line wake, and what does each of them read as the
- * new message. A member wakes when its own patterns match or on a broadcast
- * tag; untagged text wakes nobody. Only the woken member's own tag is
- * stripped; other members' tags stay so it can see who else was addressed.
+ * Pure: who does this owner line wake. A member wakes when its own patterns
+ * match, on a broadcast tag, or when listed in `wake`; untagged text wakes
+ * nobody. Every woken member reads the owner's text verbatim: stripping the
+ * member's own name made "Sable, Flint ..." read as addressed to the other one.
  */
 export function routeGroupMessage(
   group: Pick<GroupRecord, "mentionPatterns">,
@@ -83,29 +81,11 @@ export function routeGroupMessage(
   );
   const all = matchesMention(text, broadcast);
   const wakes: string[] = [];
-  const stripped = new Map<string, string>();
   for (const member of members) {
     if (!all && !wake.includes(member.id) && !matchesMention(text, member.patterns)) continue;
     wakes.push(member.id);
-    stripped.set(member.id, stripOwnTag(text, member.patterns));
   }
-  return { wakes, stripped };
-}
-
-function stripOwnTag(text: string, patterns: RegExp[]): string {
-  let out = text;
-  for (const pattern of patterns) {
-    const global = new RegExp(
-      pattern.source,
-      pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`,
-    );
-    out = out.replace(global, " ");
-  }
-  const cleaned = out
-    .replace(/[ \t]{2,}/g, " ")
-    .replace(/^[\s,:-]+/, "")
-    .trim();
-  return cleaned || text.trim();
+  return { wakes };
 }
 
 export function groupPromptHeader(groupId: string, channel: GroupChannel): string {
@@ -217,7 +197,7 @@ export function handleGroupOwnerMessage(input: OwnerMessageInput): RelayJob[] {
       channel: input.channel,
       history,
       trimmed,
-      newText: route.stripped.get(memberId) ?? text,
+      newText: text,
     });
     const metadata: GroupLineWakeMetadata = {
       kind: GROUP_LINE_KIND,

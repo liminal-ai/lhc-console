@@ -27,7 +27,7 @@ the group over a DM.
    <catch-up block: messages this member has not seen, oldest first, or nothing>
 
    [New message]
-   <Lee's text, this member's own @tag stripped, other members' tags left in place>
+   <Lee's text verbatim (no tag stripping: the header names the group; the addressee is clear from the tags)>
 
    <existing PHONE_REPLY_GUIDANCE trailer>
    ```

@@ -2,6 +2,7 @@ import "./style.css";
 import { ApiError } from "./api.ts";
 import { isTab, renderThread, teardownDetail } from "./detail.ts";
 import { el } from "./format.ts";
+import { renderGroup, renderGroups, teardownGroup } from "./groups.ts";
 import { renderList, teardownList } from "./list.ts";
 import { mountWorkspace, rememberBrowserRoute, setWorkspaceVisible } from "./workspace.ts";
 
@@ -10,9 +11,12 @@ const app = document.querySelector<HTMLDivElement>("#app")!;
 /** `#/thread/<host>/<id>[/<tab>[/<turnOrder>]]`, everything else is the list. */
 const THREAD_RE = /^\/thread\/([^/]+)\/([^/]+)(?:\/([^/]+))?(?:\/([^/]+))?$/;
 
+const GROUP_RE = /^\/group\/([^/]+)$/;
+
 function route(): void {
   teardownDetail();
   teardownList();
+  teardownGroup();
   // `#/term` is the second top-level mode: the workspace takes the viewport
   // and the browser page steps aside (it re-renders on the way back).
   if (location.hash === "#/term") {
@@ -23,6 +27,15 @@ function route(): void {
   rememberBrowserRoute(location.hash || "#/");
   setWorkspaceVisible(false);
   app.style.display = "";
+  const g = location.hash.slice(1).match(GROUP_RE);
+  if (g) {
+    renderGroup(app, decodeURIComponent(g[1])).catch(showError);
+    return;
+  }
+  if (location.hash === "#/groups") {
+    renderGroups(app).catch(showError);
+    return;
+  }
   const m = location.hash.slice(1).match(THREAD_RE);
   if (m) {
     const tab = isTab(m[3]) ? m[3] : "overview";

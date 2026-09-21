@@ -2174,3 +2174,98 @@ button.launch-link.has-term.is-idle {
   color: var(--dim);
   font-style: italic;
 }
+
+/* group lines */
+a.chip {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+  color: var(--dim);
+  text-decoration: none;
+}
+a.chip:hover {
+  color: var(--text);
+  border-color: var(--dim);
+}
+.group-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.group-card {
+  display: block;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+  text-decoration: none;
+  color: inherit;
+}
+.group-card:hover {
+  border-color: var(--dim);
+}
+.group-name {
+  font-weight: 600;
+}
+.group-members {
+  color: var(--accent);
+  font-size: 12px;
+  margin-top: 4px;
+}
+.group-page {
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - 32px);
+}
+.group-log {
+  flex: 1;
+  overflow-y: auto;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+}
+.group-line {
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+.group-line:last-child {
+  border-bottom: none;
+}
+.group-who {
+  font-weight: 600;
+  margin-right: 8px;
+}
+.group-line.owner .group-who {
+  color: var(--accent);
+}
+.group-when {
+  font-size: 12px;
+}
+.group-text {
+  white-space: pre-wrap;
+  margin-top: 2px;
+}
+.group-composer {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.group-input {
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+  font: inherit;
+  resize: vertical;
+}
+.group-composer-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}

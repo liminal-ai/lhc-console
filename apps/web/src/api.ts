@@ -395,8 +395,40 @@ async function get<T>(url: string, signal?: AbortSignal): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+export interface GroupRow {
+  id: string;
+  name: string;
+  description: string;
+  members: Array<{ id: string; label: string }>;
+  catchUp: { mode: "all" } | { mode: "last" } | { mode: "messages"; count: number };
+  channels: string[];
+}
+
+export interface GroupMessage {
+  seq: number;
+  senderId: string;
+  senderLabel: string;
+  text: string;
+  at: string;
+}
+
 export const api = {
   hosts: () => get<HostRow[]>("/api/hosts"),
+  groups: () => get<GroupRow[]>("/api/groups"),
+  groupMessages: (groupId: string, since = 0, signal?: AbortSignal) =>
+    get<{ messages: GroupMessage[]; lastSeq: number }>(
+      `/api/groups/${encodeURIComponent(groupId)}/messages?since=${since}`,
+      signal,
+    ),
+  postGroupMessage: (groupId: string, text: string, id: string) =>
+    send<{ seq: number | null; wakes: Array<{ jobId: string; memberId: string }> }>(
+      `/api/groups/${encodeURIComponent(groupId)}/messages`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text, id }),
+      },
+    ),
   /**
    * One fetch for the whole list. The client always asks for hidden rows and
    * filters them itself — the list is small and client-side filtering is

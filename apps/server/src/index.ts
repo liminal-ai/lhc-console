@@ -67,6 +67,7 @@ import { GoalService } from "./goal.ts";
 import { assertLegacyGoalsStartupSafe } from "./goal-migrate.ts";
 import { registerGoalRoutes } from "./goal-routes.ts";
 import { registerAgentRoutes } from "./agent-routes.ts";
+import { registerGroupRoutes } from "./group-routes.ts";
 import { createProviderAdapter } from "./v2/adapters/factory.ts";
 import { inspectCanonicalSpan } from "./v2/canonical.ts";
 import { isV2Enabled, loadConfiguredOwnerPolicies, v2BearerToken, v2DbPath } from "./v2/config.ts";
@@ -434,6 +435,12 @@ if (v2Manager && v2Policies) {
 registerMonitorRoutes(app, { service: monitorService, token: relayToken });
 registerGoalRoutes(app, { service: goalService, token: relayToken });
 registerAgentRoutes(app, { agents: agentRegistry.agents, token: relayToken });
+registerGroupRoutes(app, {
+  groups: agentRegistry.groups,
+  agents: agentRegistry.agents,
+  queue: relayQueue,
+  openTranscript: openGroupTranscript,
+});
 
 app.get("/api/hosts", async () => {
   const launchable = new Set(launchableHostIds(discoverHosts().map((h) => h.id)));

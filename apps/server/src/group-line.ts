@@ -102,7 +102,7 @@ function stripOwnTag(text: string, patterns: RegExp[]): string {
   }
   const cleaned = out
     .replace(/[ \t]{2,}/g, " ")
-    .replace(/^[\s,:\-]+/, "")
+    .replace(/^[\s,:-]+/, "")
     .trim();
   return cleaned || text.trim();
 }

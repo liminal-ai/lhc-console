@@ -2,6 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 import type { AgentRecord, GroupRecord } from "../src/agent-registry.ts";
 import {
   buildGroupWakePrompt,
+  deriveFailedMembers,
   deriveMemberActivity,
   fanInGroupReply,
   formatGroupReply,
@@ -108,6 +109,36 @@ function reply(transcript: GroupTranscript, job: RelayJob, output: string): void
   const meta = job.delivery?.metadata as GroupLineWakeMetadata;
   fanInGroupReply(transcript, meta, { id: job.id, output, finishedAt: "2026-09-21T00:00:01Z" });
 }
+
+describe("deriveFailedMembers", () => {
+  const job = (memberId: string, status: string, deliveryStatus: string | null) => ({
+    status: status as RelayJob["status"],
+    deliveryStatus: deliveryStatus as RelayJob["deliveryStatus"],
+    delivery: {
+      channel: "photon" as const,
+      destination: {},
+      metadata: {
+        kind: "group_line",
+        groupId: "g",
+        memberId,
+        memberLabel: memberId,
+        wakeSeq: 1,
+        channel: "web",
+      },
+    },
+  });
+  it("flags failed-final delivery and failed jobs, in member order, ignoring successes", () => {
+    const members = [{ id: "sable" }, { id: "flint" }, { id: "quiet" }];
+    expect(
+      deriveFailedMembers(members, [
+        job("flint", "failed", null),
+        job("sable", "completed", "failed-final"),
+        job("quiet", "completed", "delivered"),
+      ]),
+    ).toEqual(["sable", "flint"]);
+    expect(deriveFailedMembers(members, [job("sable", "running", "pending")])).toEqual([]);
+  });
+});
 
 describe("routeGroupMessage", () => {
   it("wakes only the tagged member", () => {

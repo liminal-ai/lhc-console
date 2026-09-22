@@ -7,6 +7,7 @@ import { randomUUID, timingSafeEqual } from "node:crypto";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { AgentRecord, GroupRecord } from "./agent-registry.ts";
 import {
+  deriveFailedMembers,
   deriveMemberActivity,
   handleGroupOwnerMessage,
   resolveGroupMembers,
@@ -19,7 +20,7 @@ export interface GroupRouteOptions {
   groups: GroupRecord[];
   agents: AgentRecord[];
   token: string;
-  queue: Pick<RelayQueue, "enqueue" | "listUnsettledGroupJobs">;
+  queue: Pick<RelayQueue, "enqueue" | "listUnsettledGroupJobs" | "listLatestGroupJobsByMember">;
   openTranscript: (groupId: string) => GroupTranscript;
 }
 
@@ -36,6 +37,8 @@ export interface PublicGroup {
 export interface PublicGroupSummary extends PublicGroup {
   /** Member ids whose wake job has not settled (working on a reply). */
   working: string[];
+  /** Member ids whose latest wake job failed, until their next reply. */
+  failed: string[];
   latestSeq: number;
   /** Timestamp of the latest transcript line, null when empty. */
   latestAt: string | null;
@@ -83,6 +86,10 @@ export function registerGroupRoutes(app: FastifyInstance, options: GroupRouteOpt
         working: base.members
           .filter((member) => activity[member.id]?.state === "working")
           .map((member) => member.id),
+        failed: deriveFailedMembers(
+          base.members,
+          options.queue.listLatestGroupJobsByMember(group.id),
+        ),
         latestSeq,
         latestAt: latest?.at ?? null,
       };

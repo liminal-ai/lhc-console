@@ -40,6 +40,7 @@ function setup() {
   const transcript = new GroupTranscript(":memory:");
   const jobs: Array<{ target: string; prompt: string; delivery: RelayJob["delivery"] }> = [];
   const unsettled: RelayJob[] = [];
+  const latestByMember: RelayJob[] = [];
   registerGroupRoutes(app, {
     groups: [group],
     agents: [seat("sable", "Sable"), seat("flint", "Flint")],
@@ -51,9 +52,10 @@ function setup() {
         return { id: `job-${jobs.length}`, target: input.target } as RelayJob;
       },
       listUnsettledGroupJobs: () => unsettled,
+      listLatestGroupJobsByMember: () => latestByMember,
     },
   });
-  return { app, transcript, jobs, unsettled };
+  return { app, transcript, jobs, unsettled, latestByMember };
 }
 const auth = { authorization: "Bearer test-secret" };
 
@@ -118,6 +120,7 @@ describe("group line web API", () => {
         catchUp: { mode: "all" },
         channels: ["photon"],
         working: [],
+        failed: [],
         latestSeq: 0,
         latestAt: null,
       },
@@ -153,6 +156,32 @@ describe("group line web API", () => {
     });
     expect(response.body).not.toContain("secret.env");
     expect(response.body).not.toContain("+1999");
+  });
+
+  it("lists a member as failed while its latest wake job failed, cleared by a newer job", async () => {
+    const { app, latestByMember } = setup();
+    const job = (memberId: string, status: string, deliveryStatus: string | null) =>
+      ({
+        status,
+        deliveryStatus,
+        delivery: {
+          channel: "photon",
+          destination: {},
+          metadata: {
+            kind: "group_line",
+            groupId: "spec-group",
+            memberId,
+            memberLabel: memberId,
+            wakeSeq: 1,
+          },
+        },
+      }) as unknown as RelayJob;
+    latestByMember.push(job("sable", "completed", "failed-final"), job("flint", "failed", null));
+    let list = await app.inject({ method: "GET", url: "/api/groups", headers: auth });
+    expect(list.json()[0].failed).toEqual(["sable", "flint"]);
+    latestByMember.splice(0, latestByMember.length, job("sable", "completed", "delivered"));
+    list = await app.inject({ method: "GET", url: "/api/groups", headers: auth });
+    expect(list.json()[0].failed).toEqual([]);
   });
 
   it("reports a member as working while its wake job is unsettled", async () => {

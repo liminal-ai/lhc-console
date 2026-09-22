@@ -162,6 +162,26 @@ export function deriveMemberActivity(
 }
 
 /**
+ * Pure: members whose most recent wake job failed (the job itself, or its
+ * delivery settled failed-final). Cleared by the member's next job, so the
+ * sidebar shows "Sable failed" until the next successful reply.
+ */
+export function deriveFailedMembers(
+  members: readonly Pick<GroupMember, "id">[],
+  latestByMember: readonly Pick<RelayJob, "status" | "deliveryStatus" | "delivery">[],
+): string[] {
+  const failed = new Set<string>();
+  for (const job of latestByMember) {
+    const metadata = job.delivery?.metadata;
+    if (!isGroupLineMetadata(metadata)) continue;
+    if (job.status === "failed" || job.deliveryStatus === "failed-final") {
+      failed.add(metadata.memberId);
+    }
+  }
+  return members.filter((member) => failed.has(member.id)).map((member) => member.id);
+}
+
+/**
  * Append the owner line and wake the tagged members. A repeated inbound id
  * (redelivery) appends nothing and wakes nobody. Returns the jobs enqueued.
  */

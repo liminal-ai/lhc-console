@@ -429,6 +429,32 @@ export class RelayQueue {
     }, []);
   }
 
+  /**
+   * The most recent group-line wake job per member of one group, any status.
+   * A member whose latest job failed (job failed, or delivery settled
+   * failed-final) shows as failed in the sidebar until its next reply.
+   */
+  listLatestGroupJobsByMember(groupId: string): RelayJob[] {
+    return this.#withDb(() => {
+      const rows = this.#db
+        .prepare(
+          `SELECT * FROM relay_jobs
+           WHERE delivery_metadata IS NOT NULL
+             AND json_extract(delivery_metadata, '$.kind') = 'group_line'
+             AND json_extract(delivery_metadata, '$.groupId') = ?
+             AND rowid IN (
+               SELECT MAX(rowid) FROM relay_jobs
+               WHERE delivery_metadata IS NOT NULL
+                 AND json_extract(delivery_metadata, '$.kind') = 'group_line'
+                 AND json_extract(delivery_metadata, '$.groupId') = ?
+               GROUP BY json_extract(delivery_metadata, '$.memberId'))
+           ORDER BY created_at`,
+        )
+        .all(groupId, groupId) as unknown as RelayRow[];
+      return rows.map((row) => rowToJob(row));
+    }, []);
+  }
+
   listRunningJobs(): RelayJob[] {
     return this.#withDb(() => {
       const rows = this.#db

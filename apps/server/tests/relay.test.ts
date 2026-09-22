@@ -2446,6 +2446,52 @@ describe("RelayQueue delivery failure classes", () => {
   });
 });
 
+describe("listLatestGroupJobsByMember", () => {
+  it("returns each member's most recent group-line job for the group, any status", async () => {
+    const dbPath = tempDb();
+    const queue = createQueue({
+      dbPath,
+      targets: {
+        sable: { hostId: "h", threadId: "t1", cwd: "/tmp", command: "unused", args: [] },
+        flint: { hostId: "h", threadId: "t2", cwd: "/tmp", command: "unused", args: [] },
+      },
+      isBusy: () => true,
+      execute: async () => "unused",
+    });
+    try {
+      const meta = (memberId: string, groupId = "spec-group") => ({
+        channel: "photon" as const,
+        destination: {},
+        metadata: {
+          kind: "group_line",
+          groupId,
+          memberId,
+          memberLabel: memberId,
+          wakeSeq: 1,
+          channel: "web",
+        },
+      });
+      const sableOld = queue.enqueue({ target: "sable", prompt: "a", delivery: meta("sable") });
+      const sableNew = queue.enqueue({ target: "sable", prompt: "b", delivery: meta("sable") });
+      const flint = queue.enqueue({ target: "flint", prompt: "c", delivery: meta("flint") });
+      queue.enqueue({ target: "flint", prompt: "d", delivery: meta("flint", "other") });
+      const db = new DatabaseSync(dbPath);
+      db.prepare(
+        "UPDATE relay_jobs SET status = 'completed', delivery_status = 'delivered' WHERE id = ?",
+      ).run(sableOld.id);
+      db.prepare(
+        "UPDATE relay_jobs SET status = 'completed', delivery_status = 'failed-final' WHERE id = ?",
+      ).run(sableNew.id);
+      db.close();
+      const latest = queue.listLatestGroupJobsByMember("spec-group");
+      expect(latest.map((job) => job.id).sort()).toEqual([sableNew.id, flint.id].sort());
+      expect(latest.find((job) => job.id === sableNew.id)?.deliveryStatus).toBe("failed-final");
+    } finally {
+      await queue.close();
+    }
+  });
+});
+
 describe("listUnsettledGroupJobs", () => {
   it("returns group-line jobs for the group that are queued, running, or completed with delivery in flight", async () => {
     const dbPath = tempDb();

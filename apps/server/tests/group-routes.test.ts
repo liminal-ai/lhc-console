@@ -102,8 +102,8 @@ describe("group line web API", () => {
     ).toBe(404);
   });
 
-  it("lists groups with member labels and no channel secrets", async () => {
-    const { app } = setup();
+  it("lists groups with member labels, activity summary, and no channel secrets", async () => {
+    const { app, transcript, unsettled } = setup();
     const response = await app.inject({ method: "GET", url: "/api/groups", headers: auth });
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual([
@@ -117,8 +117,40 @@ describe("group line web API", () => {
         ],
         catchUp: { mode: "all" },
         channels: ["photon"],
+        working: [],
+        latestSeq: 0,
+        latestAt: null,
       },
     ]);
+    transcript.append({
+      senderId: "lee",
+      senderLabel: "Lee",
+      text: "one",
+      at: "2026-09-22T10:00:00.000Z",
+      inboundMessageId: "l1",
+    });
+    unsettled.push({
+      target: "flint",
+      createdAt: "2026-09-22T10:00:01Z",
+      delivery: {
+        channel: "photon",
+        destination: {},
+        metadata: {
+          kind: "group_line",
+          groupId: "spec-group",
+          memberId: "flint",
+          memberLabel: "Flint",
+          wakeSeq: 1,
+          channel: "web",
+        },
+      },
+    } as unknown as RelayJob);
+    const after = await app.inject({ method: "GET", url: "/api/groups", headers: auth });
+    expect(after.json()[0]).toMatchObject({
+      working: ["flint"],
+      latestSeq: 1,
+      latestAt: "2026-09-22T10:00:00.000Z",
+    });
     expect(response.body).not.toContain("secret.env");
     expect(response.body).not.toContain("+1999");
   });

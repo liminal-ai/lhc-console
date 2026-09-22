@@ -32,6 +32,15 @@ export interface PublicGroup {
   channels: string[];
 }
 
+/** List row: what a sidebar needs to show activity without opening the group. */
+export interface PublicGroupSummary extends PublicGroup {
+  /** Member ids whose wake job has not settled (working on a reply). */
+  working: string[];
+  latestSeq: number;
+  /** Timestamp of the latest transcript line, null when empty. */
+  latestAt: string | null;
+}
+
 export interface PublicGroupDetail extends PublicGroup {
   /** Each member's cursor: the last transcript seq it has been shown. */
   members: Array<{ id: string; label: string; cursorSeq: number; activity: MemberActivity }>;
@@ -60,7 +69,24 @@ export function registerGroupRoutes(app: FastifyInstance, options: GroupRouteOpt
     options.groups.find((group) => group.id === id);
 
   app.get("/api/groups", { preHandler: authorize }, async () =>
-    options.groups.map((group) => toPublicGroup(group, options.agents)),
+    options.groups.map((group): PublicGroupSummary => {
+      const base = toPublicGroup(group, options.agents);
+      const activity = deriveMemberActivity(
+        base.members,
+        options.queue.listUnsettledGroupJobs(group.id),
+      );
+      const transcript = options.openTranscript(group.id);
+      const latestSeq = transcript.lastSeq();
+      const latest = latestSeq > 0 ? transcript.list(latestSeq - 1, 1)[0] : undefined;
+      return {
+        ...base,
+        working: base.members
+          .filter((member) => activity[member.id]?.state === "working")
+          .map((member) => member.id),
+        latestSeq,
+        latestAt: latest?.at ?? null,
+      };
+    }),
   );
 
   app.get<{ Params: { id: string } }>(
